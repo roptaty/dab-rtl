@@ -108,10 +108,11 @@ impl OfdmDemod {
     /// Demodulate one data symbol.
     ///
     /// On the first call (coarse not yet locked), searches for the best
-    /// coarse offset using the DQPSK constellation quality metric, then
-    /// re-extracts PRS carriers at the correct offset.
+    /// coarse offset using the power-spectrum metric, then re-extracts
+    /// PRS carriers at the correct offset.
     ///
-    /// Returns 3 072 soft bits or empty if PRS not yet processed.
+    /// Returns 3 072 soft bits in split layout `[Re(0)..Re(K-1), Im(0)..Im(K-1)]`
+    /// or empty if PRS not yet processed.
     pub fn demod_symbol(&mut self, symbol_samples: &[Complex32]) -> Vec<f32> {
         if !self.has_ref {
             log::warn!("demod_symbol called before phase reference is available");
@@ -154,10 +155,17 @@ impl OfdmDemod {
         // b1 = d_{2k+1} → sign of I (re): positive = 0
         let correction = self.residual_correction;
         let mut soft_bits = Vec::with_capacity(NUM_CARRIERS * 2);
+
+        // Split layout: first all real parts, then all imaginary parts.
+        // This matches welle.io's output format where the FIC accumulator
+        // collects 2304 bits at a time across symbol boundaries.
         for (&cur, &prev) in current.iter().zip(self.phase_ref.iter()) {
             let z = (cur * prev.conj()) * correction;
-            soft_bits.push(z.im); // b0 = d_{2k}   (Q axis)
-            soft_bits.push(z.re); // b1 = d_{2k+1} (I axis)
+            soft_bits.push(z.re); // I axis (first half)
+        }
+        for (&cur, &prev) in current.iter().zip(self.phase_ref.iter()) {
+            let z = (cur * prev.conj()) * correction;
+            soft_bits.push(z.im); // Q axis (second half)
         }
 
         // Update previous carriers for the next symbol.

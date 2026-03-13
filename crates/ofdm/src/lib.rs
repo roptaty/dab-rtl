@@ -28,8 +28,8 @@ pub enum OfdmError {
 
 /// A decoded OFDM frame containing soft bits for all 75 data symbols.
 ///
-/// Each inner `Vec<f32>` has `NUM_CARRIERS * 2 = 3 072` entries:
-/// interleaved real and imaginary parts of the differential product.
+/// Each inner `Vec<f32>` has `NUM_CARRIERS * 2 = 3 072` entries in split
+/// layout: `[Re(0)..Re(1535), Im(0)..Im(1535)]`.
 pub struct OfdmFrame {
     /// 75 symbols × 3 072 soft bits per symbol.
     pub soft_bits: Vec<Vec<f32>>,
@@ -131,24 +131,19 @@ impl OfdmProcessor {
 
                 let raw_bits = self.demod.demod_symbol(sym_samples);
 
-                // The soft bits come out interleaved re/im per carrier.
-                // Split into per-carrier f32 values for the deinterleaver.
-                // The deinterleaver operates on carrier-indexed floats, so we
-                // deinterleave real and imaginary channels separately and then
-                // re-interleave.
-                let re_channel: Vec<f32> = raw_bits.iter().step_by(2).copied().collect();
-                let im_channel: Vec<f32> = raw_bits.iter().skip(1).step_by(2).copied().collect();
+                // The soft bits are in split layout:
+                //   [Re(0)..Re(K-1), Im(0)..Im(K-1)]
+                // Deinterleave each half separately, keep split layout.
+                let (re_channel, im_channel) = raw_bits.split_at(NUM_CARRIERS);
 
-                let re_di = self.deinterleaver.deinterleave(&re_channel);
-                let im_di = self.deinterleaver.deinterleave(&im_channel);
+                let re_di = self.deinterleaver.deinterleave(re_channel);
+                let im_di = self.deinterleaver.deinterleave(im_channel);
 
-                let mut interleaved = Vec::with_capacity(NUM_CARRIERS * 2);
-                for (r, i) in re_di.into_iter().zip(im_di.into_iter()) {
-                    interleaved.push(r);
-                    interleaved.push(i);
-                }
+                let mut deinterleaved = Vec::with_capacity(NUM_CARRIERS * 2);
+                deinterleaved.extend_from_slice(&re_di);
+                deinterleaved.extend_from_slice(&im_di);
 
-                soft_bits.push(interleaved);
+                soft_bits.push(deinterleaved);
             }
 
             if log::log_enabled!(log::Level::Debug) {
