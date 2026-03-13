@@ -15,8 +15,15 @@ pub const NUM_STATES: usize = 1 << (K - 1); // 64
 /// Number of output bits per input bit.
 pub const NUM_OUTPUTS: usize = 4;
 
-/// Generator polynomials (7 bits each, MSB = oldest register bit).
-const G: [u8; NUM_OUTPUTS] = [91, 121, 101, 91];
+/// Generator polynomials (7 bits each).
+///
+/// ETSI EN 300 401 §11.1 specifies (octal, MSB = current input tap):
+///   G1 = 133₈, G2 = 171₈, G3 = 145₈, G4 = 133₈
+///
+/// Our shift register stores the current input at bit 0 (LSB), so the
+/// polynomials are bit-reversed to align tap positions correctly:
+///   G1: 91→109, G2: 121→79, G3: 101→83, G4: 91→109
+const G: [u8; NUM_OUTPUTS] = [109, 79, 83, 109];
 
 // -------------------------------------------------------------------------- //
 //  Transition table                                                           //
@@ -42,13 +49,18 @@ fn encode_bit(state: u8, input: u8, poly: u8) -> u8 {
 
 /// Build the full 64×2 transition table (state × input_bit).
 fn build_transitions() -> [[Transition; 2]; NUM_STATES] {
+    build_transitions_with_polys(&G)
+}
+
+/// Build transition table with custom generator polynomials.
+fn build_transitions_with_polys(polys: &[u8; NUM_OUTPUTS]) -> [[Transition; 2]; NUM_STATES] {
     let mut table = [[Transition::default(); 2]; NUM_STATES];
     for (state, row) in table.iter_mut().enumerate() {
         for input in 0u8..2 {
             let s = state as u8;
             let next_state = ((s << 1) | input) & ((NUM_STATES - 1) as u8);
             let mut output_bits = [0u8; NUM_OUTPUTS];
-            for (i, &poly) in G.iter().enumerate() {
+            for (i, &poly) in polys.iter().enumerate() {
                 output_bits[i] = encode_bit(s, input, poly);
             }
             row[input as usize] = Transition {
@@ -76,6 +88,13 @@ impl ViterbiDecoder {
     pub fn new(_traceback_depth: usize) -> Self {
         Self {
             transitions: build_transitions(),
+        }
+    }
+
+    /// Create a decoder with custom generator polynomials.
+    pub fn with_polys(_traceback_depth: usize, polys: &[u8; NUM_OUTPUTS]) -> Self {
+        Self {
+            transitions: build_transitions_with_polys(polys),
         }
     }
 

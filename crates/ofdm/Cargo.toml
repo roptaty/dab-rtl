@@ -8,3 +8,6 @@ num-complex = "0.4"
 rustfft = "6"
 log = "0.4"
 thiserror = "1"
+
+[dev-dependencies]
+fec = { path = "../fec" }

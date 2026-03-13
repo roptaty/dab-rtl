@@ -858,6 +858,7 @@ dependencies = [
 name = "ofdm"
 version = "0.1.0"
 dependencies = [
+ "fec",
  "log",
  "num-complex",
  "rustfft",

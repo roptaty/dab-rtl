@@ -146,6 +146,7 @@ fn run_pipeline(
             log::debug!("Pipeline: OFDM frame #{}", frame_count);
 
             // ── FIC (symbols 0-2) ────────────────────────────────────────── //
+            fic.begin_frame();
             let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
             for sym in fic_symbols {
                 fic.process_symbol(sym);
@@ -244,62 +245,125 @@ fn run_pipeline(
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Wraps the Viterbi decoder and FicHandler for the FIC channel.
+///
+/// The FIC is punctured: 3 OFDM symbols × 3 072 soft bits = 9 216 bits
+/// are split into 4 FIC blocks of 2 304 punctured bits each.
+/// Each block is depunctured (PI_16/PI_15/PI_X) → 3 096 mother-code bits
+/// → Viterbi → 768 info bits = 96 bytes = 3 FIBs.
 pub struct FicDecoder {
     viterbi: ViterbiDecoder,
+    /// PRBS sequence for energy de-dispersal (768 bits = full CIF).
+    ///
+    /// ETSI EN 300 401 §12: the PRBS runs continuously across all 3 FIBs
+    /// within a CIF (not reset per FIB).
+    prbs_bits: Vec<u8>,
     pub handler: FicHandler,
+    /// Accumulation buffer for FIC soft bits across OFDM symbols.
+    fic_buf: Vec<f32>,
 }
 
 impl FicDecoder {
     pub fn new() -> Self {
         FicDecoder {
             viterbi: ViterbiDecoder::new(5 * fec::viterbi::K),
+            prbs_bits: Self::generate_prbs(768),
             handler: FicHandler::new(),
+            fic_buf: Vec::with_capacity(fec::FIC_PUNCTURED_BITS),
         }
     }
 
-    /// Decode one FIC OFDM symbol (3072 soft bits).
+    /// Generate energy dispersal PRBS: polynomial x^9 + x^5 + 1, all-ones init.
+    fn generate_prbs(len: usize) -> Vec<u8> {
+        let mut reg: u16 = 0x1FF; // 9-bit register, all ones
+        let mut out = Vec::with_capacity(len);
+        for _ in 0..len {
+            let bit = ((reg >> 8) ^ (reg >> 4)) & 1;
+            out.push(bit as u8);
+            reg = ((reg << 1) | bit) & 0x1FF;
+        }
+        out
+    }
+
+    /// Reset the accumulation buffer at the start of a new frame.
+    pub fn begin_frame(&mut self) {
+        self.fic_buf.clear();
+    }
+
+    /// Feed one FIC OFDM symbol (3 072 soft bits).
     ///
-    /// Each FIC symbol encodes 3 FIBs (768 info bits) at mother code rate 1/4.
-    /// We append 24 tail erasures (6 flush bits × 4 mother-code outputs) and
-    /// run Viterbi, then take the first 768 decoded bits = 96 bytes = 3 FIBs.
+    /// Soft bits are accumulated and a FIC block is processed every
+    /// 2 304 bits (the punctured block size).
     pub fn process_symbol(&mut self, soft: &[f32]) {
+        log::debug!(
+            "FIC: accumulating {} soft bits (buf={})",
+            soft.len(),
+            self.fic_buf.len()
+        );
+
+        for &s in soft {
+            self.fic_buf.push(s);
+            if self.fic_buf.len() >= fec::FIC_PUNCTURED_BITS {
+                self.process_fic_block();
+            }
+        }
+    }
+
+    /// Process one complete FIC block (2 304 punctured soft bits).
+    fn process_fic_block(&mut self) {
         const INFO_BITS: usize = 768;
-        const TAIL_ERASURES: usize = 24; // 6 flush bits × 4 generator polynomials
 
-        log::debug!("FIC: processing symbol with {} soft bits", soft.len());
+        let block: Vec<f32> = self.fic_buf.drain(..fec::FIC_PUNCTURED_BITS).collect();
 
-        // Append tail erasures.
-        let mut padded = Vec::with_capacity(soft.len() + TAIL_ERASURES);
-        padded.extend_from_slice(soft);
-        padded.extend(std::iter::repeat_n(0.0f32, TAIL_ERASURES));
+        // Normalize soft bits to ~[-1, +1] for Viterbi.
+        let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if max_abs > 0.0 { 1.0 / max_abs } else { 1.0 };
+        let normalized: Vec<f32> = block.iter().map(|v| v * scale).collect();
 
-        let bits = self.viterbi.decode(&padded);
+        // Depuncture 2304 → 3096 using PI_16/PI_15/PI_X.
+        let depunctured = fec::fic_depuncture(&normalized);
+
+        let bits = self.viterbi.decode(&depunctured);
         let info = &bits[..bits.len().min(INFO_BITS)];
 
         // Pack bits MSB-first → 96 bytes.
-        let fic_bytes = pack_bits(info);
+        let mut fic_bytes = pack_bits(info);
 
-        // Log FIB CRC results for debugging.
-        if log::log_enabled!(log::Level::Debug) {
-            for fib_idx in 0..3 {
-                let start = fib_idx * 32;
-                if start + 32 <= fic_bytes.len() {
-                    let fib = &fic_bytes[start..start + 32];
-                    let crc_ok = fib_crc_check(fib);
-                    log::debug!(
-                        "FIC: FIB {} CRC {} (first bytes: {:02X} {:02X} {:02X} {:02X})",
-                        fib_idx,
-                        if crc_ok { "OK" } else { "FAIL" },
-                        fib[0],
-                        fib[1],
-                        fib[2],
-                        fib[3]
-                    );
-                }
+        // Energy de-dispersal: apply continuous PRBS across all 3 FIBs.
+        self.energy_dedispersal(&mut fic_bytes);
+
+        // Log FIB CRC results.
+        for fib_idx in 0..3 {
+            let start = fib_idx * 32;
+            if start + 32 <= fic_bytes.len() {
+                let fib = &fic_bytes[start..start + 32];
+                let crc_ok = fib_crc_check(fib);
+                log::debug!(
+                    "FIC: FIB {} CRC {} (first bytes: {:02X} {:02X} {:02X} {:02X})",
+                    fib_idx,
+                    if crc_ok { "OK" } else { "FAIL" },
+                    fib[0],
+                    fib[1],
+                    fib[2],
+                    fib[3]
+                );
             }
         }
 
         self.handler.process_fic_bytes(&fic_bytes);
+    }
+
+    /// XOR FIC bytes (96 bytes = 3 FIBs) with the continuous PRBS.
+    fn energy_dedispersal(&self, fic_bytes: &mut [u8]) {
+        for (i, byte) in fic_bytes.iter_mut().enumerate() {
+            let mut mask = 0u8;
+            for bit in 0..8 {
+                let idx = i * 8 + bit;
+                if idx < self.prbs_bits.len() && self.prbs_bits[idx] != 0 {
+                    mask |= 0x80 >> bit;
+                }
+            }
+            *byte ^= mask;
+        }
     }
 }
 

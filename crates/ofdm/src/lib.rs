@@ -10,7 +10,7 @@ pub use sync::{FrameStart, FrameSync};
 use num_complex::Complex32;
 use thiserror::Error;
 
-use params::{FRAME_SYMBOLS, NUM_CARRIERS, SYMBOL_SIZE};
+use params::{FFT_SIZE, FRAME_SYMBOLS, GUARD_SIZE, NUM_CARRIERS, SYMBOL_SIZE};
 
 // -------------------------------------------------------------------------- //
 //  Error type                                                                 //
@@ -88,14 +88,15 @@ impl OfdmProcessor {
                 let to_feed = &self.sample_buf[sync_consumed..];
 
                 if let Some(fs) = self.sync.push_samples(to_feed) {
-                    // `fs.sample_offset` is the absolute sample index (as
-                    // counted by the sync) at which the PRS begins.
-                    // sample_buf[0] corresponds to absolute index 0 only if
-                    // we never trimmed the buffer.  Since we accumulate all
-                    // samples, sample_buf[i] ↔ absolute index i.
-                    self.prs_offset = Some(fs.sample_offset);
+                    // The energy-based null detector has a lag due to its
+                    // sliding window.  Refine the PRS start using guard-
+                    // interval correlation, which peaks at the exact symbol
+                    // boundary.
+                    let refined = Self::refine_prs_start(&self.sample_buf, fs.sample_offset);
+                    self.prs_offset = Some(refined);
                     log::info!(
-                        "OfdmProcessor: frame lock, PRS at sample {}",
+                        "OfdmProcessor: frame lock, PRS at sample {} (raw {})",
+                        refined,
                         fs.sample_offset
                     );
                 } else {
@@ -179,6 +180,75 @@ impl OfdmProcessor {
         }
 
         frames
+    }
+}
+
+impl OfdmProcessor {
+    /// Refine the PRS start position using guard-interval correlation.
+    ///
+    /// The energy-based null detector has ~256-sample lag from its sliding
+    /// window.  We search backwards from the raw detection point for the
+    /// position that maximises guard-interval correlation (the cyclic prefix
+    /// is a copy of the last GUARD_SIZE samples of the useful part).
+    fn refine_prs_start(buf: &[Complex32], raw_offset: usize) -> usize {
+        let search_back = 512; // search up to 512 samples earlier
+        let search_fwd = 64; // and a little forward
+
+        let start = raw_offset.saturating_sub(search_back);
+        let end = (raw_offset + search_fwd).min(buf.len().saturating_sub(SYMBOL_SIZE));
+
+        let mut best_pos = raw_offset;
+        let mut best_corr = 0.0f32;
+
+        // Coarse search (step 4)
+        let mut pos = start;
+        while pos <= end {
+            let corr = Self::guard_corr(buf, pos);
+            if corr > best_corr {
+                best_corr = corr;
+                best_pos = pos;
+            }
+            pos += 4;
+        }
+
+        // Fine-tune (single-sample)
+        let fine_start = best_pos.saturating_sub(4);
+        let fine_end = (best_pos + 4).min(buf.len().saturating_sub(SYMBOL_SIZE));
+        for p in fine_start..=fine_end {
+            let corr = Self::guard_corr(buf, p);
+            if corr > best_corr {
+                best_corr = corr;
+                best_pos = p;
+            }
+        }
+
+        log::debug!(
+            "PRS refinement: raw={} → refined={} (Δ={}), guard_corr={:.4}",
+            raw_offset,
+            best_pos,
+            raw_offset as i64 - best_pos as i64,
+            best_corr
+        );
+        best_pos
+    }
+
+    /// Guard-interval correlation at a given position.
+    fn guard_corr(buf: &[Complex32], start: usize) -> f32 {
+        if start + SYMBOL_SIZE > buf.len() {
+            return 0.0;
+        }
+        let sym = &buf[start..start + SYMBOL_SIZE];
+        let mut corr = Complex32::new(0.0, 0.0);
+        let mut power = 0.0f32;
+        for n in 0..GUARD_SIZE {
+            corr += sym[n + FFT_SIZE] * sym[n].conj();
+            power += sym[n].norm_sqr() + sym[n + FFT_SIZE].norm_sqr();
+        }
+        if power > 0.0 {
+            corr.norm() / (power / 2.0)
+        } else {
+            0.0
+        }
     }
 }
 

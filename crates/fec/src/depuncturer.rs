@@ -143,10 +143,6 @@ pub const PUNCT_VECTORS: [[u8; 32]; 24] = [
 //  FIC puncturing definition                                                  //
 // -------------------------------------------------------------------------- //
 
-/// Tail bits appended to the FIC encoded stream (6 encoder-flush zeros × 4
-/// generator polynomials).
-const FIC_TAIL_BITS: usize = 24;
-
 // -------------------------------------------------------------------------- //
 //  Public API                                                                 //
 // -------------------------------------------------------------------------- //
@@ -191,18 +187,68 @@ pub fn depuncture(punctured: &[f32], pattern: &[u8; 32]) -> Vec<f32> {
     out
 }
 
-/// Prepare a FIC (Fast Information Channel) soft-bit stream for Viterbi
-/// decoding.
+/// Tail-bits puncturing pattern for FIC (PI_X).
 ///
-/// Each FIC symbol carries 3 072 soft bits at the mother-code rate of 1/4
-/// (essentially unpunctured).  These encode 768 information bits + 6 tail
-/// bits = 774 input bits × 4 = 3 096 coded bits.  The last 24 coded bits
-/// (the tail) are not transmitted, so we append 24 zero-valued erasures
-/// to reconstruct the full 3 096-element input for the Viterbi decoder.
+/// ETSI EN 300 401 §11.1.2: the 24 tail coded bits use this pattern
+/// (12 ones out of 24).
+const PI_X: [u8; 24] = [
+    1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0,
+];
+
+/// Number of punctured soft bits per FIC block.
+pub const FIC_PUNCTURED_BITS: usize = 2304;
+
+/// De-puncture a FIC (Fast Information Channel) block for Viterbi decoding.
+///
+/// ETSI EN 300 401 §11.1.2, Table 30:
+///   - 21 blocks of PI_16 (24/32 ones, repeated 4× = 128 positions per block)
+///   - 3 blocks of PI_15  (23/32 ones, repeated 4× = 128 positions per block)
+///   - 24 tail positions with PI_X (12/24 ones)
+///
+/// Input:  2 304 punctured soft bits (one FIC block).
+/// Output: 3 096 mother-code soft bits ready for Viterbi.
 pub fn fic_depuncture(soft: &[f32]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(soft.len() + FIC_TAIL_BITS);
-    out.extend_from_slice(soft);
-    out.resize(out.len() + FIC_TAIL_BITS, 0.0f32);
+    let pi_16 = &PUNCT_VECTORS[15]; // PI_16 = index 15 (0-based)
+    let pi_15 = &PUNCT_VECTORS[14]; // PI_15 = index 14
+
+    let mut out = Vec::with_capacity(3096);
+    let mut src = 0usize;
+
+    // Helper: apply one block (4 repetitions of a 32-element pattern).
+    let apply_block = |pattern: &[u8; 32], out: &mut Vec<f32>, src: &mut usize| {
+        for _ in 0..4 {
+            for &keep in pattern.iter() {
+                if keep == 1 {
+                    out.push(if *src < soft.len() { soft[*src] } else { 0.0 });
+                    *src += 1;
+                } else {
+                    out.push(0.0);
+                }
+            }
+        }
+    };
+
+    // 21 blocks of PI_16.
+    for _ in 0..21 {
+        apply_block(pi_16, &mut out, &mut src);
+    }
+
+    // 3 blocks of PI_15.
+    for _ in 0..3 {
+        apply_block(pi_15, &mut out, &mut src);
+    }
+
+    // Tail: 24 positions with PI_X.
+    for &keep in PI_X.iter() {
+        if keep == 1 {
+            out.push(if src < soft.len() { soft[src] } else { 0.0 });
+            src += 1;
+        } else {
+            out.push(0.0);
+        }
+    }
+
+    debug_assert_eq!(out.len(), 3096);
     out
 }
 
@@ -252,17 +298,28 @@ mod tests {
     }
 
     #[test]
-    fn fic_depuncture_appends_tail() {
-        let input = vec![1.0f32; 3072]; // one FIC symbol
+    fn fic_depuncture_correct_size() {
+        let input = vec![1.0f32; FIC_PUNCTURED_BITS]; // one FIC block (2304 bits)
         let out = fic_depuncture(&input);
-        // 3072 soft bits + 24 tail erasures = 3096.
-        assert_eq!(out.len(), 3072 + FIC_TAIL_BITS);
-        // Last FIC_TAIL_BITS entries should be 0.
-        for &v in out.iter().rev().take(FIC_TAIL_BITS) {
-            assert_eq!(v, 0.0f32);
-        }
-        // Original data preserved.
-        assert!(out[..3072].iter().all(|&v| v == 1.0));
+        assert_eq!(out.len(), 3096, "depunctured FIC block should be 3096 bits");
+    }
+
+    #[test]
+    fn fic_depuncture_erasures_are_zero() {
+        let input = vec![1.0f32; FIC_PUNCTURED_BITS];
+        let out = fic_depuncture(&input);
+        // Every erased position (pattern=0) should be 0.0.
+        let erased_count = out.iter().filter(|&&v| v == 0.0).count();
+        // 3096 - 2304 = 792 erasures.
+        assert_eq!(erased_count, 3096 - FIC_PUNCTURED_BITS);
+    }
+
+    #[test]
+    fn fic_depuncture_kept_bits_nonzero() {
+        let input: Vec<f32> = (1..=FIC_PUNCTURED_BITS as i32).map(|i| i as f32).collect();
+        let out = fic_depuncture(&input);
+        let kept_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert_eq!(kept_count, FIC_PUNCTURED_BITS);
     }
 
     #[test]
