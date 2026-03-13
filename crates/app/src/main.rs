@@ -1,0 +1,384 @@
+mod countries;
+mod pipeline;
+mod tui;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "dab-rtl",
+    about = "Pure-Rust DAB/DAB+ radio receiver",
+    version
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+
+    /// RTL-SDR device index
+    #[arg(short = 'd', long, default_value = "0", global = true)]
+    device: u32,
+
+    /// Crystal frequency correction in PPM
+    #[arg(long, default_value = "0", global = true)]
+    ppm: i32,
+
+    /// Tuner gain in tenths of dB (−1 = hardware AGC)
+    #[arg(short = 'g', long, default_value = "-1", global = true)]
+    gain: i32,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List connected RTL-SDR devices
+    ListDevices,
+
+    /// List available audio output devices
+    ListAudio,
+
+    /// List supported countries and their DAB channels
+    ListCountries,
+
+    /// Scan for DAB stations on the given channel (no TUI)
+    Scan {
+        /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
+        #[arg(short = 'c', long, required_unless_present = "country")]
+        channel: Option<String>,
+
+        /// ISO 3166-1 alpha-2 country code (e.g. NO, GB, DE); scans all channels
+        #[arg(long, conflicts_with = "channel")]
+        country: Option<String>,
+    },
+
+    /// Tune to a channel and launch the interactive TUI
+    Tune {
+        /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
+        #[arg(short = 'c', long)]
+        channel: String,
+
+        /// Audio output device name (default = system default)
+        #[arg(short = 'a', long)]
+        audio_device: Option<String>,
+    },
+
+    /// Play a specific station (non-interactive)
+    Play {
+        /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
+        #[arg(short = 'c', long)]
+        channel: String,
+
+        /// Station name (case-insensitive substring match)
+        #[arg(short = 's', long)]
+        station: String,
+
+        /// Audio output device name (default = system default)
+        #[arg(short = 'a', long)]
+        audio_device: Option<String>,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────── //
+//  DAB Band III channel table                                                  //
+// ─────────────────────────────────────────────────────────────────────────── //
+
+pub fn channel_to_freq(ch: &str) -> Option<u32> {
+    match ch.to_uppercase().as_str() {
+        "5A"  => Some(174_928_000),
+        "5B"  => Some(176_640_000),
+        "5C"  => Some(178_352_000),
+        "5D"  => Some(180_064_000),
+        "6A"  => Some(181_936_000),
+        "6B"  => Some(183_648_000),
+        "6C"  => Some(185_360_000),
+        "6D"  => Some(187_072_000),
+        "7A"  => Some(188_928_000),
+        "7B"  => Some(190_640_000),
+        "7C"  => Some(192_352_000),
+        "7D"  => Some(194_064_000),
+        "8A"  => Some(195_936_000),
+        "8B"  => Some(197_648_000),
+        "8C"  => Some(199_360_000),
+        "8D"  => Some(201_072_000),
+        "9A"  => Some(202_928_000),
+        "9B"  => Some(204_640_000),
+        "9C"  => Some(206_352_000),
+        "9D"  => Some(208_064_000),
+        "10A" => Some(209_936_000),
+        "10B" => Some(211_648_000),
+        "10C" => Some(213_360_000),
+        "10D" => Some(215_072_000),
+        "11A" => Some(216_928_000),
+        "11B" => Some(218_640_000),
+        "11C" => Some(220_352_000),
+        "11D" => Some(222_064_000),
+        "12A" => Some(223_936_000),
+        "12B" => Some(225_648_000),
+        "12C" => Some(227_360_000),
+        "12D" => Some(229_072_000),
+        "13A" => Some(230_784_000),
+        "13B" => Some(232_496_000),
+        "13C" => Some(234_208_000),
+        "13D" => Some(235_776_000),
+        "13E" => Some(237_488_000),
+        "13F" => Some(239_200_000),
+        other => other.parse::<u32>().ok(),
+    }
+}
+
+fn resolve_channel(ch: &str) -> u32 {
+    channel_to_freq(ch).unwrap_or_else(|| {
+        eprintln!("error: unknown channel '{ch}'");
+        std::process::exit(1);
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────── //
+//  Entry point                                                                 //
+// ─────────────────────────────────────────────────────────────────────────── //
+
+fn main() {
+    env_logger::init();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::ListDevices => cmd_list_devices(),
+        Command::ListAudio => cmd_list_audio(),
+        Command::ListCountries => countries::print_countries(),
+        Command::Scan { channel, country } => {
+            let channels: Vec<String> = if let Some(code) = country {
+                match countries::channels_for_country(&code) {
+                    Some(chs) => chs.iter().map(|s| s.to_string()).collect(),
+                    None => {
+                        eprintln!("error: unknown country code '{code}'. Try `list-countries`.");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                vec![channel.expect("channel or country required")]
+            };
+            for ch in &channels {
+                let freq = resolve_channel(ch);
+                cmd_scan(cli.device, cli.ppm, cli.gain, freq);
+            }
+        }
+        Command::Tune { channel, audio_device } => {
+            let freq = resolve_channel(&channel);
+            cmd_tune(cli.device, cli.ppm, cli.gain, freq, audio_device);
+        }
+        Command::Play { channel, station, audio_device } => {
+            let freq = resolve_channel(&channel);
+            cmd_play(cli.device, cli.ppm, cli.gain, freq, station, audio_device);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────── //
+//  Subcommand implementations                                                  //
+// ─────────────────────────────────────────────────────────────────────────── //
+
+fn cmd_list_devices() {
+    let devices = sdr::list_devices();
+    if devices.is_empty() {
+        println!("No RTL-SDR devices found.");
+    } else {
+        for (idx, name) in devices {
+            println!("[{idx}] {name}");
+        }
+    }
+}
+
+fn cmd_list_audio() {
+    let devices = audio::list_devices();
+    if devices.is_empty() {
+        println!("No audio output devices found.");
+    } else {
+        for (idx, name) in devices {
+            println!("[{idx}] {name}");
+        }
+    }
+}
+
+/// Headless scan: print services as they are decoded from the FIC.
+fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
+    use ofdm::OfdmProcessor;
+    use pipeline::FicDecoder;
+
+    println!(
+        "Scanning {:.3} MHz (device {device_idx})…",
+        freq_hz as f64 / 1e6
+    );
+
+    let config = sdr::DeviceConfig {
+        index: device_idx,
+        center_freq_hz: freq_hz,
+        gain,
+        ppm_correction: ppm,
+    };
+    let iq_rx = match sdr::open_stream(config, 32_768) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    };
+
+    let mut ofdm = OfdmProcessor::new();
+    let mut fic = FicDecoder::new();
+    let mut printed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+
+    for iq_buf in iq_rx.iter() {        
+        for frame in ofdm.push_samples(&iq_buf) {
+            // Decode the 3 FIC symbols.
+            for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+                fic.process_symbol(sym);
+            }
+
+            let ens = fic.handler.ensemble();
+            if !ens.label.is_empty() {
+                // Print ensemble label once.
+                if printed.is_empty() {
+                    println!("Ensemble: {} (EId {:04X})", ens.label, ens.id);
+                }
+                for svc in &ens.services {
+                    if printed.insert(svc.id) {
+                        println!(
+                            "  [{:08X}]  {}",
+                            svc.id,
+                            if svc.label.is_empty() { "<no label>" } else { &svc.label }
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Interactive TUI on a channel: let the user browse and select a station.
+fn cmd_tune(
+    device_idx: u32,
+    ppm: i32,
+    gain: i32,
+    freq_hz: u32,
+    audio_device: Option<String>,
+) {
+    println!(
+        "Tuning to {:.3} MHz…",
+        freq_hz as f64 / 1e6
+    );
+
+    let config = sdr::DeviceConfig {
+        index: device_idx,
+        center_freq_hz: freq_hz,
+        gain,
+        ppm_correction: ppm,
+    };
+
+    let handle = match pipeline::start(config, audio_device) {
+        Ok(h) => h,
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    };
+
+    if let Err(e) = tui::run(handle) {
+        eprintln!("TUI error: {e}");
+    }
+}
+
+/// Non-interactive play: find the named station and start audio immediately.
+fn cmd_play(
+    device_idx: u32,
+    ppm: i32,
+    gain: i32,
+    freq_hz: u32,
+    station: String,
+    audio_device: Option<String>,
+) {
+    use pipeline::{PipelineCmd, PipelineUpdate};
+
+    println!(
+        "Searching for '{}' on {:.3} MHz…  Press Ctrl-C to stop.",
+        station,
+        freq_hz as f64 / 1e6
+    );
+
+    let config = sdr::DeviceConfig {
+        index: device_idx,
+        center_freq_hz: freq_hz,
+        gain,
+        ppm_correction: ppm,
+    };
+
+    let handle = match pipeline::start(config, audio_device) {
+        Ok(h) => h,
+        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+    };
+
+    let mut started = false;
+
+    for update in handle.update_rx.iter() {
+        match update {
+            PipelineUpdate::Ensemble(ens) => {
+                if !started {
+                    for svc in &ens.services {
+                        if svc.label.to_lowercase().contains(&station.to_lowercase()) {
+                            println!("Found: {} — starting playback", svc.label);
+                            let _ = handle.cmd_tx.try_send(PipelineCmd::Play(svc.id));
+                            started = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            PipelineUpdate::Playing { label } => {
+                println!("Playing: {label}");
+            }
+            PipelineUpdate::Status(s) => {
+                log::info!("Pipeline: {s}");
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────── //
+//  Tests                                                                       //
+// ─────────────────────────────────────────────────────────────────────────── //
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_channels_resolve() {
+        assert_eq!(channel_to_freq("11C"), Some(220_352_000));
+        assert_eq!(channel_to_freq("5A"),  Some(174_928_000));
+        assert_eq!(channel_to_freq("13F"), Some(239_200_000));
+    }
+
+    #[test]
+    fn channel_case_insensitive() {
+        assert_eq!(channel_to_freq("11c"), channel_to_freq("11C"));
+    }
+
+    #[test]
+    fn raw_frequency_passthrough() {
+        assert_eq!(channel_to_freq("220352000"), Some(220_352_000));
+    }
+
+    #[test]
+    fn unknown_channel_returns_none() {
+        assert_eq!(channel_to_freq("99Z"), None);
+    }
+
+    #[test]
+    fn all_band3_channels_covered() {
+        let channels = [
+            "5A","5B","5C","5D",
+            "6A","6B","6C","6D",
+            "7A","7B","7C","7D",
+            "8A","8B","8C","8D",
+            "9A","9B","9C","9D",
+            "10A","10B","10C","10D",
+            "11A","11B","11C","11D",
+            "12A","12B","12C","12D",
+            "13A","13B","13C","13D","13E","13F",
+        ];
+        for ch in &channels {
+            assert!(channel_to_freq(ch).is_some(), "missing channel {ch}");
+        }
+    }
+}

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/app",
+    "crates/sdr",
+    "crates/ofdm",
+    "crates/fec",
+    "crates/protocol",
+    "crates/audio",
+]
+
+[workspace.dependencies]
+num-complex = "0.4"
+rustfft    = "6"
+log        = "0.4"
+thiserror  = "1"
