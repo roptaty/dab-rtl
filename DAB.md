@@ -267,6 +267,83 @@ Frequency de-interleave
 | FIC symbols | 3 (symbols 1–3) |
 | MSC symbols | 72 (symbols 4–75, 4 CIFs × 18) |
 
+## Services and the Ensemble
+
+### What an Ensemble Is
+
+A DAB **ensemble** (also called a multiplex or "mux") is a collection of services (radio stations, data services) sharing a single RF channel. All services in an ensemble are broadcast together at the same frequency, multiplexed in the time domain across the 72 MSC symbols per frame. A typical ensemble carries 6–12 audio services.
+
+The ensemble has a global identity:
+
+| Field | Description |
+|---|---|
+| EId (Ensemble Identifier) | 16-bit ID: upper 4 bits = country code (ECC), lower 12 bits = ensemble reference |
+| Ensemble label | Human-readable name, e.g. "BBC National DAB" |
+| LTO | Local time offset from UTC |
+
+### Roles
+
+| Role | Responsibility |
+|---|---|
+| **Spectrum regulator** | Assigns DAB frequencies and geographic coverage areas; issues licences to multiplex operators (e.g. Ofcom in the UK, Bundesnetzagentur in Germany) |
+| **Multiplex operator** | Holds the spectrum licence; operates the transmitter network; signs contracts with broadcasters; configures the ensemble |
+| **Broadcaster / service provider** | Produces the audio programme; delivers an encoded audio stream to the multiplex operator for inclusion |
+
+### Administrative Steps to Join an Ensemble
+
+1. **Spectrum allocation.** The regulator assigns a Band III channel (e.g. 11D = 220.352 MHz) to a multiplex operator for a defined geographic area. The licence specifies power, antenna height, and coverage obligations.
+
+2. **Carriage agreement.** A broadcaster negotiates a carriage contract with the multiplex operator. The contract specifies:
+   - Number of Capacity Units (CUs) reserved — directly sets the bitrate: `bitrate = CU_count × 8 kbps / protection_overhead`
+   - Protection level (EEP 1-A … 4-B or UEP) — trades bitrate against error resilience
+   - Audio codec: DAB (MP2) or DAB+ (HE-AAC)
+   - Service IDs and labels to be broadcast
+
+3. **Service ID assignment.** The multiplex operator allocates:
+   - **SId** (Service Identifier): 16-bit programme ID, upper nibble = country ECC
+   - **SCIdS** (Service Component Identifier within Service): usually 0 for the primary audio component
+   - **Sub-channel ID** (SubChId): 6-bit index (0–63), unique within the ensemble
+
+4. **Multiplex reconfiguration.** The operator updates the multiplexer configuration. A **reconfiguration counter** in FIG 0/0 is incremented; receivers detect the change flag and re-read the FIC to update their service maps. New services become visible to receivers within a few seconds (one or more FIC cycles).
+
+### Technical Encoding (Broadcaster → Transmitter)
+
+```
+Programme audio
+    │
+    ▼  Audio codec
+MP2 encoder (DAB)  or  HE-AAC encoder (DAB+)
+    │  e.g. 128 kbps MP2 = 384 bytes per 96 ms frame
+    │
+    ▼  Channel coding
+Convolutional encoder (K=7, rate 1/4) + puncturing to agreed protection level
+    │
+    ▼  Multiplexer
+Bits slotted into assigned CU range within each CIF
+    │  (18 MSC symbols × 4 CIFs, start_CU .. start_CU + size_CU)
+    │
+    ▼  Ensemble multiplexer
+FIC updated with FIG 0/1, 0/2, 1/1 describing the service
+    │
+    ▼
+OFDM modulator → transmitter
+```
+
+### How the Receiver Discovers a Service
+
+The FIC (transmitted in symbols 1–3 of every frame) carries the ensemble configuration. On first tune, the receiver collects FIBs until it has seen:
+
+| FIG | What it provides |
+|---|---|
+| FIG 0/0 | EId, change flags — tells the receiver whether the config is still current |
+| FIG 0/1 | Sub-channel table: SubChId → start CU, size, protection level |
+| FIG 0/2 | Service → component → SubChId mapping (links SId to a sub-channel) |
+| FIG 1/1 | Service label (human-readable station name) |
+
+Once FIG 0/1 and 0/2 are both received for a service, the receiver knows where in the MSC bit stream to find it and how to depuncture and decode it. FIG 1/1 provides the label shown in the UI.
+
+A service can be **removed** by the multiplex operator by omitting its FIG 0/2 entry and incrementing the reconfiguration counter, or by reducing its CU allocation to zero. Receivers that fail to see a service in the FIC for several consecutive frames typically remove it from the service list.
+
 ## Terms
 
 ### Viterbi Decoder
