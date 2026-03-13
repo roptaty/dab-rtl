@@ -51,7 +51,10 @@ fn build_transitions() -> [[Transition; 2]; NUM_STATES] {
             for (i, &poly) in G.iter().enumerate() {
                 output_bits[i] = encode_bit(s, input, poly);
             }
-            row[input as usize] = Transition { next_state, output_bits };
+            row[input as usize] = Transition {
+                next_state,
+                output_bits,
+            };
         }
     }
     table
