@@ -9,132 +9,133 @@
 //  Puncturing vectors PI_1 … PI_24                                           //
 // -------------------------------------------------------------------------- //
 
-/// All 24 standard DAB puncturing vectors.
+/// All 24 standard DAB puncturing vectors per ETSI EN 300 401 Table 31.
 ///
-/// Index 0 = PI_1 (code rate 4/4, no puncturing)
-/// Index 1 = PI_2 (code rate 4/3)
+/// Index 0 = PI_1 (9 ones — heaviest puncturing)
 /// …
-/// Index 23 = PI_24 (code rate 4/1, very heavy puncturing)
+/// Index 23 = PI_24 (32 ones — no puncturing)
+///
+/// Higher PI number = more bits kept = less puncturing = lower code rate.
 pub const PUNCT_VECTORS: [[u8; 32]; 24] = [
-    // PI_1: rate 4/4 — all bits kept
+    // PI_1: 9 ones per 32
+    [
+        1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0,
+        0, 0,
+    ],
+    // PI_2: 10 ones per 32
+    [
+        1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0,
+        0, 0,
+    ],
+    // PI_3: 11 ones per 32
+    [
+        1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0,
+        0, 0,
+    ],
+    // PI_4: 12 ones per 32
+    [
+        1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0,
+        0, 0,
+    ],
+    // PI_5: 13 ones per 32
+    [
+        1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0,
+        0, 0,
+    ],
+    // PI_6: 14 ones per 32
+    [
+        1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+        0, 0,
+    ],
+    // PI_7: 15 ones per 32
+    [
+        1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0,
+        0, 0,
+    ],
+    // PI_8: 16 ones per 32
+    [
+        1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_9: 17 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_10: 18 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_11: 19 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_12: 20 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_13: 21 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_14: 22 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_15: 23 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1,
+        0, 0,
+    ],
+    // PI_16: 24 ones per 32
+    [
+        1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1,
+        1, 0,
+    ],
+    // PI_17: 25 ones per 32
+    [
+        1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1,
+        1, 0,
+    ],
+    // PI_18: 26 ones per 32
+    [
+        1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1,
+        1, 0,
+    ],
+    // PI_19: 27 ones per 32
+    [
+        1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1,
+        1, 0,
+    ],
+    // PI_20: 28 ones per 32
+    [
+        1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1,
+        1, 0,
+    ],
+    // PI_21: 29 ones per 32
+    [
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1,
+        1, 0,
+    ],
+    // PI_22: 30 ones per 32
+    [
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 0,
+    ],
+    // PI_23: 31 ones per 32
+    [
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 0,
+    ],
+    // PI_24: 32 ones per 32 — no puncturing
     [
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
         1, 1,
-    ],
-    // PI_2: rate 4/3 — 24 ones per 32
-    [
-        1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1,
-        0, 1,
-    ],
-    // PI_3: rate 4/3 — slightly different pattern
-    [
-        1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0, 0, 1, 1, 1, 0, 1, 1, 0,
-        0, 1,
-    ],
-    // PI_4: rate 4/2 — 16 ones per 32
-    [
-        1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0,
-        0, 1,
-    ],
-    // PI_5: rate 4/2 — denser at the front
-    [
-        1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0,
-        0, 1,
-    ],
-    // PI_6: rate 4/2 — alternating pairs
-    [
-        1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0,
-        0, 1,
-    ],
-    // PI_7: rate 4/2 — asymmetric
-    [
-        1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0,
-        0, 1,
-    ],
-    // PI_8: rate 4/2 — 12 ones
-    [
-        1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0,
-        0, 1,
-    ],
-    // PI_9: 10 ones per 32
-    [
-        1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0,
-        0, 0,
-    ],
-    // PI_10: 8 ones per 32
-    [
-        1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0,
-        0, 0,
-    ],
-    // PI_11: 7 ones per 32
-    [
-        1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
-        0, 0,
-    ],
-    // PI_12: 6 ones per 32
-    [
-        1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-        0, 0,
-    ],
-    // PI_13: 5 ones per 32
-    [
-        1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-        0, 0,
-    ],
-    // PI_14: 4 ones per 32
-    [
-        1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
-        0, 0,
-    ],
-    // PI_15: 3 ones per 32
-    [
-        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0,
-    ],
-    // PI_16: 2 ones per 32 (used in FIC)
-    [
-        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0,
-    ],
-    // PI_17: 14 ones — heavier than PI_2, lighter than PI_1
-    [
-        1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 0, 1,
-        1, 1,
-    ],
-    // PI_18: 12 ones
-    [
-        1, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1,
-        1, 0,
-    ],
-    // PI_19: 10 ones
-    [
-        1, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1,
-        1, 0,
-    ],
-    // PI_20: 9 ones
-    [
-        1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1,
-        0, 0,
-    ],
-    // PI_21: 8 ones
-    [
-        1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
-        1, 0,
-    ],
-    // PI_22: 6 ones
-    [
-        1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
-        0, 0,
-    ],
-    // PI_23: 4 ones
-    [
-        1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
-        0, 0,
-    ],
-    // PI_24: 2 ones — maximum puncturing
-    [
-        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
-        0, 0,
     ],
 ];
 
@@ -142,16 +143,9 @@ pub const PUNCT_VECTORS: [[u8; 32]; 24] = [
 //  FIC puncturing definition                                                  //
 // -------------------------------------------------------------------------- //
 
-/// Number of FIC sub-channels (groups) in one FIC block.
-/// The FIC is encoded with a specific scheme: 2 304 bits coded, 768 info bits.
-/// Three sections use PI_16 (very heavy puncturing) with tail bits appended.
-///
-/// In practice the FIC uses the following structure (ETSI §11.3):
-///   21 × 32-bit group using PI_16 (all-ones), then 24 tail bits.
-/// This corresponds to a rate-1/3 code (768 bits in, 2304 bits out ≈ rate 1/3
-/// for the mother rate-1/4 code with puncturing).
-const FIC_GROUPS: usize = 21;
-const FIC_TAIL_BITS: usize = 24; // 6 tailing zero-bits × 4 outputs
+/// Tail bits appended to the FIC encoded stream (6 encoder-flush zeros × 4
+/// generator polynomials).
+const FIC_TAIL_BITS: usize = 24;
 
 // -------------------------------------------------------------------------- //
 //  Public API                                                                 //
@@ -197,32 +191,18 @@ pub fn depuncture(punctured: &[f32], pattern: &[u8; 32]) -> Vec<f32> {
     out
 }
 
-/// De-puncture a FIC (Fast Information Channel) soft-bit stream.
+/// Prepare a FIC (Fast Information Channel) soft-bit stream for Viterbi
+/// decoding.
 ///
-/// The FIC puncturing scheme (ETSI EN 300 401 §11.3.1) uses PI_1 (all ones,
-/// i.e. no puncturing) for the FIC protection class.  The encoded FIC block
-/// is 2 304 rate-1/4 bits (= 576 coded symbols of 4 bits each) followed by
-/// 24 tail bits, totalling 2 328 soft bits.  The information content is
-/// 768 bits.
-///
-/// This function inserts the tail-bit erasures (24 zeros appended) and
-/// returns the 2 328-element soft-bit vector ready for the Viterbi decoder.
-pub fn fic_depuncture(punctured: &[f32]) -> Vec<f32> {
-    // FIC uses PI_1 (all ones) for the main body → the punctured stream
-    // is already full-rate.  We just need to append the tail-bit erasures.
-    let mut out = Vec::with_capacity(punctured.len() + FIC_TAIL_BITS);
-
-    // Main body: FIC_GROUPS × 32 bits, all transmitted (PI_1 = all ones).
-    let main_len = FIC_GROUPS * 32; // 672
-    let body = &punctured[..main_len.min(punctured.len())];
-
-    // Re-expand through PI_1 (no-op but kept for consistency).
-    let pi1 = &PUNCT_VECTORS[0];
-    out.extend(depuncture(body, pi1));
-
-    // Tail bits: 24 zero-valued soft bits (encoder tail zeros, always 0.0).
+/// Each FIC symbol carries 3 072 soft bits at the mother-code rate of 1/4
+/// (essentially unpunctured).  These encode 768 information bits + 6 tail
+/// bits = 774 input bits × 4 = 3 096 coded bits.  The last 24 coded bits
+/// (the tail) are not transmitted, so we append 24 zero-valued erasures
+/// to reconstruct the full 3 096-element input for the Viterbi decoder.
+pub fn fic_depuncture(soft: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(soft.len() + FIC_TAIL_BITS);
+    out.extend_from_slice(soft);
     out.resize(out.len() + FIC_TAIL_BITS, 0.0f32);
-
     out
 }
 
@@ -235,50 +215,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pi1_no_erasures() {
+    fn pi24_no_erasures() {
+        // PI_24 (index 23) = all ones = no puncturing.
         let input: Vec<f32> = (0..64).map(|i| i as f32).collect();
-        let out = depuncture(&input, &PUNCT_VECTORS[0]);
-        assert_eq!(out, input, "PI_1 should be a no-op");
+        let out = depuncture(&input, &PUNCT_VECTORS[23]);
+        assert_eq!(out, input, "PI_24 should be a no-op");
     }
 
     #[test]
-    fn pi2_length_correct() {
-        // PI_2 has 24 ones per 32 → for 24 input bits we get 32 output bits.
-        let input = vec![1.0f32; 24];
-        let out = depuncture(&input, &PUNCT_VECTORS[1]);
+    fn pi1_length_correct() {
+        // PI_1 has 9 ones per 32 → 9 input bits produce 32 output bits.
+        let input = vec![1.0f32; 9];
+        let out = depuncture(&input, &PUNCT_VECTORS[0]);
         assert_eq!(out.len(), 32);
     }
 
     #[test]
-    fn pi2_erasures_are_zero() {
-        let input = vec![1.0f32; 24];
-        let out = depuncture(&input, &PUNCT_VECTORS[1]);
-        // PI_2 pattern: [1,1,0,1 ...] — position 2 (0-indexed) should be 0.
+    fn pi1_erasures_are_zero() {
+        // PI_1: [1,1,0,0, 1,0,0,0, ...] — position 2 should be erased.
+        let input = vec![1.0f32; 9];
+        let out = depuncture(&input, &PUNCT_VECTORS[0]);
         assert_eq!(out[2], 0.0f32);
+        assert_eq!(out[3], 0.0f32);
     }
 
     #[test]
-    fn pi2_kept_bits_preserved() {
-        let input: Vec<f32> = (0..24).map(|i| i as f32 + 1.0).collect();
-        let out = depuncture(&input, &PUNCT_VECTORS[1]);
-        // PI_2 positions 0,1,3 kept → out[0]=input[0], out[1]=input[1],
-        // out[2]=0.0, out[3]=input[2], ...
+    fn pi1_kept_bits_preserved() {
+        let input: Vec<f32> = (0..9).map(|i| i as f32 + 1.0).collect();
+        let out = depuncture(&input, &PUNCT_VECTORS[0]);
+        // PI_1 positions 0,1 kept, 2,3 erased, 4 kept, 5,6,7 erased, 8 kept, ...
         assert_eq!(out[0], 1.0);
         assert_eq!(out[1], 2.0);
         assert_eq!(out[2], 0.0); // erased
-        assert_eq!(out[3], 3.0);
+        assert_eq!(out[3], 0.0); // erased
+        assert_eq!(out[4], 3.0);
     }
 
     #[test]
     fn fic_depuncture_appends_tail() {
-        let input = vec![1.0f32; FIC_GROUPS * 32]; // 672 bits
+        let input = vec![1.0f32; 3072]; // one FIC symbol
         let out = fic_depuncture(&input);
-        // PI_1 is a no-op, then 24 tail zeros appended.
-        assert_eq!(out.len(), FIC_GROUPS * 32 + FIC_TAIL_BITS);
+        // 3072 soft bits + 24 tail erasures = 3096.
+        assert_eq!(out.len(), 3072 + FIC_TAIL_BITS);
         // Last FIC_TAIL_BITS entries should be 0.
         for &v in out.iter().rev().take(FIC_TAIL_BITS) {
             assert_eq!(v, 0.0f32);
         }
+        // Original data preserved.
+        assert!(out[..3072].iter().all(|&v| v == 1.0));
     }
 
     #[test]
@@ -286,6 +270,25 @@ mod tests {
         for (i, pv) in PUNCT_VECTORS.iter().enumerate() {
             assert_eq!(pv.len(), 32, "PI_{} wrong length", i + 1);
         }
+    }
+
+    #[test]
+    fn punct_vectors_ones_monotonic() {
+        // ETSI PI_1..PI_24: ones per 32 increase monotonically (9..32).
+        let mut prev_ones = 0usize;
+        for (i, pv) in PUNCT_VECTORS.iter().enumerate() {
+            let ones: usize = pv.iter().map(|&b| b as usize).sum();
+            assert!(
+                ones > prev_ones,
+                "PI_{} has {} ones, expected more than {}",
+                i + 1,
+                ones,
+                prev_ones
+            );
+            prev_ones = ones;
+        }
+        // PI_24 should have all 32 ones.
+        assert_eq!(prev_ones, 32);
     }
 
     #[test]

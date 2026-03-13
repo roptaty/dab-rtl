@@ -104,8 +104,10 @@ impl ViterbiDecoder {
         let mut path_metrics = vec![large; NUM_STATES];
         path_metrics[0] = 0;
 
-        // Survivor bits: survivors[t][state] = input bit chosen at step t
-        // for this state.
+        // Survivor table: survivors[t][state] = predecessor state index at
+        // step t.  The input bit is recovered as state & 1 (LSB of the
+        // destination state equals the input bit by construction of the
+        // state transition: next = ((prev << 1) | input) & mask).
         let mut survivors: Vec<Vec<u8>> = vec![vec![0u8; NUM_STATES]; n_symbols];
 
         // Forward ACS pass.
@@ -124,7 +126,7 @@ impl ViterbiDecoder {
                     let ns = tr.next_state as usize;
                     if candidate < new_metrics[ns] {
                         new_metrics[ns] = candidate;
-                        survivors[t][ns] = input;
+                        survivors[t][ns] = state as u8;
                     }
                 }
             }
@@ -140,17 +142,12 @@ impl ViterbiDecoder {
             .map(|(s, _)| s)
             .unwrap_or(0);
 
-        // Trace back.
+        // Trace back: recover input bits from the state LSB.
         let mut bits = vec![0u8; n_symbols];
         let mut state = best_state;
         for t in (0..n_symbols).rev() {
-            let bit = survivors[t][state];
-            bits[t] = bit;
-            // Reverse the state transition: previous state fed `bit` to reach
-            // `state`.  The next_state formula is ((prev << 1) | bit) & mask.
-            // So: prev = (state >> 1) | (bit << (K-2)) — we recover the
-            // (K-2) MSBs of prev from the upper bits of `state`.
-            state = (state >> 1) | ((bit as usize) << (K - 2));
+            bits[t] = (state & 1) as u8;
+            state = survivors[t][state] as usize;
         }
 
         bits

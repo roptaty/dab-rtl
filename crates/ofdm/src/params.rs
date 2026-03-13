@@ -28,7 +28,7 @@ pub const CARRIER_MIN: i32 = -768;
 pub const CARRIER_MAX: i32 = 768;
 
 /// Total samples in one DAB transmission frame
-pub const FRAME_SIZE: usize = NULL_SIZE + FRAME_SYMBOLS * SYMBOL_SIZE; // 196 952
+pub const FRAME_SIZE: usize = NULL_SIZE + FRAME_SYMBOLS * SYMBOL_SIZE; // 196 608
 
 /// Convert a DAB sub-carrier index k (−768..−1, +1..+768) to its FFT bin index.
 ///
@@ -45,7 +45,7 @@ mod tests {
 
     #[test]
     fn frame_size_matches_spec() {
-        assert_eq!(FRAME_SIZE, 196_952);
+        assert_eq!(FRAME_SIZE, 196_608);
     }
 
     #[test]

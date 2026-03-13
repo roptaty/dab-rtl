@@ -271,18 +271,23 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
                     }
                 }
             }
+        }
 
-            // Timeout: no ensemble lock.
-            if last_new_service.is_none() && start.elapsed() > Duration::from_secs(NO_LOCK_SECS) {
-                println!("  (no DAB signal — skipping)");
+        // Timeout checks run on every IQ buffer, not just when frames are
+        // produced.  Without signal the OFDM processor never yields frames,
+        // so placing these checks inside the `for frame` loop caused the
+        // scan to hang indefinitely on empty channels.
+
+        // Timeout: no ensemble lock.
+        if last_new_service.is_none() && start.elapsed() > Duration::from_secs(NO_LOCK_SECS) {
+            println!("  (no DAB signal — skipping)");
+            break 'outer;
+        }
+
+        // Timeout: no new services for SETTLE_SECS after first discovery.
+        if let Some(t) = last_new_service {
+            if t.elapsed() > Duration::from_secs(SETTLE_SECS) {
                 break 'outer;
-            }
-
-            // Timeout: no new services for SETTLE_SECS after first discovery.
-            if let Some(t) = last_new_service {
-                if t.elapsed() > Duration::from_secs(SETTLE_SECS) {
-                    break 'outer;
-                }
             }
         }
     }

@@ -333,18 +333,31 @@ impl MscDecoder {
 /// This uses a single-region approximation.  The ETSI two-region scheme
 /// (ETSI EN 300 401 Table 8a/8b) can be substituted once verified.
 ///
-/// Higher protection level number = lower code rate = more redundancy.
+/// ETSI protection levels: 1 = strongest (lowest code rate, most redundancy),
+/// 4 = weakest (highest code rate, least redundancy).
+/// Higher PI number = more bits kept = less puncturing.
 fn eep_punct_vector(protection: &ProtectionLevel) -> &'static [u8; 32] {
     match protection {
-        ProtectionLevel::EepA(1) | ProtectionLevel::EepB(1) => &PUNCT_VECTORS[0], // PI_1
-        ProtectionLevel::EepA(2) | ProtectionLevel::EepB(2) => &PUNCT_VECTORS[1], // PI_2
-        ProtectionLevel::EepA(3) | ProtectionLevel::EepB(3) => &PUNCT_VECTORS[2], // PI_3
-        ProtectionLevel::EepA(4) | ProtectionLevel::EepB(4) => &PUNCT_VECTORS[3], // PI_4
+        // Level 1 (strongest) → PI_24 (no puncturing, full rate-1/4)
+        ProtectionLevel::EepA(1) | ProtectionLevel::EepB(1) => &PUNCT_VECTORS[23], // PI_24
+        // Level 2 → PI_14 (22 ones)
+        ProtectionLevel::EepA(2) | ProtectionLevel::EepB(2) => &PUNCT_VECTORS[13], // PI_14
+        // Level 3 → PI_8 (16 ones)
+        ProtectionLevel::EepA(3) | ProtectionLevel::EepB(3) => &PUNCT_VECTORS[7], // PI_8
+        // Level 4 (weakest) → PI_3 (11 ones)
+        ProtectionLevel::EepA(4) | ProtectionLevel::EepB(4) => &PUNCT_VECTORS[2], // PI_3
         ProtectionLevel::Uep(level) => {
-            let idx = ((*level as usize).saturating_sub(1)).min(4);
+            // Map UEP levels 1-5 to reasonable PI indices
+            let idx = match level {
+                1 => 23, // strongest → PI_24
+                2 => 15, // PI_16
+                3 => 7,  // PI_8
+                4 => 3,  // PI_4
+                _ => 1,  // weakest → PI_2
+            };
             &PUNCT_VECTORS[idx]
         }
-        _ => &PUNCT_VECTORS[0], // safe default: full rate
+        _ => &PUNCT_VECTORS[23], // safe default: no puncturing (full rate)
     }
 }
 
