@@ -76,7 +76,7 @@ impl Default for MscHandler {
 /// Hard-decide soft bits and pack MSB-first into bytes.
 /// Positive soft value → bit 0, negative → bit 1.
 fn pack_bits(soft: &[f32]) -> Vec<u8> {
-    let n_bytes = (soft.len() + 7) / 8;
+    let n_bytes = soft.len().div_ceil(8);
     let mut out = vec![0u8; n_bytes];
     for (i, &s) in soft.iter().enumerate() {
         if s < 0.0 {

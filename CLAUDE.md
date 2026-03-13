@@ -6,6 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **Prerequisites (Debian/Ubuntu):**
 ```bash
+# Remove any apt-installed Rust packages first
+sudo apt-get remove rustc cargo rust-all
+
+# Install Rust via rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Native libraries
 sudo apt-get install librtlsdr-dev libasound2-dev pkg-config
 ```
 
@@ -30,6 +38,16 @@ cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 Debug logging: `RUST_LOG=debug dab-rtl ...`
+
+## When changing code
+
+Always supply:
+- unit tests if relevant
+
+Always run:
+- lint and format (update code if needed)
+- tests (all tests must be successful )
+
 
 ## Architecture
 

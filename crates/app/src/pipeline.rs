@@ -241,7 +241,7 @@ impl FicDecoder {
         // Append tail erasures.
         let mut padded = Vec::with_capacity(soft.len() + TAIL_ERASURES);
         padded.extend_from_slice(soft);
-        padded.extend(std::iter::repeat(0.0f32).take(TAIL_ERASURES));
+        padded.extend(std::iter::repeat_n(0.0f32, TAIL_ERASURES));
 
         let bits = self.viterbi.decode(&padded);
         let info = &bits[..bits.len().min(INFO_BITS)];
@@ -359,7 +359,7 @@ fn find_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
 
 /// Pack a bit slice (MSB first) into bytes.
 fn pack_bits(bits: &[u8]) -> Vec<u8> {
-    let n = (bits.len() + 7) / 8;
+    let n = bits.len().div_ceil(8);
     let mut out = vec![0u8; n];
     for (i, &b) in bits.iter().enumerate() {
         if b != 0 {
