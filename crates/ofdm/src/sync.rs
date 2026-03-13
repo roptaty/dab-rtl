@@ -8,6 +8,13 @@ use std::collections::VecDeque;
 
 use crate::params::{FRAME_SYMBOLS, NULL_SIZE, SYMBOL_SIZE};
 
+/// Short sliding window for edge detection (much smaller than NULL_SIZE).
+const WINDOW_SIZE: usize = 256;
+
+/// Minimum samples before null detection is enabled, so the long-term energy
+/// estimate has time to converge.
+pub const MIN_WARMUP_SAMPLES: usize = 8192;
+
 /// State machine for the synchroniser.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncState {
@@ -53,12 +60,12 @@ impl FrameSync {
     /// Create a new synchroniser in the `Hunting` state.
     pub fn new() -> Self {
         Self {
-            energy_buf: VecDeque::with_capacity(NULL_SIZE),
-            window_size: NULL_SIZE,
+            energy_buf: VecDeque::with_capacity(WINDOW_SIZE),
+            window_size: WINDOW_SIZE,
             threshold_factor: 0.3,
             state: SyncState::Hunting,
             window_energy: 0.0,
-            long_term_avg: 1.0,
+            long_term_avg: 0.0,
             sample_count: 0,
             null_sample_count: 0,
         }
@@ -88,8 +95,22 @@ impl FrameSync {
                     // Update long-term average only when not in a null.
                     self.long_term_avg = 0.999 * self.long_term_avg + 0.001 * (window_mean);
 
-                    // Detect energy dip.
-                    if self.long_term_avg > 0.0
+                    // Periodic status log so we can verify the sync is running.
+                    if self.sample_count.is_multiple_of(500_000) {
+                        log::debug!(
+                            "Sync: state={:?} samples={} avg={:.6} win_mean={:.6} thr={:.6}",
+                            self.state,
+                            self.sample_count,
+                            self.long_term_avg,
+                            window_mean,
+                            self.threshold_factor as f64 * self.long_term_avg
+                        );
+                    }
+
+                    // Detect energy dip (only after warm-up so the average
+                    // has converged to the actual signal level).
+                    if self.sample_count >= MIN_WARMUP_SAMPLES
+                        && self.long_term_avg > 0.0
                         && window_mean < (self.threshold_factor as f64) * self.long_term_avg
                     {
                         let null_start = self.sample_count.wrapping_sub(self.energy_buf.len());
@@ -174,8 +195,8 @@ mod tests {
     #[test]
     fn detects_null_after_warm_up() {
         let mut sync = FrameSync::new();
-        // Warm up with loud signal.
-        let loud = make_samples(8192, 1.0);
+        // Warm up with loud signal (must exceed MIN_WARMUP_SAMPLES).
+        let loud = make_samples(MIN_WARMUP_SAMPLES + 4096, 1.0);
         sync.push_samples(&loud);
 
         // Feed a null.
@@ -191,7 +212,7 @@ mod tests {
     #[test]
     fn state_transitions_to_locked() {
         let mut sync = FrameSync::new();
-        let loud = make_samples(8192, 1.0);
+        let loud = make_samples(MIN_WARMUP_SAMPLES + 4096, 1.0);
         sync.push_samples(&loud);
         let null = make_samples(NULL_SIZE, 0.01);
         sync.push_samples(&null);

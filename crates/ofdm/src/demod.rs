@@ -68,11 +68,16 @@ impl OfdmDemod {
         let current = self.fft_and_extract(symbol_samples);
 
         // Differential product: z[k] = current[k] * conj(prev[k])
+        //
+        // ETSI EN 300 401 §14.4, Table 42 maps coded bits (b0, b1) to the
+        // QPSK symbol I + jQ.  b0 is carried by Q (imaginary) and b1 by I
+        // (real).  The coded bit stream expects b0 first, so we output
+        // (im, re) per carrier to maintain the correct bit order.
         let mut soft_bits = Vec::with_capacity(NUM_CARRIERS * 2);
         for (k, (&cur, &prev)) in current.iter().zip(self.phase_ref.iter()).enumerate() {
             let z = cur * prev.conj();
-            soft_bits.push(z.re);
-            soft_bits.push(z.im);
+            soft_bits.push(z.im); // b0 = d_{2k}   (Q axis)
+            soft_bits.push(z.re); // b1 = d_{2k+1}  (I axis)
             let _ = k; // index available for debugging
         }
 

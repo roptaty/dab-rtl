@@ -150,6 +150,21 @@ impl OfdmProcessor {
                 soft_bits.push(interleaved);
             }
 
+            if log::log_enabled!(log::Level::Debug) {
+                // Log soft-bit statistics for the first FIC symbol.
+                if let Some(sym0) = soft_bits.first() {
+                    let mean_abs: f32 =
+                        sym0.iter().map(|v| v.abs()).sum::<f32>() / sym0.len() as f32;
+                    let max_abs: f32 = sym0.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                    log::debug!(
+                        "OFDM frame: {} symbols, FIC sym0 mean_abs={:.4} max_abs={:.4}",
+                        soft_bits.len(),
+                        mean_abs,
+                        max_abs
+                    );
+                }
+            }
+
             frames.push(OfdmFrame { soft_bits });
 
             // ----------------------------------------------------------------
@@ -181,6 +196,7 @@ impl Default for OfdmProcessor {
 mod tests {
     use super::*;
     use params::{GUARD_SIZE, NULL_SIZE};
+    use sync::MIN_WARMUP_SAMPLES;
 
     #[test]
     fn processor_constructs() {
@@ -202,8 +218,8 @@ mod tests {
 
         let mut p = OfdmProcessor::new();
 
-        // Warm-up: 8 k samples at full amplitude.
-        p.push_samples(&loud(8192));
+        // Warm-up: enough samples for the sync to start detecting nulls.
+        p.push_samples(&loud(MIN_WARMUP_SAMPLES + 4096));
 
         // Null symbol.
         p.push_samples(&quiet(NULL_SIZE));

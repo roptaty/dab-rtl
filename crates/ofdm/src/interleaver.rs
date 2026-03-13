@@ -26,9 +26,11 @@ impl FreqDeinterleaver {
     ///
     /// For Mode I: T_u = 2048, V1 = 511.
     ///
-    /// Only entries where π(j) maps to an active carrier (±1..±768,
-    /// i.e. not DC and within the 1 536 active sub-carriers) are kept.
-    /// The resulting 1 536 entries form a permutation on 0..1535.
+    /// The LCG visits all 2048 sub-carrier positions in a scrambled order.
+    /// We keep only the visits that land on active carriers (|k| ∈ [1, 768]).
+    /// The m-th such visit tells us that logical coded bit m was placed at
+    /// the corresponding physical carrier position.  The deinterleaver
+    /// recovers: out[m] = in[carrier_idx_of(π(visit_m))].
     pub fn new() -> Self {
         const T_U: usize = FFT_SIZE; // 2048
         const V1: usize = 511; // Mode I constant per ETSI
@@ -67,6 +69,12 @@ impl FreqDeinterleaver {
     ///
     /// `carriers` must have exactly `NUM_CARRIERS` elements; extra elements
     /// are ignored, missing ones produce a zero-padded output.
+    ///
+    /// The LCG sequence defines the order in which active carriers are
+    /// visited.  `table[logical]` gives the interleaved (physical) index
+    /// that carries the `logical`-th coded bit.  To recover coded-bit
+    /// order we apply the **forward** permutation:
+    ///   out[logical] = carriers[table[logical]]
     pub fn deinterleave(&self, carriers: &[f32]) -> Vec<f32> {
         let mut out = vec![0.0f32; NUM_CARRIERS];
         for (logical, &src) in self.table.iter().enumerate() {

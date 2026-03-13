@@ -119,6 +119,7 @@ fn run_pipeline(
     let mut playing_sid: Option<u32> = None;
     let mut last_ens_label = String::new();
     let mut last_svc_count = 0usize;
+    let mut frame_count = 0u64;
 
     let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
@@ -141,6 +142,9 @@ fn run_pipeline(
 
         // OFDM demodulation.
         for frame in ofdm.push_samples(&iq_buf) {
+            frame_count += 1;
+            log::debug!("Pipeline: OFDM frame #{}", frame_count);
+
             // ── FIC (symbols 0-2) ────────────────────────────────────────── //
             let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
             for sym in fic_symbols {
@@ -152,6 +156,30 @@ fn run_pipeline(
             if ens.label != last_ens_label || ens.services.len() != last_svc_count {
                 last_ens_label = ens.label.clone();
                 last_svc_count = ens.services.len();
+                log::info!(
+                    "Ensemble: id={:04X} label={:?} services={}",
+                    ens.id,
+                    ens.label,
+                    ens.services.len()
+                );
+                for svc in &ens.services {
+                    log::info!(
+                        "  Service: id={:04X} label={:?} dab+={} components={}",
+                        svc.id,
+                        svc.label,
+                        svc.is_dab_plus,
+                        svc.components.len()
+                    );
+                    for comp in &svc.components {
+                        log::info!(
+                            "    Component: subch={} start={} size={} prot={:?}",
+                            comp.subchannel_id,
+                            comp.start_address,
+                            comp.size,
+                            comp.protection
+                        );
+                    }
+                }
                 let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens.clone()));
                 let _ = update_tx.try_send(PipelineUpdate::Status(format!(
                     "Locked — {} services",
@@ -238,6 +266,8 @@ impl FicDecoder {
         const INFO_BITS: usize = 768;
         const TAIL_ERASURES: usize = 24; // 6 flush bits × 4 generator polynomials
 
+        log::debug!("FIC: processing symbol with {} soft bits", soft.len());
+
         // Append tail erasures.
         let mut padded = Vec::with_capacity(soft.len() + TAIL_ERASURES);
         padded.extend_from_slice(soft);
@@ -248,6 +278,27 @@ impl FicDecoder {
 
         // Pack bits MSB-first → 96 bytes.
         let fic_bytes = pack_bits(info);
+
+        // Log FIB CRC results for debugging.
+        if log::log_enabled!(log::Level::Debug) {
+            for fib_idx in 0..3 {
+                let start = fib_idx * 32;
+                if start + 32 <= fic_bytes.len() {
+                    let fib = &fic_bytes[start..start + 32];
+                    let crc_ok = fib_crc_check(fib);
+                    log::debug!(
+                        "FIC: FIB {} CRC {} (first bytes: {:02X} {:02X} {:02X} {:02X})",
+                        fib_idx,
+                        if crc_ok { "OK" } else { "FAIL" },
+                        fib[0],
+                        fib[1],
+                        fib[2],
+                        fib[3]
+                    );
+                }
+            }
+        }
+
         self.handler.process_fic_bytes(&fic_bytes);
     }
 }
@@ -368,6 +419,27 @@ fn find_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
         .find(|s| s.id == sid)?
         .components
         .first()
+}
+
+/// Quick FIB CRC-16/CCITT check for debug logging.
+fn fib_crc_check(fib: &[u8]) -> bool {
+    if fib.len() < 32 {
+        return false;
+    }
+    let mut crc: u16 = 0xFFFF;
+    for &byte in &fib[..30] {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    let computed = !crc;
+    let stored = u16::from_be_bytes([fib[30], fib[31]]);
+    computed == stored
 }
 
 /// Pack a bit slice (MSB first) into bytes.

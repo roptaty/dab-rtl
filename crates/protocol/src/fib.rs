@@ -18,6 +18,80 @@
 ///   Bytes 2+: extension-specific data
 use crate::ensemble::Ensemble;
 
+/// UEP sub-channel size (CU) and protection level per table index.
+///
+/// ETSI EN 300 401 Table 8.  Index 0–63.
+/// Each entry is `(sub_channel_size_CU, uep_protection_level)`.
+/// Protection levels: 1 = strongest … 5 = weakest.
+#[rustfmt::skip]
+const UEP_TABLE: [(u16, u8); 64] = [
+    // idx  size  lvl     bitrate  prot
+    ( 16, 5), // 0    32 kbit/s  level 5
+    ( 21, 4), // 1    32         level 4
+    ( 24, 3), // 2    32         level 3
+    ( 29, 2), // 3    32         level 2
+    ( 35, 1), // 4    32         level 1
+    ( 24, 5), // 5    48         level 5
+    ( 29, 4), // 6    48         level 4
+    ( 35, 3), // 7    48         level 3
+    ( 42, 2), // 8    48         level 2
+    ( 52, 1), // 9    48         level 1
+    ( 29, 5), // 10   56         level 5
+    ( 35, 4), // 11   56         level 4
+    ( 42, 3), // 12   56         level 3
+    ( 52, 2), // 13   56         level 2
+    ( 32, 5), // 14   64         level 5
+    ( 42, 4), // 15   64         level 4
+    ( 48, 3), // 16   64         level 3
+    ( 58, 2), // 17   64         level 2
+    ( 70, 1), // 18   64         level 1
+    ( 40, 5), // 19   80         level 5
+    ( 52, 4), // 20   80         level 4
+    ( 58, 3), // 21   80         level 3
+    ( 70, 2), // 22   80         level 2
+    ( 84, 1), // 23   80         level 1
+    ( 48, 5), // 24   96         level 5
+    ( 58, 4), // 25   96         level 4
+    ( 70, 3), // 26   96         level 3
+    ( 84, 2), // 27   96         level 2
+    (104, 1), // 28   96         level 1
+    ( 58, 5), // 29  112         level 5
+    ( 70, 4), // 30  112         level 4
+    ( 84, 3), // 31  112         level 3
+    (104, 2), // 32  112         level 2
+    ( 64, 5), // 33  128         level 5
+    ( 84, 4), // 34  128         level 4
+    ( 96, 3), // 35  128         level 3
+    (116, 2), // 36  128         level 2
+    (140, 1), // 37  128         level 1
+    ( 80, 5), // 38  160         level 5
+    (104, 4), // 39  160         level 4
+    (116, 3), // 40  160         level 3
+    (140, 2), // 41  160         level 2
+    (168, 1), // 42  160         level 1
+    ( 96, 5), // 43  192         level 5
+    (116, 4), // 44  192         level 4
+    (140, 3), // 45  192         level 3
+    (168, 2), // 46  192         level 2
+    (208, 1), // 47  192         level 1
+    (116, 5), // 48  224         level 5
+    (140, 4), // 49  224         level 4
+    (168, 3), // 50  224         level 3
+    (208, 2), // 51  224         level 2
+    (232, 1), // 52  224         level 1
+    (128, 5), // 53  256         level 5
+    (168, 4), // 54  256         level 4
+    (192, 3), // 55  256         level 3
+    (232, 2), // 56  256         level 2
+    (280, 1), // 57  256         level 1
+    (160, 5), // 58  320         level 5
+    (208, 4), // 59  320         level 4
+    (280, 2), // 60  320         level 2
+    (192, 5), // 61  384         level 5
+    (280, 3), // 62  384         level 3
+    (416, 1), // 63  384         level 1
+];
+
 pub struct FibParser {
     pub ensemble: Ensemble,
 }
@@ -29,10 +103,14 @@ impl FibParser {
         }
     }
 
-    /// Parse one FIB (first 30 bytes = FIG content; last 2 bytes = CRC, ignored).
-    /// Returns `true` (CRC check skipped — always succeeds for now).
+    /// Parse one FIB (first 30 bytes = FIG content; last 2 bytes = CRC-16).
+    /// Returns `true` if the CRC was valid (or if the FIB was too short to check).
     pub fn parse_fib(&mut self, fib: &[u8]) -> bool {
-        // Use only the 30 FIG-content bytes; ignore the 2-byte CRC trailer.
+        // Verify CRC-16/CCITT before parsing.
+        if fib.len() >= 32 && !fib_crc_valid(&fib[..32]) {
+            return false;
+        }
+        // Use only the 30 FIG-content bytes.
         let data = if fib.len() >= 32 { &fib[..30] } else { fib };
         let mut pos = 0usize;
 
@@ -82,6 +160,7 @@ impl FibParser {
 
         match extension {
             0 => self.parse_fig_0_0(payload),
+            1 => self.parse_fig_0_1(payload),
             2 => self.parse_fig_0_2(payload),
             _ => {}
         }
@@ -98,6 +177,75 @@ impl FibParser {
         self.ensemble.id = eid;
         self.ensemble.country_id = (eid >> 12) as u8;
         log::debug!("FIG 0/0: EId={:04X}", eid);
+    }
+
+    /// FIG 0/1 — Subchannel organisation (ETSI EN 300 401 §6.2.1).
+    ///
+    /// Provides start address, size, and protection level for each subchannel.
+    ///
+    /// Short form (S/L=0): 3 bytes per entry → UEP via table index.
+    /// Long form  (S/L=1): 4 bytes per entry → EEP with explicit size & level.
+    fn parse_fig_0_1(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+
+        while i + 3 <= data.len() {
+            let sub_ch_id = (data[i] >> 2) & 0x3F;
+            let start_address = ((data[i] as u16 & 0x03) << 8) | data[i + 1] as u16;
+            let long_form = (data[i + 2] >> 7) & 1 == 1;
+
+            if long_form {
+                // Long form: 4 bytes total
+                if i + 4 > data.len() {
+                    break;
+                }
+                let option = (data[i + 2] >> 4) & 0x07;
+                let prot_level = ((data[i + 2] >> 2) & 0x03) + 1; // 1-4
+                let sub_ch_size = ((data[i + 2] as u16 & 0x03) << 8) | data[i + 3] as u16;
+
+                let protection = match option {
+                    0 => crate::ensemble::ProtectionLevel::EepA(prot_level),
+                    _ => crate::ensemble::ProtectionLevel::EepB(prot_level),
+                };
+
+                self.update_subchannel(sub_ch_id, start_address, sub_ch_size, protection);
+                i += 4;
+            } else {
+                // Short form: 3 bytes total → UEP table lookup
+                let table_index = (data[i + 2] & 0x3F) as usize;
+
+                if let Some(&(size, level)) = UEP_TABLE.get(table_index) {
+                    let protection = crate::ensemble::ProtectionLevel::Uep(level);
+                    self.update_subchannel(sub_ch_id, start_address, size, protection);
+                }
+                i += 3;
+            }
+
+            log::debug!(
+                "FIG 0/1: SubChId={} StartAddr={} long={}",
+                sub_ch_id,
+                start_address,
+                long_form
+            );
+        }
+    }
+
+    /// Apply subchannel parameters to all components with matching subchannel id.
+    fn update_subchannel(
+        &mut self,
+        sub_ch_id: u8,
+        start_address: u16,
+        size: u16,
+        protection: crate::ensemble::ProtectionLevel,
+    ) {
+        for svc in &mut self.ensemble.services {
+            for comp in &mut svc.components {
+                if comp.subchannel_id == sub_ch_id {
+                    comp.start_address = start_address;
+                    comp.size = size;
+                    comp.protection = protection.clone();
+                }
+            }
+        }
     }
 
     /// FIG 0/2 — Basic service and service component.
@@ -217,6 +365,28 @@ impl Default for FibParser {
     }
 }
 
+/// CRC-16/CCITT check for a 32-byte FIB.
+///
+/// Polynomial: x^16 + x^12 + x^5 + 1 (0x1021), init 0xFFFF.
+/// The transmitted CRC is the bitwise complement of the CRC of the first 30
+/// data bytes, stored big-endian in bytes 30–31.
+fn fib_crc_valid(fib: &[u8]) -> bool {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in &fib[..30] {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    let computed = !crc;
+    let stored = u16::from_be_bytes([fib[30], fib[31]]);
+    computed == stored
+}
+
 /// Decode a 16-byte label field (EBU Latin / ASCII, space-padded) to a String.
 fn decode_label(bytes: &[u8]) -> String {
     // Treat as Latin-1; strip trailing spaces.
@@ -239,6 +409,21 @@ mod tests {
         if len < 30 {
             fib[len] = 0xFF; // type=7, length=31 — end marker
         }
+        // Compute and append CRC-16/CCITT so the FIB passes validation.
+        let mut crc: u16 = 0xFFFF;
+        for &b in &fib[..30] {
+            crc ^= (b as u16) << 8;
+            for _ in 0..8 {
+                if crc & 0x8000 != 0 {
+                    crc = (crc << 1) ^ 0x1021;
+                } else {
+                    crc <<= 1;
+                }
+            }
+        }
+        let crc = !crc;
+        fib[30] = (crc >> 8) as u8;
+        fib[31] = crc as u8;
         fib
     }
 
@@ -280,5 +465,94 @@ mod tests {
     fn decode_label_trims_spaces() {
         let bytes = b"Radio 4         ";
         assert_eq!(super::decode_label(bytes), "Radio 4");
+    }
+
+    #[test]
+    fn crc_valid_on_correct_fib() {
+        // Construct a FIB with correct CRC.
+        let mut fib = vec![0xFFu8; 32]; // all end-markers → valid content
+                                        // Compute CRC of first 30 bytes.
+        let mut crc: u16 = 0xFFFF;
+        for &b in &fib[..30] {
+            crc ^= (b as u16) << 8;
+            for _ in 0..8 {
+                if crc & 0x8000 != 0 {
+                    crc = (crc << 1) ^ 0x1021;
+                } else {
+                    crc <<= 1;
+                }
+            }
+        }
+        let crc = !crc; // invert per DAB spec
+        fib[30] = (crc >> 8) as u8;
+        fib[31] = crc as u8;
+        assert!(super::fib_crc_valid(&fib));
+    }
+
+    #[test]
+    fn crc_rejects_corrupted_fib() {
+        let mut fib = vec![0u8; 32];
+        fib[30] = 0xDE;
+        fib[31] = 0xAD;
+        assert!(!super::fib_crc_valid(&fib));
+    }
+
+    #[test]
+    fn parse_fig_0_1_long_form_eep() {
+        let mut parser = FibParser::new();
+        // First create a service with a component on SubChId=5
+        let svc = parser.ensemble.get_or_insert_service(0x1234);
+        svc.components.push(crate::ensemble::Component {
+            subchannel_id: 5,
+            service_type: crate::ensemble::ServiceType::Audio,
+            start_address: 0,
+            size: 0,
+            protection: Default::default(),
+        });
+
+        // FIG 0/1 long form: SubChId=5, StartAddr=100, Option=0 (EEP-A),
+        // ProtLevel=1 (encoded as 0), SubChSize=84
+        // Byte 0: SubChId(5) << 2 | StartAddr_high(0) = 0x14
+        // Byte 1: StartAddr_low(100) = 0x64
+        // Byte 2: LongForm(1) | Option(0) | ProtLevel(0) | Size_high(0) = 0x80
+        // Byte 3: Size_low(84) = 0x54
+        let payload = [0x14, 0x64, 0x80, 0x54];
+        parser.parse_fig_0_1(&payload);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.start_address, 100);
+        assert_eq!(comp.size, 84);
+        assert!(matches!(
+            comp.protection,
+            crate::ensemble::ProtectionLevel::EepA(1)
+        ));
+    }
+
+    #[test]
+    fn parse_fig_0_1_short_form_uep() {
+        let mut parser = FibParser::new();
+        let svc = parser.ensemble.get_or_insert_service(0x5678);
+        svc.components.push(crate::ensemble::Component {
+            subchannel_id: 10,
+            service_type: crate::ensemble::ServiceType::Audio,
+            start_address: 0,
+            size: 0,
+            protection: Default::default(),
+        });
+
+        // Short form: SubChId=10, StartAddr=50, TableIndex=15 (64kbit/s lvl4, 42 CU)
+        // Byte 0: SubChId(10) << 2 | StartAddr_high(0) = 0x28
+        // Byte 1: StartAddr_low(50) = 0x32
+        // Byte 2: LongForm(0) | TableSwitch(0) | TableIndex(15) = 0x0F
+        let payload = [0x28, 0x32, 0x0F];
+        parser.parse_fig_0_1(&payload);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.start_address, 50);
+        assert_eq!(comp.size, 42); // UEP_TABLE[15]
+        assert!(matches!(
+            comp.protection,
+            crate::ensemble::ProtectionLevel::Uep(4)
+        ));
     }
 }
