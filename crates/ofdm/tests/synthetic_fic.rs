@@ -247,26 +247,32 @@ fn synthetic_fic_roundtrip() {
     let raw_bits = demod.demod_symbol(&data_symbol);
     assert_eq!(raw_bits.len(), NUM_CARRIERS * 2);
 
-    // Check DQPSK metric
+    // Check DQPSK metric (split layout: first half is Re, second half is Im)
     let mut dqpsk_sum = 0.0f64;
-    for pair in raw_bits.chunks_exact(2) {
-        let angle = pair[0].atan2(pair[1]);
+    for k in 0..NUM_CARRIERS {
+        let re = raw_bits[k];
+        let im = raw_bits[NUM_CARRIERS + k];
+        let angle = im.atan2(re);
         dqpsk_sum += (4.0 * angle as f64).cos();
     }
     let dqpsk_metric = dqpsk_sum / (NUM_CARRIERS as f64);
     eprintln!("DQPSK metric: {dqpsk_metric:.4} (ideal: -1.0)");
 
     // Frequency deinterleave
+    // Demod now outputs split layout [Re(0)..Re(K-1), Im(0)..Im(K-1)].
     let deinterleaver = FreqDeinterleaver::new();
-    let re_channel: Vec<f32> = raw_bits.iter().step_by(2).copied().collect();
-    let im_channel: Vec<f32> = raw_bits.iter().skip(1).step_by(2).copied().collect();
-    let re_di = deinterleaver.deinterleave(&re_channel);
-    let im_di = deinterleaver.deinterleave(&im_channel);
+    let (re_channel, im_channel) = raw_bits.split_at(NUM_CARRIERS);
+    let re_di = deinterleaver.deinterleave(re_channel);
+    let im_di = deinterleaver.deinterleave(im_channel);
 
+    // The demod outputs split layout [Re..., Im...], but this synthetic
+    // test uses unpunctured rate-1/4 (no FIC block accumulation).
+    // Convert back to interleaved [Im(0), Re(0), Im(1), Re(1), ...]
+    // which is the natural coded-bit ordering for the Viterbi decoder.
     let mut soft_bits = Vec::with_capacity(NUM_CARRIERS * 2);
-    for (r, i) in re_di.into_iter().zip(im_di.into_iter()) {
-        soft_bits.push(r);
-        soft_bits.push(i);
+    for k in 0..NUM_CARRIERS {
+        soft_bits.push(im_di[k]); // d_{2k}   = Q axis
+        soft_bits.push(re_di[k]); // d_{2k+1} = I axis
     }
 
     // Normalize
@@ -277,7 +283,7 @@ fn synthetic_fic_roundtrip() {
     // Show first few soft bits
     eprintln!("First 8 soft bits: {:?}", &normalized[..8]);
 
-    // Viterbi decode
+    // Viterbi decode (unpunctured — append 24 tail erasures)
     let mut padded = normalized;
     padded.extend(std::iter::repeat_n(0.0f32, 24));
     let viterbi = fec::ViterbiDecoder::new(35);
@@ -403,26 +409,28 @@ fn synthetic_with_freq_offset(epsilon: f32) -> usize {
     demod.process_phase_ref(&prs_shifted);
     let raw_bits = demod.demod_symbol(&data_shifted);
 
-    // DQPSK metric
+    // DQPSK metric (split layout)
     let mut dqpsk_sum = 0.0f64;
-    for pair in raw_bits.chunks_exact(2) {
-        let angle = pair[0].atan2(pair[1]);
+    for k in 0..NUM_CARRIERS {
+        let re = raw_bits[k];
+        let im = raw_bits[NUM_CARRIERS + k];
+        let angle = im.atan2(re);
         dqpsk_sum += (4.0 * angle as f64).cos();
     }
     let dqpsk_metric = dqpsk_sum / (NUM_CARRIERS as f64);
     eprintln!("  ε={epsilon:.3}: DQPSK metric={dqpsk_metric:.4}");
 
-    // Deinterleave
+    // Deinterleave (split layout)
     let deinterleaver = FreqDeinterleaver::new();
-    let re_ch: Vec<f32> = raw_bits.iter().step_by(2).copied().collect();
-    let im_ch: Vec<f32> = raw_bits.iter().skip(1).step_by(2).copied().collect();
-    let re_di = deinterleaver.deinterleave(&re_ch);
-    let im_di = deinterleaver.deinterleave(&im_ch);
+    let (re_ch, im_ch) = raw_bits.split_at(NUM_CARRIERS);
+    let re_di = deinterleaver.deinterleave(re_ch);
+    let im_di = deinterleaver.deinterleave(im_ch);
 
+    // Convert to interleaved for Viterbi (no puncturing in synthetic test)
     let mut soft_bits = Vec::with_capacity(NUM_CARRIERS * 2);
-    for (r, i) in re_di.into_iter().zip(im_di.into_iter()) {
-        soft_bits.push(r);
-        soft_bits.push(i);
+    for k in 0..NUM_CARRIERS {
+        soft_bits.push(im_di[k]); // d_{2k}
+        soft_bits.push(re_di[k]); // d_{2k+1}
     }
 
     let max_abs = soft_bits.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
