@@ -349,7 +349,7 @@ fn eep_punct_vector(protection: &ProtectionLevel) -> &'static [u8; 32] {
 }
 
 /// Find the first audio component for a service in the ensemble.
-fn find_component<'a>(ens: &'a Ensemble, sid: u32) -> Option<&'a Component> {
+fn find_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
     ens.services
         .iter()
         .find(|s| s.id == sid)?

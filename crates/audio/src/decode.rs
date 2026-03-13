@@ -59,12 +59,7 @@ pub fn decode_mp2(data: &[u8]) -> Vec<f32> {
 
     let mut out = Vec::new();
 
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(_) => break,
-        };
-
+    while let Ok(packet) = format.next_packet() {
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 let spec = *decoded.spec();
@@ -199,11 +194,7 @@ pub fn decode_aac_adts(adts_data: &[u8]) -> Vec<f32> {
     };
 
     let mut out = Vec::new();
-    loop {
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(_) => break,
-        };
+    while let Ok(packet) = format.next_packet() {
         match decoder.decode(&packet) {
             Ok(decoded) => {
                 let spec = *decoded.spec();

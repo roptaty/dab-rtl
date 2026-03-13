@@ -77,7 +77,7 @@ impl FrameSync {
             self.update_window(energy);
             self.sample_count = self.sample_count.wrapping_add(1);
 
-            let window_mean = if self.energy_buf.len() > 0 {
+            let window_mean = if !self.energy_buf.is_empty() {
                 self.window_energy / self.energy_buf.len() as f64
             } else {
                 0.0

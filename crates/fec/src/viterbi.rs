@@ -1,12 +1,12 @@
-/// Soft-decision Viterbi decoder for the DAB rate-1/4 convolutional code.
-///
-/// ETSI EN 300 401 §11.1:
-///   Constraint length  K = 7  (6-bit shift register → 64 states)
-///   Generator polynomials (octal notation per spec, binary MSB-first):
-///     G1 = 133₈ = 0b1011011 = 91
-///     G2 = 171₈ = 0b1111001 = 121
-///     G3 = 145₈ = 0b1100101 = 101
-///     G4 = 133₈ = 0b1011011 = 91   (same as G1)
+//! Soft-decision Viterbi decoder for the DAB rate-1/4 convolutional code.
+//!
+//! ETSI EN 300 401 §11.1:
+//!   Constraint length  K = 7  (6-bit shift register → 64 states)
+//!   Generator polynomials (octal notation per spec, binary MSB-first):
+//!     G1 = 133₈ = 0b1011011 = 91
+//!     G2 = 171₈ = 0b1111001 = 121
+//!     G3 = 145₈ = 0b1100101 = 101
+//!     G4 = 133₈ = 0b1011011 = 91   (same as G1)
 
 /// Constraint length.
 pub const K: usize = 7;
@@ -43,16 +43,15 @@ fn encode_bit(state: u8, input: u8, poly: u8) -> u8 {
 /// Build the full 64×2 transition table (state × input_bit).
 fn build_transitions() -> [[Transition; 2]; NUM_STATES] {
     let mut table = [[Transition::default(); 2]; NUM_STATES];
-    for state in 0..NUM_STATES {
+    for (state, row) in table.iter_mut().enumerate() {
         for input in 0u8..2 {
             let s = state as u8;
-            let mut t = Transition::default();
-            // New state: shift register left, drop MSB, insert input at LSB.
-            t.next_state = ((s << 1) | input) & ((NUM_STATES - 1) as u8);
+            let next_state = ((s << 1) | input) & ((NUM_STATES - 1) as u8);
+            let mut output_bits = [0u8; NUM_OUTPUTS];
             for (i, &poly) in G.iter().enumerate() {
-                t.output_bits[i] = encode_bit(s, input, poly);
+                output_bits[i] = encode_bit(s, input, poly);
             }
-            table[state][input as usize] = t;
+            row[input as usize] = Transition { next_state, output_bits };
         }
     }
     table
@@ -111,14 +110,14 @@ impl ViterbiDecoder {
             let mut new_metrics = vec![large; NUM_STATES];
             let sym_bits = &scaled[t * NUM_OUTPUTS..(t + 1) * NUM_OUTPUTS];
 
-            for state in 0..NUM_STATES {
-                if path_metrics[state] == large {
+            for (state, &pm) in path_metrics.iter().enumerate() {
+                if pm == large {
                     continue; // unreachable state
                 }
                 for input in 0u8..2 {
                     let tr = &self.transitions[state][input as usize];
                     let branch = self.branch_metric(sym_bits, &tr.output_bits);
-                    let candidate = path_metrics[state].saturating_add(branch);
+                    let candidate = pm.saturating_add(branch);
                     let ns = tr.next_state as usize;
                     if candidate < new_metrics[ns] {
                         new_metrics[ns] = candidate;
@@ -221,10 +220,9 @@ mod tests {
     #[test]
     fn transition_table_next_states_in_range() {
         let table = build_transitions();
-        for state in 0..NUM_STATES {
-            for input in 0..2 {
-                let ns = table[state][input].next_state as usize;
-                assert!(ns < NUM_STATES);
+        for row in table.iter() {
+            for tr in row.iter() {
+                assert!((tr.next_state as usize) < NUM_STATES);
             }
         }
     }

@@ -1,9 +1,9 @@
-/// DAB puncturing patterns and de-puncturing utilities.
-///
-/// ETSI EN 300 401 §11.2 defines 24 puncturing vectors (PI_1 … PI_24).
-/// Each vector has 32 entries where 1 = transmitted bit, 0 = erased bit.
-/// The de-puncturer inserts 0.0 soft values for erased positions so that
-/// the Viterbi decoder receives a full-rate (rate-1/4) stream.
+//! DAB puncturing patterns and de-puncturing utilities.
+//!
+//! ETSI EN 300 401 §11.2 defines 24 puncturing vectors (PI_1 … PI_24).
+//! Each vector has 32 entries where 1 = transmitted bit, 0 = erased bit.
+//! The de-puncturer inserts 0.0 soft values for erased positions so that
+//! the Viterbi decoder receives a full-rate (rate-1/4) stream.
 
 // -------------------------------------------------------------------------- //
 //  Puncturing vectors PI_1 … PI_24                                           //
@@ -221,9 +221,7 @@ pub fn fic_depuncture(punctured: &[f32]) -> Vec<f32> {
     out.extend(depuncture(body, pi1));
 
     // Tail bits: 24 zero-valued soft bits (encoder tail zeros, always 0.0).
-    for _ in 0..FIC_TAIL_BITS {
-        out.push(0.0f32);
-    }
+    out.resize(out.len() + FIC_TAIL_BITS, 0.0f32);
 
     out
 }

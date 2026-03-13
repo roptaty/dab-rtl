@@ -1,4 +1,4 @@
-/// DAB Transmission Mode I constants per ETSI EN 300 401.
+//! DAB Transmission Mode I constants per ETSI EN 300 401.
 
 /// Sample rate: 2.048 MHz
 pub const SAMPLE_RATE: u32 = 2_048_000;

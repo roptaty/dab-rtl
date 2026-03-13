@@ -1,8 +1,8 @@
-/// Country-to-DAB-channel mappings.
-///
-/// Each entry lists the Band III channel names in use for that country.
-/// Sources: ETSI TR 101 496, national frequency coordinators, and
-/// public multiplex registries.
+//! Country-to-DAB-channel mappings.
+//!
+//! Each entry lists the Band III channel names in use for that country.
+//! Sources: ETSI TR 101 496, national frequency coordinators, and
+//! public multiplex registries.
 
 /// Returns the DAB Band III channels allocated for a given ISO 3166-1
 /// alpha-2 country code (case-insensitive).  Returns `None` for unknown codes.
@@ -25,7 +25,7 @@ pub fn channels_for_country(code: &str) -> Option<&'static [&'static str]> {
 
 /// Print a formatted list of all supported countries.
 pub fn print_countries() {
-    println!("{:<6}  {}", "Code", "Country");
+    println!("{:<6}  Country", "Code");
     println!("{}", "-".repeat(40));
     for (code, name, channels) in COUNTRY_TABLE {
         println!("{code:<6}  {name:<20}  ({} channels)", channels.len());
