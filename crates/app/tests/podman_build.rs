@@ -8,7 +8,6 @@
 /// directory, invokes `podman build`, and asserts a zero exit code.
 /// Standard output/error from the build are streamed to the terminal so
 /// failures are easy to diagnose.
-
 use std::path::Path;
 use std::process::Command;
 
@@ -19,9 +18,9 @@ use std::process::Command;
 /// two parents         →  <workspace root>
 fn workspace_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()   // crates/app  →  crates
+        .parent() // crates/app  →  crates
         .expect("crates dir missing")
-        .parent()   // crates      →  workspace root
+        .parent() // crates      →  workspace root
         .expect("workspace root missing")
         .to_path_buf()
 }
@@ -33,7 +32,8 @@ fn podman_build_succeeds() {
     let status = Command::new("podman")
         .args([
             "build",
-            "--tag", "dab-rtl:test",
+            "--tag",
+            "dab-rtl:test",
             // Pass the workspace root as the build context.
             root.to_str().expect("non-UTF-8 workspace path"),
         ])
@@ -41,8 +41,5 @@ fn podman_build_succeeds() {
         .status()
         .expect("failed to launch `podman` — is it installed?");
 
-    assert!(
-        status.success(),
-        "podman build exited with status {status}"
-    );
+    assert!(status.success(), "podman build exited with status {status}");
 }

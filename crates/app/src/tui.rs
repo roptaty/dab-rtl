@@ -9,7 +9,6 @@
 /// ├──────────────────────────────────────────────────────────┤
 /// │ [↑↓] Navigate  [Enter] Play  [s] Stop  [q] Quit  Status │
 /// └──────────────────────────────────────────────────────────┘
-
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -233,7 +232,10 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: ratatui::layout::Re
     let content = if let Some(ref label) = state.playing_label {
         vec![
             Line::from(vec![
-                Span::styled("Now playing: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Now playing: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(label.clone()),
             ]),
             Line::from(""),
@@ -257,7 +259,11 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: ratatui::layout::Re
     };
 
     let para = Paragraph::new(content)
-        .block(Block::default().borders(Borders::ALL).title(" Now Playing "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Now Playing "),
+        )
         .wrap(Wrap { trim: true });
 
     f.render_widget(para, area);
@@ -274,8 +280,7 @@ fn render_status_bar(f: &mut Frame, state: &AppState, area: ratatui::layout::Rec
     );
 
     let line = Line::from(vec![help, Span::raw(" │"), status]);
-    let para = Paragraph::new(line)
-        .block(Block::default().borders(Borders::ALL));
+    let para = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
 
     f.render_widget(para, area);
 }

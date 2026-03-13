@@ -1,11 +1,10 @@
 pub mod decode;
-pub use decode::{decode_mp2, Mp2Decoder};
+pub use decode::{decode_mp2, DabPlusDecoder, Mp2Decoder};
 
 /// Audio output via cpal (ALSA or PulseAudio on Linux).
 ///
 /// A ring-buffer of f32 PCM samples is shared between the caller (writer)
 /// and the cpal stream callback (reader).  Samples are interleaved if stereo.
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
@@ -69,9 +68,7 @@ impl AudioOutput {
         let host = cpal::default_host();
 
         let device = match device_name {
-            None => host
-                .default_output_device()
-                .ok_or(AudioError::NoDevice)?,
+            None => host.default_output_device().ok_or(AudioError::NoDevice)?,
             Some(name) => host
                 .output_devices()
                 .map_err(|e| AudioError::Device(e.to_string()))?
@@ -118,7 +115,12 @@ impl AudioOutput {
             )
             .map_err(|e| AudioError::Stream(e.to_string()))?;
 
-        Ok(AudioOutput { stream, buf, sample_rate, channels })
+        Ok(AudioOutput {
+            stream,
+            buf,
+            sample_rate,
+            channels,
+        })
     }
 
     /// Write PCM samples into the output buffer.

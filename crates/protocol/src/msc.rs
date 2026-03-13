@@ -3,7 +3,6 @@
 /// The MSC carries audio and data subchannels interleaved across CIFs
 /// (Common Interleaved Frames).  Each subchannel occupies a contiguous
 /// range of Capacity Units (CUs), where 1 CU = 64 bits.
-
 use crate::ensemble::Component;
 
 /// A decoded audio frame ready for the audio decoder.
@@ -63,10 +62,7 @@ impl MscHandler {
         Some(AudioFrame {
             subchannel_id: component.subchannel_id,
             data: bytes,
-            is_dab_plus: matches!(
-                component.service_type,
-                crate::ensemble::ServiceType::Data
-            ),
+            is_dab_plus: component.service_type == crate::ensemble::ServiceType::DabPlus,
         })
     }
 }
@@ -112,8 +108,8 @@ mod tests {
 
         // 2 CUs = 128 bits = 16 bytes.  Fill with all-positive (→ all zeros).
         let mut cif = vec![1.0f32; 64 * 10]; // 10 CUs total
-        // subchannel at CU 2, size 2: bits 128..256
-        // Set all bits in that range to negative → should produce 0xFF bytes.
+                                             // subchannel at CU 2, size 2: bits 128..256
+                                             // Set all bits in that range to negative → should produce 0xFF bytes.
         for v in &mut cif[128..256] {
             *v = -1.0;
         }
@@ -147,7 +143,9 @@ mod tests {
     #[test]
     fn pack_bits_alternating() {
         // bits: 1,0,1,0,1,0,1,0 → MSB first → 0b10101010 = 0xAA
-        let soft: Vec<f32> = (0..8).map(|i| if i % 2 == 0 { -1.0 } else { 1.0 }).collect();
+        let soft: Vec<f32> = (0..8)
+            .map(|i| if i % 2 == 0 { -1.0 } else { 1.0 })
+            .collect();
         assert_eq!(pack_bits(&soft), vec![0xAA]);
     }
 }

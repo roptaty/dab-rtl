@@ -5,11 +5,7 @@ mod tui;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(
-    name = "dab-rtl",
-    about = "Pure-Rust DAB/DAB+ radio receiver",
-    version
-)]
+#[command(name = "dab-rtl", about = "Pure-Rust DAB/DAB+ radio receiver", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -82,26 +78,26 @@ enum Command {
 
 pub fn channel_to_freq(ch: &str) -> Option<u32> {
     match ch.to_uppercase().as_str() {
-        "5A"  => Some(174_928_000),
-        "5B"  => Some(176_640_000),
-        "5C"  => Some(178_352_000),
-        "5D"  => Some(180_064_000),
-        "6A"  => Some(181_936_000),
-        "6B"  => Some(183_648_000),
-        "6C"  => Some(185_360_000),
-        "6D"  => Some(187_072_000),
-        "7A"  => Some(188_928_000),
-        "7B"  => Some(190_640_000),
-        "7C"  => Some(192_352_000),
-        "7D"  => Some(194_064_000),
-        "8A"  => Some(195_936_000),
-        "8B"  => Some(197_648_000),
-        "8C"  => Some(199_360_000),
-        "8D"  => Some(201_072_000),
-        "9A"  => Some(202_928_000),
-        "9B"  => Some(204_640_000),
-        "9C"  => Some(206_352_000),
-        "9D"  => Some(208_064_000),
+        "5A" => Some(174_928_000),
+        "5B" => Some(176_640_000),
+        "5C" => Some(178_352_000),
+        "5D" => Some(180_064_000),
+        "6A" => Some(181_936_000),
+        "6B" => Some(183_648_000),
+        "6C" => Some(185_360_000),
+        "6D" => Some(187_072_000),
+        "7A" => Some(188_928_000),
+        "7B" => Some(190_640_000),
+        "7C" => Some(192_352_000),
+        "7D" => Some(194_064_000),
+        "8A" => Some(195_936_000),
+        "8B" => Some(197_648_000),
+        "8C" => Some(199_360_000),
+        "8D" => Some(201_072_000),
+        "9A" => Some(202_928_000),
+        "9B" => Some(204_640_000),
+        "9C" => Some(206_352_000),
+        "9D" => Some(208_064_000),
         "10A" => Some(209_936_000),
         "10B" => Some(211_648_000),
         "10C" => Some(213_360_000),
@@ -160,11 +156,18 @@ fn main() {
                 cmd_scan(cli.device, cli.ppm, cli.gain, freq);
             }
         }
-        Command::Tune { channel, audio_device } => {
+        Command::Tune {
+            channel,
+            audio_device,
+        } => {
             let freq = resolve_channel(&channel);
             cmd_tune(cli.device, cli.ppm, cli.gain, freq, audio_device);
         }
-        Command::Play { channel, station, audio_device } => {
+        Command::Play {
+            channel,
+            station,
+            audio_device,
+        } => {
             let freq = resolve_channel(&channel);
             cmd_play(cli.device, cli.ppm, cli.gain, freq, station, audio_device);
         }
@@ -198,9 +201,19 @@ fn cmd_list_audio() {
 }
 
 /// Headless scan: print services as they are decoded from the FIC.
+///
+/// Stops when either:
+/// - No ensemble is detected within `NO_LOCK_SECS` seconds, or
+/// - `SETTLE_SECS` seconds pass with no new service appearing.
 fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
+    use std::time::{Duration, Instant};
+
+    /// Give up if no DAB ensemble is detected within this time.
+    const NO_LOCK_SECS: u64 = 10;
+    /// After the first service appears, wait this long for more to arrive.
+    const SETTLE_SECS: u64 = 5;
 
     println!(
         "Scanning {:.3} MHz (device {device_idx})…",
@@ -215,15 +228,21 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
     };
     let iq_rx = match sdr::open_stream(config, 32_768) {
         Ok(r) => r,
-        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     };
 
     let mut ofdm = OfdmProcessor::new();
     let mut fic = FicDecoder::new();
     let mut printed: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
-    for iq_buf in iq_rx.iter() {        
-        for frame in ofdm.push_samples(&iq_buf) {
+    let start = Instant::now();
+    let mut last_new_service = Option::<Instant>::None;
+
+    'outer: for iq_buf in iq_rx.iter() {
+        for frame in ofdm.push_samples(&iq_buf) {            
             // Decode the 3 FIC symbols.
             for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
                 fic.process_symbol(sym);
@@ -237,12 +256,32 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
                 }
                 for svc in &ens.services {
                     if printed.insert(svc.id) {
+                        last_new_service = Some(Instant::now());
+                        let tag = if svc.is_dab_plus { " [DAB+]" } else { "" };
                         println!(
-                            "  [{:08X}]  {}",
+                            "  [{:08X}]  {}{}",
                             svc.id,
-                            if svc.label.is_empty() { "<no label>" } else { &svc.label }
+                            if svc.label.is_empty() {
+                                "<no label>"
+                            } else {
+                                &svc.label
+                            },
+                            tag,
                         );
                     }
+                }
+            }
+
+            // Timeout: no ensemble lock.
+            if last_new_service.is_none() && start.elapsed() > Duration::from_secs(NO_LOCK_SECS) {
+                println!("  (no DAB signal — skipping)");
+                break 'outer;
+            }
+
+            // Timeout: no new services for SETTLE_SECS after first discovery.
+            if let Some(t) = last_new_service {
+                if t.elapsed() > Duration::from_secs(SETTLE_SECS) {
+                    break 'outer;
                 }
             }
         }
@@ -250,17 +289,8 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
 }
 
 /// Interactive TUI on a channel: let the user browse and select a station.
-fn cmd_tune(
-    device_idx: u32,
-    ppm: i32,
-    gain: i32,
-    freq_hz: u32,
-    audio_device: Option<String>,
-) {
-    println!(
-        "Tuning to {:.3} MHz…",
-        freq_hz as f64 / 1e6
-    );
+fn cmd_tune(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32, audio_device: Option<String>) {
+    println!("Tuning to {:.3} MHz…", freq_hz as f64 / 1e6);
 
     let config = sdr::DeviceConfig {
         index: device_idx,
@@ -271,7 +301,10 @@ fn cmd_tune(
 
     let handle = match pipeline::start(config, audio_device) {
         Ok(h) => h,
-        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     };
 
     if let Err(e) = tui::run(handle) {
@@ -305,7 +338,10 @@ fn cmd_play(
 
     let handle = match pipeline::start(config, audio_device) {
         Ok(h) => h,
-        Err(e) => { eprintln!("error: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     };
 
     let mut started = false;
@@ -345,7 +381,7 @@ mod tests {
     #[test]
     fn known_channels_resolve() {
         assert_eq!(channel_to_freq("11C"), Some(220_352_000));
-        assert_eq!(channel_to_freq("5A"),  Some(174_928_000));
+        assert_eq!(channel_to_freq("5A"), Some(174_928_000));
         assert_eq!(channel_to_freq("13F"), Some(239_200_000));
     }
 
@@ -367,15 +403,9 @@ mod tests {
     #[test]
     fn all_band3_channels_covered() {
         let channels = [
-            "5A","5B","5C","5D",
-            "6A","6B","6C","6D",
-            "7A","7B","7C","7D",
-            "8A","8B","8C","8D",
-            "9A","9B","9C","9D",
-            "10A","10B","10C","10D",
-            "11A","11B","11C","11D",
-            "12A","12B","12C","12D",
-            "13A","13B","13C","13D","13E","13F",
+            "5A", "5B", "5C", "5D", "6A", "6B", "6C", "6D", "7A", "7B", "7C", "7D", "8A", "8B",
+            "8C", "8D", "9A", "9B", "9C", "9D", "10A", "10B", "10C", "10D", "11A", "11B", "11C",
+            "11D", "12A", "12B", "12C", "12D", "13A", "13B", "13C", "13D", "13E", "13F",
         ];
         for ch in &channels {
             assert!(channel_to_freq(ch).is_some(), "missing channel {ch}");

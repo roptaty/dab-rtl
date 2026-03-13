@@ -209,9 +209,7 @@ mod tests {
 
     #[test]
     fn decode_noiseless() {
-        let input = vec![
-            0u8, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1,
-        ];
+        let input = vec![0u8, 1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0, 0, 1];
         let encoded = encode(&input);
         let dec = ViterbiDecoder::new(5 * K);
         let decoded = dec.decode(&encoded);

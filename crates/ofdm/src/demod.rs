@@ -6,15 +6,13 @@
 ///   3. Active sub-carrier extraction (bins ±1..±768, DC skipped).
 ///   4. Differential demodulation (π/4-DQPSK): z[k] = cur[k] · conj(prev[k]).
 ///   5. Soft-bit output: interleaved real/imaginary parts of z[k].
-
 use std::sync::Arc;
 
 use num_complex::Complex32;
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::{num_complex::Complex, FftPlanner};
 
 use crate::params::{
-    FFT_SIZE, GUARD_SIZE, NUM_CARRIERS, CARRIER_MIN, CARRIER_MAX,
-    carrier_to_fft_bin,
+    carrier_to_fft_bin, CARRIER_MAX, CARRIER_MIN, FFT_SIZE, GUARD_SIZE, NUM_CARRIERS,
 };
 
 pub struct OfdmDemod {

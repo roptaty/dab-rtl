@@ -16,7 +16,6 @@
 /// FIG type 1 (labels):
 ///   Byte 1: [charset:4 | OE:1 | extension:3]
 ///   Bytes 2+: extension-specific data
-
 use crate::ensemble::Ensemble;
 
 pub struct FibParser {
@@ -25,7 +24,9 @@ pub struct FibParser {
 
 impl FibParser {
     pub fn new() -> Self {
-        FibParser { ensemble: Ensemble::default() }
+        FibParser {
+            ensemble: Ensemble::default(),
+        }
     }
 
     /// Parse one FIB (first 30 bytes = FIG content; last 2 bytes = CRC, ignored).
@@ -106,6 +107,10 @@ impl FibParser {
     ///   [Num_SC_in_SId: 4 bits | ... : 4 bits]
     ///   Per component:
     ///     [TMId:2 | ASCTy/DSCTy:6 | SubChId:6 | PS:1 | CA:1]
+    ///
+    /// ASCTy values (TMId=0 audio):
+    ///   0x00 = MPEG Audio (DAB)
+    ///   0x3F = MPEG-4 HE-AAC (DAB+)
     fn parse_fig_0_2(&mut self, data: &[u8]) {
         // Retrieve P/D flag from the FIG 0 header byte (already consumed;
         // we don't have it here).  Default to short (16-bit) SId.
@@ -124,25 +129,38 @@ impl FibParser {
                     return;
                 }
                 let tmid = (data[i] >> 6) & 0x03;
+                let ascty = data[i] & 0x3F;
                 let sub_ch_id = (data[i + 1] >> 2) & 0x3F;
                 i += 2;
 
+                let service_type = match (tmid, ascty) {
+                    (0, 0x3F) => crate::ensemble::ServiceType::DabPlus,
+                    (0, _) => crate::ensemble::ServiceType::Audio,
+                    _ => crate::ensemble::ServiceType::Data,
+                };
+
                 let svc = self.ensemble.get_or_insert_service(sid);
+                // Mark the service as DAB+ if any audio component is HE-AAC.
+                if service_type == crate::ensemble::ServiceType::DabPlus {
+                    svc.is_dab_plus = true;
+                }
                 // Avoid duplicating components.
                 if !svc.components.iter().any(|c| c.subchannel_id == sub_ch_id) {
                     svc.components.push(crate::ensemble::Component {
                         subchannel_id: sub_ch_id,
-                        service_type: if tmid == 0 {
-                            crate::ensemble::ServiceType::Audio
-                        } else {
-                            crate::ensemble::ServiceType::Data
-                        },
+                        service_type,
                         start_address: 0,
                         size: 0,
                         protection: Default::default(),
                     });
                 }
-                log::debug!("FIG 0/2: SId={:04X} SubChId={}", sid, sub_ch_id);
+                log::debug!(
+                    "FIG 0/2: SId={:04X} SubChId={} TMId={} ASCTy={:#04x}",
+                    sid,
+                    sub_ch_id,
+                    tmid,
+                    ascty
+                );
             }
         }
     }

@@ -3,7 +3,6 @@
 /// ETSI EN 300 401 §14.6 specifies a frequency interleaving based on the
 /// 11-bit bit-reversal permutation.  The table maps interleaved carrier
 /// positions back to their natural (sub-carrier index) order.
-
 use crate::params::NUM_CARRIERS;
 
 /// Reverse the lower `BITS` bits of `v`.

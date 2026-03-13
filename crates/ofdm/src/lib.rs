@@ -116,8 +116,7 @@ impl OfdmProcessor {
             }
 
             // --- Phase-reference symbol ---
-            let prs_samples =
-                &self.sample_buf[prs_start..prs_start + SYMBOL_SIZE];
+            let prs_samples = &self.sample_buf[prs_start..prs_start + SYMBOL_SIZE];
             self.demod.process_phase_ref(prs_samples);
 
             // --- 75 data symbols ---
@@ -198,12 +197,8 @@ mod tests {
     #[test]
     fn frame_soft_bits_shape() {
         // Build a synthetic DAB frame: loud signal, then null, then loud signal.
-        let loud = |n: usize| -> Vec<Complex32> {
-            vec![Complex32::new(1.0, 0.0); n]
-        };
-        let quiet = |n: usize| -> Vec<Complex32> {
-            vec![Complex32::new(0.001, 0.0); n]
-        };
+        let loud = |n: usize| -> Vec<Complex32> { vec![Complex32::new(1.0, 0.0); n] };
+        let quiet = |n: usize| -> Vec<Complex32> { vec![Complex32::new(0.001, 0.0); n] };
 
         let mut p = OfdmProcessor::new();
 

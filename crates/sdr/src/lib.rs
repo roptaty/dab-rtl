@@ -2,7 +2,6 @@
 ///
 /// Wraps `rtlsdr_mt` 2.x to provide a channel-based IQ sample stream and
 /// convenience helpers for device enumeration and IQ conversion.
-
 use num_complex::Complex32;
 use std::sync::mpsc;
 use thiserror::Error;
@@ -32,12 +31,7 @@ pub enum SdrError {
 #[inline]
 pub fn iq_to_complex(raw: &[u8]) -> Vec<Complex32> {
     raw.chunks_exact(2)
-        .map(|c| {
-            Complex32::new(
-                (c[0] as f32 - 127.5) / 127.5,
-                (c[1] as f32 - 127.5) / 127.5,
-            )
-        })
+        .map(|c| Complex32::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
         .collect()
 }
 
@@ -124,8 +118,7 @@ pub fn open_stream(
                     .map_err(|e| format!("set_ppm: {e:?}"))?;
 
                 if config.gain == GAIN_AUTO {
-                    ctl.enable_agc()
-                        .map_err(|e| format!("enable_agc: {e:?}"))?;
+                    ctl.enable_agc().map_err(|e| format!("enable_agc: {e:?}"))?;
                 } else {
                     ctl.disable_agc()
                         .map_err(|e| format!("disable_agc: {e:?}"))?;

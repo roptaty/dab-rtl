@@ -23,7 +23,10 @@ impl Ensemble {
         if let Some(pos) = self.services.iter().position(|s| s.id == sid) {
             return &mut self.services[pos];
         }
-        self.services.push(Service { id: sid, ..Default::default() });
+        self.services.push(Service {
+            id: sid,
+            ..Default::default()
+        });
         self.services.last_mut().unwrap()
     }
 }
@@ -34,6 +37,8 @@ pub struct Service {
     pub id: u32,
     /// Human-readable service label (up to 16 chars).
     pub label: String,
+    /// `true` when the primary audio component uses HE-AAC (DAB+).
+    pub is_dab_plus: bool,
     /// Service components (audio/data subchannels).
     pub components: Vec<Component>,
 }
@@ -54,6 +59,8 @@ pub struct Component {
 pub enum ServiceType {
     #[default]
     Audio,
+    /// HE-AAC audio (DAB+, ASCTy = 0x3F).
+    DabPlus,
     Data,
 }
 

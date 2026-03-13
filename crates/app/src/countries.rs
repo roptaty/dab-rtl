@@ -33,17 +33,17 @@ pub fn print_countries() {
 }
 
 static COUNTRY_TABLE: &[(&str, &str, &[&str])] = &[
-    ("NO", "Norway",       NORWAY),
+    ("NO", "Norway", NORWAY),
     ("GB", "United Kingdom", UK),
-    ("DE", "Germany",      GERMANY),
-    ("NL", "Netherlands",  NETHERLANDS),
-    ("SE", "Sweden",       SWEDEN),
-    ("DK", "Denmark",      DENMARK),
-    ("IT", "Italy",        ITALY),
-    ("CH", "Switzerland",  SWITZERLAND),
-    ("BE", "Belgium",      BELGIUM),
-    ("AT", "Austria",      AUSTRIA),
-    ("PL", "Poland",       POLAND),
+    ("DE", "Germany", GERMANY),
+    ("NL", "Netherlands", NETHERLANDS),
+    ("SE", "Sweden", SWEDEN),
+    ("DK", "Denmark", DENMARK),
+    ("IT", "Italy", ITALY),
+    ("CH", "Switzerland", SWITZERLAND),
+    ("BE", "Belgium", BELGIUM),
+    ("AT", "Austria", AUSTRIA),
+    ("PL", "Poland", POLAND),
 ];
 
 // ─── Norway ──────────────────────────────────────────────────────────────── //
@@ -68,89 +68,45 @@ static COUNTRY_TABLE: &[(&str, &str, &[&str])] = &[
 //  13A   230.784 MHz  – Finnmark
 
 static NORWAY: &[&str] = &[
-    "5A",
-    "7B",
-    "7D",
-    "8A",
-    "9A",
-    "9C",
-    "10B",
-    "11A",
-    "11D",
-    "12A",
-    "12C",
-    "12D",
-    "13A",
+    "5A", "7B", "7D", "8A", "9A", "9C", "10B", "11A", "11D", "12A", "12C", "12D", "13A",
 ];
 
 // ─── United Kingdom ───────────────────────────────────────────────────────── //
 static UK: &[&str] = &[
-    "11A", "11B", "11C", "11D",
-    "12A", "12B", "12C", "12D",
-    "10B", "10C", "10D",
+    "11A", "11B", "11C", "11D", "12A", "12B", "12C", "12D", "10B", "10C", "10D",
 ];
 
 // ─── Germany ──────────────────────────────────────────────────────────────── //
 static GERMANY: &[&str] = &[
-    "5C",
-    "7A", "7B", "7C", "7D",
-    "8A", "8B", "8C", "8D",
-    "9A", "9B", "9C", "9D",
-    "10A", "10B", "10C", "10D",
-    "11A", "11B", "11C", "11D",
-    "12A", "12C", "12D",
+    "5C", "7A", "7B", "7C", "7D", "8A", "8B", "8C", "8D", "9A", "9B", "9C", "9D", "10A", "10B",
+    "10C", "10D", "11A", "11B", "11C", "11D", "12A", "12C", "12D",
 ];
 
 // ─── Netherlands ──────────────────────────────────────────────────────────── //
-static NETHERLANDS: &[&str] = &[
-    "11B", "11C",
-    "12A", "12B", "12C",
-];
+static NETHERLANDS: &[&str] = &["11B", "11C", "12A", "12B", "12C"];
 
 // ─── Sweden ───────────────────────────────────────────────────────────────── //
-static SWEDEN: &[&str] = &[
-    "10A", "10B",
-    "11A", "11B", "11C", "11D",
-    "12A", "12B",
-];
+static SWEDEN: &[&str] = &["10A", "10B", "11A", "11B", "11C", "11D", "12A", "12B"];
 
 // ─── Denmark ──────────────────────────────────────────────────────────────── //
-static DENMARK: &[&str] = &[
-    "10B", "10C",
-    "11A", "11B", "11C",
-    "12A",
-];
+static DENMARK: &[&str] = &["10B", "10C", "11A", "11B", "11C", "12A"];
 
 // ─── Italy ────────────────────────────────────────────────────────────────── //
 static ITALY: &[&str] = &[
-    "10A", "10B", "10C", "10D",
-    "11A", "11B", "11C",
-    "12A", "12B",
+    "10A", "10B", "10C", "10D", "11A", "11B", "11C", "12A", "12B",
 ];
 
 // ─── Switzerland ──────────────────────────────────────────────────────────── //
-static SWITZERLAND: &[&str] = &[
-    "12A", "12B", "12C", "12D",
-    "13A", "13B",
-];
+static SWITZERLAND: &[&str] = &["12A", "12B", "12C", "12D", "13A", "13B"];
 
 // ─── Belgium ──────────────────────────────────────────────────────────────── //
-static BELGIUM: &[&str] = &[
-    "11D", "12A", "12B",
-];
+static BELGIUM: &[&str] = &["11D", "12A", "12B"];
 
 // ─── Austria ──────────────────────────────────────────────────────────────── //
-static AUSTRIA: &[&str] = &[
-    "10A", "10B", "10C",
-    "11A", "11B",
-    "12A",
-];
+static AUSTRIA: &[&str] = &["10A", "10B", "10C", "11A", "11B", "12A"];
 
 // ─── Poland ───────────────────────────────────────────────────────────────── //
-static POLAND: &[&str] = &[
-    "11B", "11C",
-    "12A", "12B", "12C",
-];
+static POLAND: &[&str] = &["11B", "11C", "12A", "12B", "12C"];
 
 // ─────────────────────────────────────────────────────────────────────────── //
 //  Tests                                                                       //
@@ -194,7 +150,7 @@ mod tests {
     fn country_table_all_channels_valid() {
         use crate::channel_to_freq;
         for &(code, _, channels) in COUNTRY_TABLE {
-            for &ch in *channels {
+            for &ch in channels {
                 assert!(
                     channel_to_freq(ch).is_some(),
                     "Country {code}: channel {ch} missing from Band III table"

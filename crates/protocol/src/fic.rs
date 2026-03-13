@@ -2,7 +2,6 @@
 ///
 /// The FIC carries 3 FIBs per CIF (Common Interleaved Frame).
 /// Each FIB is 32 bytes (30 content + 2 CRC).
-
 use crate::ensemble::Ensemble;
 use crate::fib::FibParser;
 
@@ -12,7 +11,9 @@ pub struct FicHandler {
 
 impl FicHandler {
     pub fn new() -> Self {
-        FicHandler { parser: FibParser::new() }
+        FicHandler {
+            parser: FibParser::new(),
+        }
     }
 
     /// Process decoded FIC bytes.

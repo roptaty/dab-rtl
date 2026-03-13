@@ -17,14 +17,13 @@
 /// MSC decoding (per CIF = 18 symbols = 55296 soft bits = 864 CUs):
 ///   Extract target subchannel (start_address … start_address+size CUs)
 ///   → EEP depuncture → Viterbi → pack bytes → MP2 decoder
-
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use audio::Mp2Decoder;
-use fec::{depuncture, ViterbiDecoder};
+use audio::{DabPlusDecoder, Mp2Decoder};
 use fec::depuncturer::PUNCT_VECTORS;
+use fec::{depuncture, ViterbiDecoder};
 use ofdm::OfdmProcessor;
 use protocol::{
     ensemble::{Component, ProtectionLevel},
@@ -114,6 +113,7 @@ fn run_pipeline(
     let mut fic = FicDecoder::new();
     let mut msc = MscDecoder::new();
     let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
+    let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
 
     // Currently selected SId (None = scan-only).
     let mut playing_sid: Option<u32> = None;
@@ -153,9 +153,10 @@ fn run_pipeline(
                 last_ens_label = ens.label.clone();
                 last_svc_count = ens.services.len();
                 let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens.clone()));
-                let _ = update_tx.try_send(PipelineUpdate::Status(
-                    format!("Locked — {} services", ens.services.len()),
-                ));
+                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                    "Locked — {} services",
+                    ens.services.len()
+                )));
             }
 
             // Announce when we start playing.
@@ -177,12 +178,25 @@ fn run_pipeline(
                         continue;
                     }
                     // Flatten CIF symbols → 55296 soft bits.
-                    let cif_soft: Vec<f32> = cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
+                    let cif_soft: Vec<f32> =
+                        cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
 
                     if let Some(sid) = playing_sid {
                         if let Some(component) = find_component(&ens_snap, sid) {
+                            // Update DAB+ superframe size when component info arrives.
+                            if component.service_type == protocol::ServiceType::DabPlus {
+                                let sf_bytes = component.size as usize * 8; // CUs × 64 bits / 8
+                                if dab_plus.superframe_size != sf_bytes && sf_bytes > 0 {
+                                    dab_plus.set_superframe_size(sf_bytes);
+                                }
+                            }
+
                             if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx) {
-                                let pcm = mp2.push(&frame.data);
+                                let pcm = if frame.is_dab_plus {
+                                    dab_plus.push(&frame.data)
+                                } else {
+                                    mp2.push(&frame.data)
+                                };
                                 if let (Some(ao), false) = (&audio_out, pcm.is_empty()) {
                                     ao.write_samples(&pcm);
                                 }
@@ -283,7 +297,9 @@ impl MscDecoder {
         if end_bit > cif_soft.len() {
             log::warn!(
                 "MSC: subchannel range {}..{} exceeds CIF length {}",
-                start_bit, end_bit, cif_soft.len()
+                start_bit,
+                end_bit,
+                cif_soft.len()
             );
             return None;
         }
@@ -303,7 +319,7 @@ impl MscDecoder {
         Some(protocol::AudioFrame {
             subchannel_id: component.subchannel_id,
             data,
-            is_dab_plus: false, // TODO: detect DAB+ from service type
+            is_dab_plus: component.service_type == protocol::ServiceType::DabPlus,
         })
     }
 }

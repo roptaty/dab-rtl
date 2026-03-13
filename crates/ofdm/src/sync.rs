@@ -1,13 +1,12 @@
+use num_complex::Complex32;
 /// Frame synchroniser for DAB Mode I using energy-based null symbol detection.
 ///
 /// The null symbol has very low energy compared to normal OFDM symbols.
 /// We maintain a short-term energy estimate and declare a null when the
 /// instantaneous energy drops below `threshold_factor * short_term_average`.
-
 use std::collections::VecDeque;
-use num_complex::Complex32;
 
-use crate::params::{NULL_SIZE, SYMBOL_SIZE, FRAME_SYMBOLS};
+use crate::params::{FRAME_SYMBOLS, NULL_SIZE, SYMBOL_SIZE};
 
 /// State machine for the synchroniser.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,16 +86,13 @@ impl FrameSync {
             match &self.state.clone() {
                 SyncState::Hunting | SyncState::Locked => {
                     // Update long-term average only when not in a null.
-                    self.long_term_avg =
-                        0.999 * self.long_term_avg + 0.001 * (window_mean);
+                    self.long_term_avg = 0.999 * self.long_term_avg + 0.001 * (window_mean);
 
                     // Detect energy dip.
                     if self.long_term_avg > 0.0
-                        && window_mean
-                            < (self.threshold_factor as f64) * self.long_term_avg
+                        && window_mean < (self.threshold_factor as f64) * self.long_term_avg
                     {
-                        let null_start =
-                            self.sample_count.wrapping_sub(self.energy_buf.len());
+                        let null_start = self.sample_count.wrapping_sub(self.energy_buf.len());
                         self.state = SyncState::NullFound { null_start };
                         self.null_sample_count = 1;
                         log::debug!(
@@ -112,8 +108,7 @@ impl FrameSync {
 
                     // Still in the null?
                     let still_null = self.long_term_avg > 0.0
-                        && window_mean
-                            < (self.threshold_factor as f64) * self.long_term_avg;
+                        && window_mean < (self.threshold_factor as f64) * self.long_term_avg;
 
                     if still_null {
                         // Keep accumulating.
