@@ -323,24 +323,23 @@ pub fn decode_dab_plus_superframe(data: &[u8]) -> Vec<f32> {
     pcm
 }
 
-/// DAB+ Fire Code CRC check (ETSI TS 102 563 §6.3).
+/// DAB+ Fire Code CRC check (ETSI TS 102 563 §5.3).
 ///
 /// Generator polynomial: g(x) = (x^11 + 1)(x^5 + x^3 + x^2 + x + 1) = 0x782F.
-/// Bytes 0–1 contain the CRC; it is computed over the rest of the superframe.
+/// Bytes 0–1 contain the 16-bit CRC; it is computed over the next 9 bytes
+/// (72 bits, bytes 2–10).  The Fire code LFSR feeds the XOR result back
+/// into both the polynomial tap and the register LSB.
 pub fn firecode_check(data: &[u8]) -> bool {
-    if data.len() < 4 {
+    if data.len() < 11 {
         return false;
     }
     let stored = ((data[0] as u16) << 8) | data[1] as u16;
     let mut crc: u16 = 0;
-    for &byte in &data[2..] {
+    for &byte in &data[2..11] {
         for bit in (0..8).rev() {
             let input_bit = ((byte >> bit) & 1) as u16;
-            let feedback = ((crc >> 15) ^ input_bit) & 1;
-            crc <<= 1;
-            if feedback != 0 {
-                crc ^= 0x782F;
-            }
+            let flag = ((crc >> 15) ^ input_bit) & 1;
+            crc = (crc << 1) ^ if flag != 0 { 0x782F } else { 0 };
         }
     }
     crc == stored
@@ -520,6 +519,30 @@ mod tests {
     #[test]
     fn firecode_check_rejects_short() {
         assert!(!firecode_check(&[0x00, 0x00]));
+        assert!(!firecode_check(&[0u8; 10])); // need at least 11 bytes
+    }
+
+    #[test]
+    fn firecode_check_accepts_valid() {
+        // Compute a valid Fire code CRC for 9 bytes of known data.
+        let payload: [u8; 9] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x42];
+        let mut crc: u16 = 0;
+        for &byte in &payload {
+            for bit in (0..8).rev() {
+                let input_bit = ((byte >> bit) & 1) as u16;
+                let flag = ((crc >> 15) ^ input_bit) & 1;
+                crc = (crc << 1) ^ if flag != 0 { 0x782F } else { 0 };
+            }
+        }
+        let mut frame = vec![0u8; 11];
+        frame[0] = (crc >> 8) as u8;
+        frame[1] = crc as u8;
+        frame[2..11].copy_from_slice(&payload);
+        assert!(firecode_check(&frame), "CRC={:04X}", crc);
+
+        // Also verify that flipping a bit makes it fail.
+        frame[5] ^= 0x01;
+        assert!(!firecode_check(&frame));
     }
 
     #[test]

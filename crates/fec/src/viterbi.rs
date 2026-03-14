@@ -172,6 +172,64 @@ impl ViterbiDecoder {
         bits
     }
 
+    /// Decode soft bits and also return the normalized path metric.
+    ///
+    /// The metric is `best_end_metric / n_symbols`. Lower = better match.
+    /// For perfect noiseless input, metric ≈ 0. For random input, metric ≈ 254.
+    pub fn decode_with_metric(&self, soft_bits: &[f32]) -> (Vec<u8>, f32) {
+        let n_symbols = soft_bits.len() / NUM_OUTPUTS;
+        if n_symbols == 0 {
+            return (Vec::new(), 0.0);
+        }
+
+        let scaled: Vec<i16> = soft_bits
+            .iter()
+            .map(|&v| (v.clamp(-1.0, 1.0) * 127.0) as i16)
+            .collect();
+
+        let large: i32 = i32::MAX / 2;
+        let mut path_metrics = vec![large; NUM_STATES];
+        path_metrics[0] = 0;
+        let mut survivors: Vec<Vec<u8>> = vec![vec![0u8; NUM_STATES]; n_symbols];
+
+        for t in 0..n_symbols {
+            let mut new_metrics = vec![large; NUM_STATES];
+            let sym_bits = &scaled[t * NUM_OUTPUTS..(t + 1) * NUM_OUTPUTS];
+            for (state, &pm) in path_metrics.iter().enumerate() {
+                if pm == large {
+                    continue;
+                }
+                for input in 0u8..2 {
+                    let tr = &self.transitions[state][input as usize];
+                    let branch = self.branch_metric(sym_bits, &tr.output_bits);
+                    let candidate = pm.saturating_add(branch);
+                    let ns = tr.next_state as usize;
+                    if candidate < new_metrics[ns] {
+                        new_metrics[ns] = candidate;
+                        survivors[t][ns] = state as u8;
+                    }
+                }
+            }
+            path_metrics = new_metrics;
+        }
+
+        let (best_state, &best_metric) = path_metrics
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &m)| m)
+            .unwrap();
+        let norm_metric = best_metric as f32 / n_symbols as f32;
+
+        let mut bits = vec![0u8; n_symbols];
+        let mut state = best_state;
+        for t in (0..n_symbols).rev() {
+            bits[t] = (state & 1) as u8;
+            state = survivors[t][state] as usize;
+        }
+
+        (bits, norm_metric)
+    }
+
     /// Compute the branch metric between received (scaled) soft bits and the
     /// expected encoder output bits.
     ///

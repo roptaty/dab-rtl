@@ -132,8 +132,8 @@ impl OfdmProcessor {
 
                 // Drain past the bad region so we don't re-find the same null.
                 // Skip at least one full frame's worth of samples.
-                let drain_amount = (prs_start + FRAME_SYMBOLS * SYMBOL_SIZE)
-                    .min(self.sample_buf.len());
+                let drain_amount =
+                    (prs_start + FRAME_SYMBOLS * SYMBOL_SIZE).min(self.sample_buf.len());
                 self.sample_buf.drain(..drain_amount);
 
                 self.prs_offset = None;
