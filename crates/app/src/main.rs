@@ -211,7 +211,7 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32, channel: &str) {
     use std::time::{Duration, Instant};
 
     /// Give up if no DAB ensemble is detected within this time.
-    const NO_LOCK_SECS: u64 = 10;
+    const NO_LOCK_SECS: u64 = 30;
     /// After the first service appears, wait this long for more to arrive.
     const SETTLE_SECS: u64 = 5;
 
