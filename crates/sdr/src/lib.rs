@@ -80,73 +80,77 @@ impl Default for DeviceConfig {
 //  Streaming                                                                   //
 // ─────────────────────────────────────────────────────────────────────────── //
 
-/// Open an RTL-SDR device and return a channel that delivers IQ sample buffers.
+/// Handle to a running RTL-SDR stream.
+///
+/// Dropping this handle cancels the async read and waits for the background
+/// thread to finish, ensuring the USB device is fully released before the
+/// struct goes out of scope.
+pub struct SdrStream {
+    pub rx: mpsc::Receiver<Vec<Complex32>>,
+    ctl: Option<rtlsdr_mt::Controller>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for SdrStream {
+    fn drop(&mut self) {
+        // Cancel the async read so read_async returns promptly.
+        if let Some(ref mut ctl) = self.ctl {
+            ctl.cancel_async_read();
+        }
+        // Drop the controller so its Arc<Device> ref is released.
+        self.ctl.take();
+        // Wait for the background thread (and its Reader) to finish.
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Open an RTL-SDR device and return a stream handle delivering IQ sample buffers.
 ///
 /// A background thread drives `Reader::read_async`.  Each buffer contains
 /// `buf_size / 2` `Complex32` samples (one per I/Q pair).
 ///
-/// Dropping the returned `Receiver` causes the next `tx.send` inside the
-/// async callback to fail, which exits the callback and the background thread.
-pub fn open_stream(
-    config: DeviceConfig,
-    buf_size: u32,
-) -> Result<mpsc::Receiver<Vec<Complex32>>, SdrError> {
+/// Dropping the returned `SdrStream` cancels the async read, waits for the
+/// background thread to exit, and releases the USB device.
+pub fn open_stream(config: DeviceConfig, buf_size: u32) -> Result<SdrStream, SdrError> {
     // Quick check: if the devices iterator is empty there is nothing to open.
     if rtlsdr_mt::devices().next().is_none() {
         return Err(SdrError::NoDevice);
     }
 
+    // Open and configure the device on the calling thread so errors are
+    // reported immediately (not silently swallowed in a background thread).
+    let (mut ctl, mut reader) =
+        rtlsdr_mt::open(config.index).map_err(|e| SdrError::Device(format!("{e:?}")))?;
+
+    ctl.set_sample_rate(SAMPLE_RATE)
+        .map_err(|e| SdrError::Device(format!("set_sample_rate: {e:?}")))?;
+    ctl.set_ppm(config.ppm_correction)
+        .map_err(|e| SdrError::Device(format!("set_ppm: {e:?}")))?;
+
+    if config.gain == GAIN_AUTO {
+        ctl.enable_agc()
+            .map_err(|e| SdrError::Device(format!("enable_agc: {e:?}")))?;
+    } else {
+        ctl.disable_agc()
+            .map_err(|e| SdrError::Device(format!("disable_agc: {e:?}")))?;
+        ctl.set_tuner_gain(config.gain)
+            .map_err(|e| SdrError::Device(format!("set_tuner_gain: {e:?}")))?;
+    }
+
+    ctl.set_center_freq(config.center_freq_hz)
+        .map_err(|e| SdrError::Device(format!("set_center_freq: {e:?}")))?;
+
     let (tx, rx) = mpsc::sync_channel::<Vec<Complex32>>(8);
 
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name("rtlsdr-reader".into())
         .spawn(move || {
-            let open_result = rtlsdr_mt::open(config.index);
-            let (mut ctl, mut reader) = match open_result {
-                Ok(pair) => pair,
-                Err(e) => {
-                    log::error!("rtlsdr-reader: open failed: {:?}", e);
-                    return;
-                }
-            };
-
-            // Configure device.
-            let mut configure = || -> Result<(), String> {
-                ctl.set_sample_rate(SAMPLE_RATE)
-                    .map_err(|e| format!("set_sample_rate: {e:?}"))?;
-                ctl.set_ppm(config.ppm_correction)
-                    .map_err(|e| format!("set_ppm: {e:?}"))?;
-
-                if config.gain == GAIN_AUTO {
-                    ctl.enable_agc().map_err(|e| format!("enable_agc: {e:?}"))?;
-                } else {
-                    ctl.disable_agc()
-                        .map_err(|e| format!("disable_agc: {e:?}"))?;
-                    ctl.set_tuner_gain(config.gain)
-                        .map_err(|e| format!("set_tuner_gain: {e:?}"))?;
-                }
-
-                ctl.set_center_freq(config.center_freq_hz)
-                    .map_err(|e| format!("set_center_freq: {e:?}"))?;
-
-                Ok(())
-            };
-
-            if let Err(e) = configure() {
-                log::error!("rtlsdr-reader: configure failed: {e}");
-                return;
-            }
-
-            // Start async read loop.  The callback runs until the channel is
-            // dropped (tx.send returns Err) or read_async returns.
             let read_result = reader.read_async(4, buf_size, |bytes| {
                 let samples = iq_to_complex(bytes);
                 if tx.send(samples).is_err() {
-                    // Receiver dropped — stop reading.
                     log::info!("rtlsdr-reader: receiver dropped, stopping");
-                    // We cannot cancel from inside the callback directly;
-                    // returning just lets the next iteration call back again.
-                    // Use ctl.cancel_async_read() from outside if needed.
                 }
             });
 
@@ -156,7 +160,11 @@ pub fn open_stream(
         })
         .map_err(|e| SdrError::Device(e.to_string()))?;
 
-    Ok(rx)
+    Ok(SdrStream {
+        rx,
+        ctl: Some(ctl),
+        thread: Some(thread),
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //

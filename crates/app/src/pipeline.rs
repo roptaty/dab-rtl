@@ -79,7 +79,7 @@ pub fn start(
     let cmd_rx = Arc::new(Mutex::new(cmd_rx));
 
     // Open SDR stream (produces Vec<Complex32> buffers).
-    let iq_rx = sdr::open_stream(device_config, 32_768).map_err(|e| e.to_string())?;
+    let stream = sdr::open_stream(device_config, 32_768).map_err(|e| e.to_string())?;
 
     // AudioOutput contains cpal::Stream which is !Send, so it must be
     // constructed inside the pipeline thread rather than passed across threads.
@@ -92,7 +92,7 @@ pub fn start(
             if let Some(ref ao) = audio_out {
                 ao.play();
             }
-            run_pipeline(iq_rx, audio_out, update_tx, cmd_rx);
+            run_pipeline(stream, audio_out, update_tx, cmd_rx);
         })
         .map_err(|e| e.to_string())?;
 
@@ -104,7 +104,7 @@ pub fn start(
 // ─────────────────────────────────────────────────────────────────────────── //
 
 fn run_pipeline(
-    iq_rx: mpsc::Receiver<Vec<num_complex::Complex32>>,
+    stream: sdr::SdrStream,
     audio_out: Option<audio::AudioOutput>,
     update_tx: mpsc::SyncSender<PipelineUpdate>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<PipelineCmd>>>,
@@ -123,7 +123,7 @@ fn run_pipeline(
 
     let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
-    for iq_buf in iq_rx.iter() {
+    for iq_buf in stream.rx.iter() {
         // Drain any pending commands.
         if let Ok(guard) = cmd_rx.try_lock() {
             while let Ok(cmd) = guard.try_recv() {

@@ -226,7 +226,7 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
         gain,
         ppm_correction: ppm,
     };
-    let iq_rx = match sdr::open_stream(config, 32_768) {
+    let stream = match sdr::open_stream(config, 32_768) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
@@ -241,7 +241,7 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
     let start = Instant::now();
     let mut last_new_service = Option::<Instant>::None;
 
-    'outer: for iq_buf in iq_rx.iter() {
+    'outer: for iq_buf in stream.rx.iter() {
         for frame in ofdm.push_samples(&iq_buf) {
             // Decode the 3 FIC symbols.
             for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
