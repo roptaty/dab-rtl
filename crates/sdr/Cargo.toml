@@ -1,7 +1,10 @@
 [package]
-name = "sdr"
-version = "0.1.0"
-edition = "2021"
+name        = "sdr"
+description = "RTL-SDR IQ acquisition and Complex32 streaming for dab-rtl"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
 
 [dependencies]
 num-complex = "0.4"
