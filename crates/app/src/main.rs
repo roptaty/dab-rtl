@@ -153,7 +153,7 @@ fn main() {
             };
             for ch in &channels {
                 let freq = resolve_channel(ch);
-                cmd_scan(cli.device, cli.ppm, cli.gain, freq);
+                cmd_scan(cli.device, cli.ppm, cli.gain, freq, ch);
             }
         }
         Command::Tune {
@@ -205,7 +205,7 @@ fn cmd_list_audio() {
 /// Stops when either:
 /// - No ensemble is detected within `NO_LOCK_SECS` seconds, or
 /// - `SETTLE_SECS` seconds pass with no new service appearing.
-fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
+fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32, channel: &str) {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
     use std::time::{Duration, Instant};
@@ -216,7 +216,7 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
     const SETTLE_SECS: u64 = 5;
 
     println!(
-        "Scanning {:.3} MHz (device {device_idx})…",
+        "Scanning channel {channel} at {:.3} MHz (device {device_idx})…",
         freq_hz as f64 / 1e6
     );
 
