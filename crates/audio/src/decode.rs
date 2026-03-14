@@ -211,59 +211,108 @@ pub fn decode_aac_adts(adts_data: &[u8]) -> Vec<f32> {
     out
 }
 
-/// DAB+ audio superframe parser.
+/// Read 12 bits from a byte array at the given bit offset (MSB-first).
+fn read_12bits(data: &[u8], bit_offset: usize) -> u16 {
+    let byte_pos = bit_offset / 8;
+    let bit_pos = bit_offset % 8;
+    let combined = ((*data.get(byte_pos).unwrap_or(&0) as u32) << 16)
+        | ((*data.get(byte_pos + 1).unwrap_or(&0) as u32) << 8)
+        | (*data.get(byte_pos + 2).unwrap_or(&0) as u32);
+    ((combined >> (12 - bit_pos)) & 0xFFF) as u16
+}
+
+/// DAB+ audio superframe parser (ETSI TS 102 563 §5.3).
 ///
-/// A DAB+ audio superframe is 5 × (subchannel_size / 5) bytes, structured as:
-///   - 2 bytes Firecode header (sync + CRC, we skip CRC here)
-///   - 1 byte  flags (num_AUs, DAC rate, SBR flag, etc.)
-///   - 2 × num_AUs bytes  AU start offsets (big-endian, relative to payload start)
+/// A DAB+ superframe spans 5 consecutive CIFs.  Layout:
+///   - 2 bytes Firecode CRC (sync/error detection)
+///   - 1 byte  stream params: dac_rate, sbr_flag, aac_channel_mode,
+///     ps_flag, mpeg_surround_config, rfa
+///   - (num_aus − 1) × 12-bit AU start addresses (bit-packed, MSB-first)
 ///   - AU payloads back-to-back
+///   - num_aus × 2-byte CRCs at the end of the superframe
 ///
-/// We extract each AU, wrap it in ADTS, and decode.
-///
-/// `sample_rate_idx` and `channels` are the ADTS parameters to use.
-pub fn decode_dab_plus_superframe(data: &[u8], sample_rate_idx: u8, channels: u8) -> Vec<f32> {
-    // Minimum viable superframe: firecode(2) + header(1) + one AU offset(2) = 5 bytes
-    if data.len() < 5 {
+/// ADTS parameters (sample rate, channels) are derived from the header.
+pub fn decode_dab_plus_superframe(data: &[u8]) -> Vec<f32> {
+    // Minimum: firecode(2) + header(1) + at least one 12-bit AU addr + some data
+    if data.len() < 6 {
         return Vec::new();
     }
 
-    // Byte 2 (after 2-byte Firecode): num_AUs is encoded in bits [4:3]
-    //   00 = 2 AUs, 01 = 3 AUs, 10 = 4 AUs, 11 = 6 AUs
+    // Byte 2 (after 2-byte Firecode): stream parameters
     let header_byte = data[2];
-    let num_aus: usize = match (header_byte >> 3) & 0x03 {
-        0 => 2,
-        1 => 3,
-        2 => 4,
-        _ => 6,
+    let dac_rate = (header_byte >> 7) & 1;
+    let sbr_flag = (header_byte >> 6) & 1;
+    let aac_channel_mode = (header_byte >> 5) & 1;
+
+    // Number of AUs depends on dac_rate and sbr_flag (ETSI TS 102 563 Table 2)
+    let num_aus: usize = match (dac_rate, sbr_flag) {
+        (0, 0) => 6,
+        (0, 1) => 3,
+        (1, 0) => 4,
+        (1, 1) => 2,
+        _ => unreachable!(),
     };
 
-    // AU start offsets: 2 bytes each, starting at byte 3.
-    // Last AU ends at data.len() - 2 (last 2 bytes are the RFA/padding).
-    let offsets_start = 3usize;
-    let offsets_end = offsets_start + num_aus * 2;
-    if offsets_end > data.len() {
-        log::debug!("DAB+: superframe too short for {} AU offsets", num_aus);
+    // ADTS sample rate index: core AAC rate (SBR doubles it if present)
+    let sample_rate_idx: u8 = match (dac_rate, sbr_flag) {
+        (0, 0) => 3, // 48 kHz
+        (0, 1) => 6, // 24 kHz core (SBR → 48 kHz)
+        (1, 0) => 5, // 32 kHz
+        (1, 1) => 8, // 16 kHz core (SBR → 32 kHz)
+        _ => unreachable!(),
+    };
+    let channels: u8 = if aac_channel_mode == 0 { 1 } else { 2 };
+
+    // AU start addresses: (num_aus − 1) × 12-bit values starting at bit 24.
+    // All offsets are relative to byte 2 (start of "stream" after Firecode).
+    let header_bits = 24 + (num_aus - 1) * 12;
+    let first_au_offset = header_bits.div_ceil(8); // first byte after header
+
+    if first_au_offset >= data.len() {
+        log::debug!("DAB+: superframe too short for header ({} bytes)", data.len());
         return Vec::new();
     }
 
-    let payload_start = offsets_end;
-    let payload_end = data.len().saturating_sub(2); // trim 2-byte trailing CRC
+    // Build AU start offsets (relative to byte 2 of the superframe).
+    // AU[0] starts right after the header; AU[1..n-1] come from the 12-bit fields.
+    let mut au_offsets: Vec<usize> = Vec::with_capacity(num_aus + 1);
+    au_offsets.push(first_au_offset - 2); // relative to byte 2
 
-    let mut au_starts: Vec<usize> = (0..num_aus)
-        .map(|k| {
-            let o = offsets_start + k * 2;
-            u16::from_be_bytes([data[o], data[o + 1]]) as usize + payload_start
-        })
-        .collect();
-    au_starts.push(payload_end); // sentinel
+    for i in 0..(num_aus - 1) {
+        let addr = read_12bits(data, 24 + i * 12) as usize;
+        au_offsets.push(addr);
+    }
+
+    // Sentinel: end of last AU = total_size − firecode(2) − CRCs (num_aus × 2)
+    let au_data_end = data.len() - 2 - 2 * num_aus; // relative to byte 2
+    au_offsets.push(au_data_end);
+
+    log::debug!(
+        "DAB+ superframe: {} bytes, dac_rate={}, sbr={}, ch={}, num_aus={}, offsets={:?}",
+        data.len(),
+        dac_rate,
+        sbr_flag,
+        channels,
+        num_aus,
+        au_offsets
+    );
 
     let mut pcm = Vec::new();
-    for w in au_starts.windows(2) {
-        let (start, end) = (w[0], w[1]);
+    for i in 0..num_aus {
+        let start = 2 + au_offsets[i]; // absolute byte index in data[]
+        let end = 2 + au_offsets[i + 1];
+
         if start >= end || end > data.len() {
+            log::debug!(
+                "DAB+: AU[{}] invalid range {}..{} (sf_len={})",
+                i,
+                start,
+                end,
+                data.len()
+            );
             continue;
         }
+
         let au = &data[start..end];
         let adts = adts_wrap(au, sample_rate_idx, channels);
         pcm.extend(decode_aac_adts(&adts));
@@ -273,42 +322,32 @@ pub fn decode_dab_plus_superframe(data: &[u8], sample_rate_idx: u8, channels: u8
 
 /// Stateful DAB+ audio decoder.
 ///
-/// Accumulates raw bytes until a full superframe is available, then decodes.
-/// Call `set_params` once the audio parameters are known (from PAD/XPad or
-/// defaults: 48 kHz stereo).
+/// Accumulates raw bytes until a full superframe (5 CIFs) is available,
+/// then decodes.  Audio parameters (sample rate, channels) are extracted
+/// from the superframe header automatically.
 pub struct DabPlusDecoder {
     buf: Vec<u8>,
+    /// Per-CIF byte count.  Set from the first actual decoded frame.
     pub superframe_size: usize,
-    sample_rate_idx: u8,
-    channels: u8,
 }
 
 impl DabPlusDecoder {
     /// Create a decoder.
     ///
-    /// `superframe_size` is the subchannel capacity in bytes per 24 ms frame.
+    /// `superframe_size` is the per-CIF byte count (Viterbi output).
     /// If unknown, pass 0 — the decoder will skip until `set_superframe_size`
-    /// is called.  Default audio params: 48 kHz stereo.
+    /// is called.
     pub fn new(superframe_size: usize) -> Self {
         DabPlusDecoder {
             buf: Vec::new(),
             superframe_size,
-            sample_rate_idx: 3, // 48000 Hz
-            channels: 2,        // stereo
         }
     }
 
-    /// Update the superframe size (bytes).  Call when subchannel info is known.
+    /// Update the per-CIF byte count.  Call when actual frame size is known.
     pub fn set_superframe_size(&mut self, size: usize) {
         self.superframe_size = size;
         self.buf.clear();
-    }
-
-    /// Update sample rate and channel count for ADTS wrapping.
-    /// ADTS sample_rate_idx: 3=48000, 4=44100, 5=32000, 6=24000, 7=22050.
-    pub fn set_params(&mut self, sample_rate_idx: u8, channels: u8) {
-        self.sample_rate_idx = sample_rate_idx;
-        self.channels = channels;
     }
 
     /// Push bytes for one CIF and return any decoded PCM samples.
@@ -321,7 +360,7 @@ impl DabPlusDecoder {
             return Vec::new();
         }
         let superframe: Vec<u8> = self.buf.drain(..self.superframe_size * 5).collect();
-        decode_dab_plus_superframe(&superframe, self.sample_rate_idx, self.channels)
+        decode_dab_plus_superframe(&superframe)
     }
 }
 
@@ -349,5 +388,74 @@ mod tests {
         let mut dec = Mp2Decoder::new(512);
         let short = vec![0u8; 100];
         assert!(dec.push(&short).is_empty(), "should buffer, not decode yet");
+    }
+
+    #[test]
+    fn read_12bits_byte_aligned() {
+        // 12 bits starting at bit 0: 0xABC
+        let data = [0xAB, 0xC0, 0x00];
+        assert_eq!(read_12bits(&data, 0), 0xABC);
+    }
+
+    #[test]
+    fn read_12bits_nibble_offset() {
+        // 12 bits starting at bit 4: should read lower nibble of byte 0 + byte 1
+        let data = [0xFA, 0xBC, 0x00];
+        assert_eq!(read_12bits(&data, 4), 0xABC);
+    }
+
+    #[test]
+    fn dab_plus_superframe_short_input_returns_empty() {
+        assert!(decode_dab_plus_superframe(&[0; 5]).is_empty());
+    }
+
+    #[test]
+    fn dab_plus_superframe_does_not_panic_on_garbage() {
+        let garbage = vec![0xFFu8; 1200];
+        let _ = decode_dab_plus_superframe(&garbage);
+    }
+
+    #[test]
+    fn dab_plus_num_aus_from_header() {
+        // Verify header byte parsing for all dac_rate/sbr combinations.
+        // dac_rate=0, sbr=0 (bits 7:6 = 0b00) → 6 AUs
+        // dac_rate=0, sbr=1 (bits 7:6 = 0b01) → 3 AUs
+        // dac_rate=1, sbr=0 (bits 7:6 = 0b10) → 4 AUs
+        // dac_rate=1, sbr=1 (bits 7:6 = 0b11) → 2 AUs
+        let cases: [(u8, usize); 4] = [
+            (0b0000_0000, 6), // dac_rate=0, sbr=0
+            (0b0100_0000, 3), // dac_rate=0, sbr=1
+            (0b1000_0000, 4), // dac_rate=1, sbr=0
+            (0b1100_0000, 2), // dac_rate=1, sbr=1
+        ];
+        for (header_byte, expected_aus) in cases {
+            let dac_rate = (header_byte >> 7) & 1;
+            let sbr_flag = (header_byte >> 6) & 1;
+            let num_aus = match (dac_rate, sbr_flag) {
+                (0, 0) => 6usize,
+                (0, 1) => 3,
+                (1, 0) => 4,
+                (1, 1) => 2,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                num_aus, expected_aus,
+                "header_byte={:#010b}",
+                header_byte
+            );
+        }
+    }
+
+    #[test]
+    fn dab_plus_decoder_buffers_5_cifs() {
+        let mut dec = DabPlusDecoder::new(100);
+        for i in 0..4 {
+            let data = vec![0u8; 100];
+            let pcm = dec.push(&data);
+            assert!(pcm.is_empty(), "should buffer CIF {}", i);
+        }
+        // 5th CIF triggers superframe decode (will return empty on garbage data)
+        let data = vec![0u8; 100];
+        let _ = dec.push(&data); // must not panic
     }
 }

@@ -224,14 +224,6 @@ fn run_pipeline(
                             );
                         }
                         if let Some(component) = component {
-                            // Update DAB+ superframe size when component info arrives.
-                            if component.service_type == protocol::ServiceType::DabPlus {
-                                let sf_bytes = component.size as usize * 8; // CUs × 64 bits / 8
-                                if dab_plus.superframe_size != sf_bytes && sf_bytes > 0 {
-                                    dab_plus.set_superframe_size(sf_bytes);
-                                }
-                            }
-
                             if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx) {
                                 log::debug!(
                                     "MSC: CIF {} subchannel {} → {} bytes ({})",
@@ -240,6 +232,18 @@ fn run_pipeline(
                                     frame.data.len(),
                                     if frame.is_dab_plus { "DAB+" } else { "DAB" }
                                 );
+                                // Set DAB+ superframe size from actual Viterbi output.
+                                if frame.is_dab_plus
+                                    && !frame.data.is_empty()
+                                    && dab_plus.superframe_size != frame.data.len()
+                                {
+                                    log::info!(
+                                        "DAB+: setting per-CIF size to {} bytes (was {})",
+                                        frame.data.len(),
+                                        dab_plus.superframe_size
+                                    );
+                                    dab_plus.set_superframe_size(frame.data.len());
+                                }
                                 let pcm = if frame.is_dab_plus {
                                     dab_plus.push(&frame.data)
                                 } else {
