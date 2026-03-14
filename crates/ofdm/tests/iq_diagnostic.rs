@@ -246,6 +246,7 @@ fn fic_round_trip() {
 }
 
 #[test]
+#[ignore] // slow: processes full IQ capture; run with --ignored
 fn diagnose_fic_decoding() {
     if !std::path::Path::new(IQ_FILE).exists() {
         eprintln!("Skipping: IQ file not found at {IQ_FILE}");

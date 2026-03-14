@@ -29,6 +29,7 @@ cargo test --all               # all crates
 cargo test -p <crate>          # single crate (sdr, ofdm, fec, protocol, audio, dab-rtl)
 cargo test -p <crate> <name>   # single test by name, e.g.: cargo test -p dab-rtl known_channels_resolve
 cargo test -p <crate> -- --nocapture  # with stdout
+cargo test --ignored # Run ignored tests - run this when there have been fundamental changes to OFDM, fec and protocol
 ```
 
 **Lint & Format:**
@@ -77,6 +78,14 @@ RTL-SDR IQ → [sdr] → Complex32 samples
 2. **DAB+ HE-AAC** — requires `fdk-aac` (FFI C dep, unavoidable for DAB+)
 3. **DLS** (Programme Associated Data / scrolling text)
 4. **Scan caching** — persist results to `~/.config/dab-rtl/`
+
+## Soft bit layout (split, not interleaved)
+
+The OFDM demodulator produces soft bits in **split layout**: `[Re(0)..Re(1535), Im(0)..Im(1535)]` per symbol (3072 values). The Re and Im halves are frequency-deinterleaved separately and then concatenated.
+
+This differs from the ETSI EN 300 401 §14.4 interleaved mapping `[Im(0), Re(0), Im(1), Re(1), ...]`. The split layout is empirically verified to produce valid FIB CRCs (tested against real IQ captures). Interleaved layout produces 0% CRC pass rate. Do **not** change to interleaved without re-running `cargo test -p ofdm --test iq_pipeline -- --nocapture` to confirm FIB CRCs still pass.
+
+The FIC accumulator collects soft bits from 3 symbols (9216 total) and cuts 2304-bit blocks for depuncturing → Viterbi. The MSC similarly flattens 18 symbols per CIF (55296 bits) and extracts subchannel ranges.
 
 ## DAB Mode I Constants (ofdm/src/params.rs)
 

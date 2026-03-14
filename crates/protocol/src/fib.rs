@@ -16,7 +16,17 @@
 /// FIG type 1 (labels):
 ///   Byte 1: [charset:4 | OE:1 | extension:3]
 ///   Bytes 2+: extension-specific data
+use std::collections::HashMap;
+
 use crate::ensemble::Ensemble;
+
+/// Subchannel parameters from FIG 0/1, stored independently from components.
+#[derive(Debug, Clone)]
+struct SubchannelInfo {
+    start_address: u16,
+    size: u16,
+    protection: crate::ensemble::ProtectionLevel,
+}
 
 /// UEP sub-channel size (CU) and protection level per table index.
 ///
@@ -94,12 +104,16 @@ const UEP_TABLE: [(u16, u8); 64] = [
 
 pub struct FibParser {
     pub ensemble: Ensemble,
+    /// Subchannel parameters indexed by SubChId (0–63), populated by FIG 0/1.
+    /// Stored separately so they are available regardless of FIG arrival order.
+    subchannels: HashMap<u8, SubchannelInfo>,
 }
 
 impl FibParser {
     pub fn new() -> Self {
         FibParser {
             ensemble: Ensemble::default(),
+            subchannels: HashMap::new(),
         }
     }
 
@@ -229,7 +243,10 @@ impl FibParser {
         }
     }
 
-    /// Apply subchannel parameters to all components with matching subchannel id.
+    /// Store subchannel parameters and apply to any existing components.
+    ///
+    /// FIG 0/1 may arrive before or after FIG 0/2 creates the component.
+    /// We store the info in `self.subchannels` so it survives either ordering.
     fn update_subchannel(
         &mut self,
         sub_ch_id: u8,
@@ -237,6 +254,17 @@ impl FibParser {
         size: u16,
         protection: crate::ensemble::ProtectionLevel,
     ) {
+        // Store for future components (FIG 0/2 arriving later).
+        self.subchannels.insert(
+            sub_ch_id,
+            SubchannelInfo {
+                start_address,
+                size,
+                protection: protection.clone(),
+            },
+        );
+
+        // Apply to any components that already exist.
         for svc in &mut self.ensemble.services {
             for comp in &mut svc.components {
                 if comp.subchannel_id == sub_ch_id {
@@ -252,7 +280,7 @@ impl FibParser {
     ///
     /// Layout per service entry:
     ///   [SId: 16 bits (P/D=0) or 32 bits (P/D=1)]
-    ///   [Num_SC_in_SId: 4 bits | ... : 4 bits]
+    ///   [Local_flag:1 | CAID:3 | Num_SC:4]
     ///   Per component:
     ///     [TMId:2 | ASCTy/DSCTy:6 | SubChId:6 | PS:1 | CA:1]
     ///
@@ -264,12 +292,12 @@ impl FibParser {
         // we don't have it here).  Default to short (16-bit) SId.
         let mut i = 0usize;
 
-        while i + 3 < data.len() {
+        while i + 3 <= data.len() {
             // Short SId (16-bit).
             let sid = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
             i += 2;
 
-            let num_sc = (data[i] >> 4) & 0x0F;
+            let num_sc = data[i] & 0x0F;
             i += 1;
 
             for _ in 0..num_sc {
@@ -294,12 +322,19 @@ impl FibParser {
                 }
                 // Avoid duplicating components.
                 if !svc.components.iter().any(|c| c.subchannel_id == sub_ch_id) {
+                    // Apply subchannel info if FIG 0/1 already provided it.
+                    let (start_address, size, protection) =
+                        if let Some(info) = self.subchannels.get(&sub_ch_id) {
+                            (info.start_address, info.size, info.protection.clone())
+                        } else {
+                            (0, 0, Default::default())
+                        };
                     svc.components.push(crate::ensemble::Component {
                         subchannel_id: sub_ch_id,
                         service_type,
-                        start_address: 0,
-                        size: 0,
-                        protection: Default::default(),
+                        start_address,
+                        size,
+                        protection,
                     });
                 }
                 log::debug!(
@@ -554,5 +589,52 @@ mod tests {
             comp.protection,
             crate::ensemble::ProtectionLevel::Uep(4)
         ));
+    }
+
+    #[test]
+    fn fig_0_1_before_fig_0_2_applies_subchannel_info() {
+        let mut parser = FibParser::new();
+
+        // FIG 0/1 arrives first: SubChId=5, StartAddr=100, EEP-A level 1, size=84
+        let fig_0_1_payload = [0x14, 0x64, 0x80, 0x54];
+        parser.parse_fig_0_1(&fig_0_1_payload);
+
+        // No components yet — but subchannel info is stored.
+        assert!(parser.ensemble.services.is_empty());
+
+        // FIG 0/2 arrives later: SId=0x1234, 1 component, TMId=0 ASCTy=0, SubChId=5
+        let fig_0_2_payload = [0x12, 0x34, 0x01, 0x00, 0x14];
+        parser.parse_fig_0_2(&fig_0_2_payload);
+
+        // Component should have the subchannel info from FIG 0/1.
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.subchannel_id, 5);
+        assert_eq!(comp.start_address, 100);
+        assert_eq!(comp.size, 84);
+        assert!(matches!(
+            comp.protection,
+            crate::ensemble::ProtectionLevel::EepA(1)
+        ));
+    }
+
+    #[test]
+    fn fig_0_2_last_service_not_skipped() {
+        let mut parser = FibParser::new();
+
+        // Two services back to back, each with 1 component (5 bytes each = 10 total).
+        // Svc 1: SId=0xAAAA, num_sc=1, TMId=0 ASCTy=0x00, SubChId=1
+        // Svc 2: SId=0xBBBB, num_sc=1, TMId=0 ASCTy=0x3F (DAB+), SubChId=2
+        let payload = [
+            0xAA, 0xAA, 0x01, 0x00, 0x04, // svc 1: SubChId=1
+            0xBB, 0xBB, 0x01, 0x3F, 0x08, // svc 2: SubChId=2
+        ];
+        parser.parse_fig_0_2(&payload);
+
+        assert_eq!(parser.ensemble.services.len(), 2);
+        assert_eq!(parser.ensemble.services[0].id, 0xAAAA);
+        assert_eq!(parser.ensemble.services[0].components.len(), 1);
+        assert_eq!(parser.ensemble.services[1].id, 0xBBBB);
+        assert_eq!(parser.ensemble.services[1].components.len(), 1);
+        assert!(parser.ensemble.services[1].is_dab_plus);
     }
 }

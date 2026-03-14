@@ -211,7 +211,19 @@ fn run_pipeline(
                         cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
 
                     if let Some(sid) = playing_sid {
-                        if let Some(component) = find_component(&ens_snap, sid) {
+                        let component = find_component(&ens_snap, sid);
+                        if component.is_none() && cif_idx == 0 {
+                            log::debug!(
+                                "MSC: no component found for SId {:04X} (service has {} components)",
+                                sid,
+                                ens_snap
+                                    .services
+                                    .iter()
+                                    .find(|s| s.id == sid)
+                                    .map_or(0, |s| s.components.len())
+                            );
+                        }
+                        if let Some(component) = component {
                             // Update DAB+ superframe size when component info arrives.
                             if component.service_type == protocol::ServiceType::DabPlus {
                                 let sf_bytes = component.size as usize * 8; // CUs × 64 bits / 8
@@ -221,13 +233,33 @@ fn run_pipeline(
                             }
 
                             if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx) {
+                                log::debug!(
+                                    "MSC: CIF {} subchannel {} → {} bytes ({})",
+                                    cif_idx,
+                                    frame.subchannel_id,
+                                    frame.data.len(),
+                                    if frame.is_dab_plus { "DAB+" } else { "DAB" }
+                                );
                                 let pcm = if frame.is_dab_plus {
                                     dab_plus.push(&frame.data)
                                 } else {
                                     mp2.push(&frame.data)
                                 };
-                                if let (Some(ao), false) = (&audio_out, pcm.is_empty()) {
+                                if pcm.is_empty() {
+                                    log::debug!(
+                                        "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
+                                    );
+                                } else if let Some(ao) = &audio_out {
+                                    log::debug!(
+                                        "MSC: writing {} PCM samples to audio device",
+                                        pcm.len()
+                                    );
                                     ao.write_samples(&pcm);
+                                } else {
+                                    log::debug!(
+                                        "MSC: {} PCM samples ready but no audio device",
+                                        pcm.len()
+                                    );
                                 }
                             }
                         }
@@ -429,7 +461,10 @@ impl MscDecoder {
         let bits = self.viterbi.decode(&depunct);
 
         // Pack to bytes.
-        let data = pack_bits(&bits);
+        let mut data = pack_bits(&bits);
+
+        // Energy de-dispersal: XOR with PRBS (ETSI EN 300 401 §12).
+        energy_dedispersal(&mut data);
 
         Some(protocol::AudioFrame {
             subchannel_id: component.subchannel_id,
@@ -506,6 +541,26 @@ fn fib_crc_check(fib: &[u8]) -> bool {
     computed == stored
 }
 
+/// Apply energy de-dispersal PRBS to MSC data bytes.
+///
+/// ETSI EN 300 401 §12: polynomial x^9 + x^5 + 1, all-ones initial state.
+/// The PRBS is XORed with the data bytes to reverse the scrambling applied
+/// at the transmitter.
+fn energy_dedispersal(data: &mut [u8]) {
+    let mut reg: u16 = 0x1FF; // 9-bit register, all ones
+    for byte in data.iter_mut() {
+        let mut mask = 0u8;
+        for bit in 0..8 {
+            let prbs_bit = ((reg >> 8) ^ (reg >> 4)) & 1;
+            if prbs_bit != 0 {
+                mask |= 0x80 >> bit;
+            }
+            reg = ((reg << 1) | prbs_bit) & 0x1FF;
+        }
+        *byte ^= mask;
+    }
+}
+
 /// Pack a bit slice (MSB first) into bytes.
 fn pack_bits(bits: &[u8]) -> Vec<u8> {
     let n = bits.len().div_ceil(8);
@@ -571,5 +626,134 @@ mod tests {
         };
         let cif = vec![1.0f32; 55296];
         assert!(dec.process_cif(&cif, &comp, 0).is_none());
+    }
+
+    #[test]
+    fn energy_dedispersal_roundtrip() {
+        // Apply dispersal twice = identity (XOR is self-inverse).
+        let mut data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67];
+        let original = data.clone();
+        energy_dedispersal(&mut data);
+        assert_ne!(data, original, "PRBS should change data");
+        energy_dedispersal(&mut data);
+        assert_eq!(data, original, "double XOR should restore original");
+    }
+
+    /// End-to-end test: IQ file → OFDM → FIC → discover services → MSC decode.
+    ///
+    /// Verifies that the pipeline produces non-empty audio frames from the
+    /// test IQ recording.
+    #[test]
+    #[ignore] // slow: processes full IQ capture; run with --ignored
+    fn msc_decode_from_iq_file() {
+        use num_complex::Complex32;
+
+        let iq_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/testdata/dab_13b_2min.raw"
+        );
+        if !std::path::Path::new(iq_path).exists() {
+            eprintln!("Skipping MSC test: IQ file not found at {iq_path}");
+            return;
+        }
+
+        let raw = std::fs::read(iq_path).unwrap();
+        let samples: Vec<Complex32> = raw
+            .chunks_exact(2)
+            .map(|c| Complex32::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
+            .collect();
+
+        let mut ofdm = OfdmProcessor::new();
+        let mut fic = FicDecoder::new();
+        let mut msc = MscDecoder::new();
+
+        let chunk_size = 65536;
+        let max_samples = 30 * 2_048_000; // 30 seconds
+        let limit = samples.len().min(max_samples);
+
+        let mut ensemble_found = false;
+        let mut first_service_sid: Option<u32> = None;
+        let mut audio_frames_decoded = 0usize;
+        let mut total_audio_bytes = 0usize;
+        let mut frame_count = 0usize;
+
+        for chunk_start in (0..limit).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(limit);
+            let chunk = &samples[chunk_start..chunk_end];
+
+            for frame in ofdm.push_samples(chunk) {
+                frame_count += 1;
+
+                // FIC
+                fic.begin_frame();
+                for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+                    fic.process_symbol(sym);
+                }
+
+                let ens = fic.handler.ensemble();
+                if frame_count <= 5 || frame_count.is_multiple_of(20) {
+                    eprintln!(
+                        "Frame {frame_count}: ens={:?} services={}",
+                        ens.label,
+                        ens.services.len()
+                    );
+                }
+
+                // Pick the first service with a valid (non-zero size) component.
+                if !ens.services.is_empty() {
+                    ensemble_found = true;
+                }
+                if first_service_sid.is_none() {
+                    for svc in &ens.services {
+                        if let Some(comp) = svc.components.first() {
+                            if comp.size > 0 {
+                                first_service_sid = Some(svc.id);
+                                msc.set_target_sid(svc.id);
+                                eprintln!(
+                                    "Selected service: {:04X} {:?} (start={}, size={}, prot={:?})",
+                                    svc.id,
+                                    svc.label,
+                                    comp.start_address,
+                                    comp.size,
+                                    comp.protection
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // MSC
+                if let Some(sid) = first_service_sid {
+                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+                    for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
+                        if cif_syms.len() < 18 {
+                            continue;
+                        }
+                        let cif_soft: Vec<f32> =
+                            cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
+                        if let Some(component) = find_component(ens, sid) {
+                            if let Some(af) = msc.process_cif(&cif_soft, component, cif_idx) {
+                                audio_frames_decoded += 1;
+                                total_audio_bytes += af.data.len();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "Results: ensemble={ensemble_found}, audio_frames={audio_frames_decoded}, \
+             total_bytes={total_audio_bytes}"
+        );
+
+        assert!(ensemble_found, "should discover at least one service");
+        assert!(
+            audio_frames_decoded > 0,
+            "should decode at least one MSC audio frame"
+        );
+        assert!(total_audio_bytes > 0, "audio frames should contain data");
     }
 }

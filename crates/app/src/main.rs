@@ -236,7 +236,7 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
 
     let mut ofdm = OfdmProcessor::new();
     let mut fic = FicDecoder::new();
-    let mut printed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut known_sids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     let start = Instant::now();
     let mut last_new_service = Option::<Instant>::None;
@@ -244,30 +244,16 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
     'outer: for iq_buf in stream.rx.iter() {
         for frame in ofdm.push_samples(&iq_buf) {
             // Decode the 3 FIC symbols.
+            fic.begin_frame();
             for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
                 fic.process_symbol(sym);
             }
 
             let ens = fic.handler.ensemble();
             if !ens.label.is_empty() {
-                // Print ensemble label once.
-                if printed.is_empty() {
-                    println!("Ensemble: {} (EId {:04X})", ens.label, ens.id);
-                }
                 for svc in &ens.services {
-                    if printed.insert(svc.id) {
+                    if known_sids.insert(svc.id) {
                         last_new_service = Some(Instant::now());
-                        let tag = if svc.is_dab_plus { " [DAB+]" } else { "" };
-                        println!(
-                            "  [{:08X}]  {}{}",
-                            svc.id,
-                            if svc.label.is_empty() {
-                                "<no label>"
-                            } else {
-                                &svc.label
-                            },
-                            tag,
-                        );
                     }
                 }
             }
@@ -289,6 +275,25 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32) {
             if t.elapsed() > Duration::from_secs(SETTLE_SECS) {
                 break 'outer;
             }
+        }
+    }
+
+    // Print final results with labels that arrived during the settle period.
+    let ens = fic.handler.ensemble();
+    if !ens.label.is_empty() {
+        println!("Ensemble: {} (EId {:04X})", ens.label, ens.id);
+        for svc in &ens.services {
+            let tag = if svc.is_dab_plus { " [DAB+]" } else { "" };
+            println!(
+                "  [{:08X}]  {}{}",
+                svc.id,
+                if svc.label.is_empty() {
+                    "<no label>"
+                } else {
+                    &svc.label
+                },
+                tag,
+            );
         }
     }
 }
