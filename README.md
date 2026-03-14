@@ -1,8 +1,8 @@
 # dab-rtl
-**NOT WORKING**
 
+Work in progress. 
 
-
+Most of the code (and contents here) are generated using vibe-coding and Claude from [Anthropic](https://www.anthropic.com/). 
 
 A pure-Rust DAB/DAB+ software-defined radio receiver for RTL-SDR and HackRF.
 
