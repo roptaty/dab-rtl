@@ -1,0 +1,70 @@
+# cargo-deny configuration
+# Documentation: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Only check dependencies for the default features
+# targets = []
+
+# ── Vulnerability advisories ────────────────────────────────────────────────── #
+[advisories]
+# RustSec advisory database: https://rustsec.org/advisories/
+version = 2
+# Deny all vulnerabilities (no exceptions by default)
+ignore = [
+    # Add advisory IDs here to suppress specific known/accepted advisories.
+    # Example: "RUSTSEC-2021-0001"
+]
+
+# ── License policy ──────────────────────────────────────────────────────────── #
+[licenses]
+version = 2
+# Accepted open-source licenses for this project.
+# All dependencies MUST use one of these licenses (or a AND/OR combination).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+]
+# Deny copyleft licenses that would require source disclosure
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "LGPL-2.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+    "AGPL-3.0",
+]
+# How to handle dependencies with no license declared
+unlicensed = "deny"
+# How to handle dependencies with licenses that aren't in the allow or deny lists
+copyleft = "warn"
+
+# ── Dependency bans ─────────────────────────────────────────────────────────── #
+[bans]
+# Warn when multiple versions of the same crate are pulled in
+multiple-versions = "warn"
+# Deny wildcard dependency specifications (e.g. version = "*")
+wildcards = "deny"
+# List of crates that must not be used in this project
+deny = [
+    # Example: ban known-broken or insecure crates
+    # { name = "openssl", reason = "use rustls instead" },
+]
+# Skip duplicate-version warnings for crates known to have divergent version requirements
+skip = [
+    # Example: { name = "bitflags", version = "=1" }
+]
+
+# ── Source origins ───────────────────────────────────────────────────────────── #
+[sources]
+# Only allow dependencies from crates.io and this repository's local paths
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
