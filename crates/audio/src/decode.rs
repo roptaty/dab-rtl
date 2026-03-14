@@ -269,7 +269,10 @@ pub fn decode_dab_plus_superframe(data: &[u8]) -> Vec<f32> {
     let first_au_offset = header_bits.div_ceil(8); // first byte after header
 
     if first_au_offset >= data.len() {
-        log::debug!("DAB+: superframe too short for header ({} bytes)", data.len());
+        log::debug!(
+            "DAB+: superframe too short for header ({} bytes)",
+            data.len()
+        );
         return Vec::new();
     }
 
@@ -320,15 +323,40 @@ pub fn decode_dab_plus_superframe(data: &[u8]) -> Vec<f32> {
     pcm
 }
 
+/// DAB+ Fire Code CRC check (ETSI TS 102 563 §6.3).
+///
+/// Generator polynomial: g(x) = (x^11 + 1)(x^5 + x^3 + x^2 + x + 1) = 0x782F.
+/// Bytes 0–1 contain the CRC; it is computed over the rest of the superframe.
+pub fn firecode_check(data: &[u8]) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+    let stored = ((data[0] as u16) << 8) | data[1] as u16;
+    let mut crc: u16 = 0;
+    for &byte in &data[2..] {
+        for bit in (0..8).rev() {
+            let input_bit = ((byte >> bit) & 1) as u16;
+            let feedback = ((crc >> 15) ^ input_bit) & 1;
+            crc <<= 1;
+            if feedback != 0 {
+                crc ^= 0x782F;
+            }
+        }
+    }
+    crc == stored
+}
+
 /// Stateful DAB+ audio decoder.
 ///
 /// Accumulates raw bytes until a full superframe (5 CIFs) is available,
-/// then decodes.  Audio parameters (sample rate, channels) are extracted
-/// from the superframe header automatically.
+/// then decodes.  Uses Firecode CRC to synchronize to the correct 5-CIF
+/// superframe boundary before decoding.
 pub struct DabPlusDecoder {
     buf: Vec<u8>,
     /// Per-CIF byte count.  Set from the first actual decoded frame.
     pub superframe_size: usize,
+    /// Whether we have found a valid Firecode alignment.
+    synced: bool,
 }
 
 impl DabPlusDecoder {
@@ -341,6 +369,7 @@ impl DabPlusDecoder {
         DabPlusDecoder {
             buf: Vec::new(),
             superframe_size,
+            synced: false,
         }
     }
 
@@ -348,6 +377,7 @@ impl DabPlusDecoder {
     pub fn set_superframe_size(&mut self, size: usize) {
         self.superframe_size = size;
         self.buf.clear();
+        self.synced = false;
     }
 
     /// Push bytes for one CIF and return any decoded PCM samples.
@@ -356,10 +386,49 @@ impl DabPlusDecoder {
             return Vec::new();
         }
         self.buf.extend_from_slice(data);
-        if self.buf.len() < self.superframe_size * 5 {
+
+        let sf_size = self.superframe_size * 5;
+
+        if !self.synced {
+            // Search for Firecode sync: try each CIF boundary until we find
+            // a valid superframe.
+            while self.buf.len() >= sf_size {
+                if firecode_check(&self.buf[..sf_size]) {
+                    log::info!("DAB+: Firecode sync acquired");
+                    self.synced = true;
+                    let superframe: Vec<u8> = self.buf.drain(..sf_size).collect();
+                    return decode_dab_plus_superframe(&superframe);
+                }
+                // Log first bytes for debugging.
+                let sf = &self.buf[..sf_size];
+                log::debug!(
+                    "DAB+: Firecode fail (stored={:04X}, bytes[2..6]={:02X} {:02X} {:02X} {:02X}), skipping 1 CIF",
+                    ((sf[0] as u16) << 8) | sf[1] as u16,
+                    sf.get(2).copied().unwrap_or(0),
+                    sf.get(3).copied().unwrap_or(0),
+                    sf.get(4).copied().unwrap_or(0),
+                    sf.get(5).copied().unwrap_or(0),
+                );
+                self.buf.drain(..self.superframe_size);
+            }
             return Vec::new();
         }
-        let superframe: Vec<u8> = self.buf.drain(..self.superframe_size * 5).collect();
+
+        // Already synced — decode at the established boundary.
+        if self.buf.len() < sf_size {
+            return Vec::new();
+        }
+        let superframe: Vec<u8> = self.buf.drain(..sf_size).collect();
+        if !firecode_check(&superframe) {
+            log::warn!("DAB+: Firecode CRC failed on synced superframe, re-syncing");
+            self.synced = false;
+            // Re-insert the data and skip one CIF to search again.
+            let mut rest = self.buf.split_off(0);
+            self.buf = superframe;
+            self.buf.append(&mut rest);
+            self.buf.drain(..self.superframe_size);
+            return Vec::new();
+        }
         decode_dab_plus_superframe(&superframe)
     }
 }
@@ -438,11 +507,29 @@ mod tests {
                 (1, 1) => 2,
                 _ => unreachable!(),
             };
-            assert_eq!(
-                num_aus, expected_aus,
-                "header_byte={:#010b}",
-                header_byte
-            );
+            assert_eq!(num_aus, expected_aus, "header_byte={:#010b}", header_byte);
+        }
+    }
+
+    #[test]
+    fn firecode_check_rejects_garbage() {
+        let garbage = vec![0xFFu8; 200];
+        assert!(!firecode_check(&garbage));
+    }
+
+    #[test]
+    fn firecode_check_rejects_short() {
+        assert!(!firecode_check(&[0x00, 0x00]));
+    }
+
+    #[test]
+    fn dab_plus_decoder_syncs_on_firecode() {
+        // The decoder should skip CIFs until Firecode matches.
+        let mut dec = DabPlusDecoder::new(10);
+        // Push garbage — should not produce output.
+        for _ in 0..10 {
+            let pcm = dec.push(&[0xAA; 10]);
+            assert!(pcm.is_empty());
         }
     }
 

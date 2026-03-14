@@ -54,6 +54,8 @@ pub struct FrameSync {
     sample_count: usize,
     /// Samples counted while inside the current null dip.
     null_sample_count: usize,
+    /// Set by `reset_for_resync()` to bypass the warmup check.
+    warmup_done: bool,
 }
 
 impl FrameSync {
@@ -68,6 +70,7 @@ impl FrameSync {
             long_term_avg: 0.0,
             sample_count: 0,
             null_sample_count: 0,
+            warmup_done: false,
         }
     }
 
@@ -77,8 +80,6 @@ impl FrameSync {
     /// pinpoint the start of a frame (i.e. just after we have consumed all
     /// NULL_SIZE null samples and know the null ended).
     pub fn push_samples(&mut self, samples: &[Complex32]) -> Option<FrameStart> {
-        let mut result: Option<FrameStart> = None;
-
         for &s in samples {
             let energy = s.norm_sqr(); // |s|²
             self.update_window(energy);
@@ -109,7 +110,7 @@ impl FrameSync {
 
                     // Detect energy dip (only after warm-up so the average
                     // has converged to the actual signal level).
-                    if self.sample_count >= MIN_WARMUP_SAMPLES
+                    if (self.warmup_done || self.sample_count >= MIN_WARMUP_SAMPLES)
                         && self.long_term_avg > 0.0
                         && window_mean < (self.threshold_factor as f64) * self.long_term_avg
                     {
@@ -148,13 +149,16 @@ impl FrameSync {
                             self.null_sample_count
                         );
                         self.state = SyncState::Locked;
-                        result = Some(frame_start);
+                        // Return immediately on first detection so the
+                        // caller can process this frame before we skip
+                        // ahead to a later null in the same buffer.
+                        return Some(frame_start);
                     }
                 }
             }
         }
 
-        result
+        None
     }
 
     /// Update the sliding energy window with a new sample energy value.
@@ -165,6 +169,24 @@ impl FrameSync {
         }
         self.energy_buf.push_back(energy);
         self.window_energy += energy as f64;
+    }
+
+    /// Reset the synchroniser for fast re-sync after losing frame tracking.
+    ///
+    /// Unlike `new()`, this preserves the converged `long_term_avg` so that
+    /// null detection works immediately without needing 8192 warmup samples.
+    pub fn reset_for_resync(&mut self) {
+        self.state = SyncState::Hunting;
+        // Keep energy_buf and window_energy intact — they hold valid signal
+        // energy from the end of the previous frame.  This prevents false
+        // null detections in the first ~256 samples after reset (the window
+        // needs to fill with real null-energy samples before triggering).
+        self.null_sample_count = 0;
+        // Keep long_term_avg — it's already converged.
+        // Reset sample_count to 0 so push_samples indices align with the
+        // caller's buffer, but mark warmup as already done.
+        self.sample_count = self.energy_buf.len();
+        self.warmup_done = true;
     }
 
     /// Total samples consumed so far.

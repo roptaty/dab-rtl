@@ -72,12 +72,7 @@ RTL-SDR IQ → [sdr] → Complex32 samples
 
 **Threading model:** `pipeline.rs` runs SDR→OFDM→FIC→MSC→audio in a background thread. `PipelineHandle` exposes `update_rx` (events from pipeline) and `cmd_tx` (Play/Stop commands) to the TUI/CLI.
 
-## Known TODOs
 
-1. **EEP two-region puncturing** — currently single-vector approximation; needs ETSI EN 300 401 Table 8a/8b
-2. **DAB+ HE-AAC** — requires `fdk-aac` (FFI C dep, unavoidable for DAB+)
-3. **DLS** (Programme Associated Data / scrolling text)
-4. **Scan caching** — persist results to `~/.config/dab-rtl/`
 
 ## Soft bit layout (split, not interleaved)
 

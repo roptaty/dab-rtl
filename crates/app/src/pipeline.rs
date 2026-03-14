@@ -22,8 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use audio::{DabPlusDecoder, Mp2Decoder};
-use fec::depuncturer::PUNCT_VECTORS;
-use fec::{depuncture, ViterbiDecoder};
+use fec::ViterbiDecoder;
 use ofdm::OfdmProcessor;
 use protocol::{
     ensemble::{Component, ProtectionLevel},
@@ -119,6 +118,7 @@ fn run_pipeline(
     let mut playing_sid: Option<u32> = None;
     let mut last_ens_label = String::new();
     let mut last_svc_count = 0usize;
+    let mut last_svc_labels = String::new();
     let mut frame_count = 0u64;
 
     let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
@@ -154,9 +154,21 @@ fn run_pipeline(
 
             // Propagate ensemble changes to the TUI.
             let ens = fic.handler.ensemble();
-            if ens.label != last_ens_label || ens.services.len() != last_svc_count {
+            // Build a fingerprint of service labels so we detect when labels
+            // arrive (they come in separate FIG messages after services appear).
+            let svc_labels: String = ens
+                .services
+                .iter()
+                .map(|s| format!("{:04X}:{}", s.id, s.label))
+                .collect::<Vec<_>>()
+                .join(",");
+            if ens.label != last_ens_label
+                || ens.services.len() != last_svc_count
+                || svc_labels != last_svc_labels
+            {
                 last_ens_label = ens.label.clone();
                 last_svc_count = ens.services.len();
+                last_svc_labels = svc_labels;
                 log::info!(
                     "Ensemble: id={:04X} label={:?} services={}",
                     ens.id,
@@ -254,9 +266,15 @@ fn run_pipeline(
                                         "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
                                     );
                                 } else if let Some(ao) = &audio_out {
+                                    let (min, max) =
+                                        pcm.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
+                                            (lo.min(s), hi.max(s))
+                                        });
                                     log::debug!(
-                                        "MSC: writing {} PCM samples to audio device",
-                                        pcm.len()
+                                        "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
+                                        pcm.len(),
+                                        min,
+                                        max
                                     );
                                     ao.write_samples(&pcm);
                                 } else {
@@ -407,9 +425,23 @@ impl FicDecoder {
 //  MSC decoder                                                                 //
 // ─────────────────────────────────────────────────────────────────────────── //
 
+/// Time interleaver permutation table (ETSI EN 300 401 §14.6, Table 31).
+///
+/// This is a 4-bit reversal permutation.  The transmitter delays bit position
+/// `i` by `PI[i % 16]` CIFs.  The receiver (deinterleaver) must compensate by
+/// picking bit `i` from the CIF that arrived `PI[i % 16]` positions ago
+/// relative to the oldest buffered CIF.
+const TIME_INTERLEAVE_PI: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+
 pub struct MscDecoder {
     target_sid: Option<u32>,
     viterbi: ViterbiDecoder,
+    /// Time deinterleaver: ring buffer of 16 CIFs of subchannel soft bits.
+    deint_buf: Vec<Vec<f32>>,
+    /// Total number of CIFs pushed into the deinterleaver.
+    deint_count: usize,
+    /// Expected subchannel soft-bit count per CIF (reset on subchannel change).
+    deint_bits_per_cif: usize,
 }
 
 impl MscDecoder {
@@ -417,23 +449,34 @@ impl MscDecoder {
         MscDecoder {
             target_sid: None,
             viterbi: ViterbiDecoder::new(128),
+            deint_buf: Vec::new(),
+            deint_count: 0,
+            deint_bits_per_cif: 0,
         }
     }
 
     pub fn set_target_sid(&mut self, sid: u32) {
         self.target_sid = Some(sid);
+        self.reset_deinterleaver();
     }
 
     pub fn clear_target(&mut self) {
         self.target_sid = None;
+        self.reset_deinterleaver();
+    }
+
+    fn reset_deinterleaver(&mut self) {
+        self.deint_buf.clear();
+        self.deint_count = 0;
+        self.deint_bits_per_cif = 0;
     }
 
     /// Decode one CIF (55296 soft bits) for the given component.
     ///
-    /// Returns `None` if no target SId is set or if the subchannel range
-    /// falls outside the CIF buffer.
+    /// Returns `None` if no target SId is set, if still filling the time
+    /// deinterleaver (first 15 CIFs), or if the subchannel range is invalid.
     pub fn process_cif(
-        &self,
+        &mut self,
         cif_soft: &[f32],
         component: &Component,
         _cif_idx: usize,
@@ -456,16 +499,54 @@ impl MscDecoder {
         }
 
         let subchannel_soft = &cif_soft[start_bit..end_bit];
+        let bits_per_cif = subchannel_soft.len();
 
-        // Apply EEP depuncturing.
-        let punct_vec = eep_punct_vector(&component.protection);
-        let depunct = depuncture(subchannel_soft, punct_vec);
+        // Reset deinterleaver if subchannel size changed.
+        if bits_per_cif != self.deint_bits_per_cif {
+            self.deint_bits_per_cif = bits_per_cif;
+            self.deint_buf = vec![vec![0.0f32; bits_per_cif]; 16];
+            self.deint_count = 0;
+        }
 
-        // Viterbi decode.
+        // Store in ring buffer.
+        let slot = self.deint_count % 16;
+        self.deint_buf[slot] = subchannel_soft.to_vec();
+        self.deint_count += 1;
+
+        // Need 16 CIFs before the deinterleaver can produce output.
+        if self.deint_count < 16 {
+            log::debug!("MSC: time deinterleaver filling ({}/16)", self.deint_count);
+            return None;
+        }
+
+        // Assemble deinterleaved soft bits.
+        // Physical CIF just written = self.deint_count - 1.
+        // We output the logical frame whose latest contribution just arrived.
+        // For bit i: source physical CIF = (current - 15 + PI[i % 16]).
+        let p = self.deint_count - 1;
+        let deint_soft: Vec<f32> = (0..bits_per_cif)
+            .map(|i| {
+                let source_cif = p - 15 + TIME_INTERLEAVE_PI[i % 16];
+                let source_slot = source_cif % 16;
+                self.deint_buf[source_slot][i]
+            })
+            .collect();
+
+        // Normalize soft bits to ~[-1, +1] for Viterbi (matches FIC path).
+        let max_abs = deint_soft.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if max_abs > 0.0 { 1.0 / max_abs } else { 1.0 };
+        let normalized: Vec<f32> = deint_soft.iter().map(|v| v * scale).collect();
+
+        // Apply two-region EEP depuncturing (ETSI EN 300 401 Tables 8/9).
+        let depunct = eep_depuncture(&normalized, component);
+
+        // Viterbi decode.  Strip K−1 = 6 tail bits (forced-zero flush bits
+        // appended by the encoder; they are not part of the information stream).
         let bits = self.viterbi.decode(&depunct);
+        let info_len = bits.len().saturating_sub(6);
 
         // Pack to bytes.
-        let mut data = pack_bits(&bits);
+        let mut data = pack_bits(&bits[..info_len]);
 
         // Energy de-dispersal: XOR with PRBS (ETSI EN 300 401 §12).
         energy_dedispersal(&mut data);
@@ -482,37 +563,34 @@ impl MscDecoder {
 //  Helpers                                                                     //
 // ─────────────────────────────────────────────────────────────────────────── //
 
-/// Return the EEP puncturing vector for a given protection level.
+/// Two-region EEP depuncturing for an MSC subchannel.
 ///
-/// This uses a single-region approximation.  The ETSI two-region scheme
-/// (ETSI EN 300 401 Table 8a/8b) can be substituted once verified.
-///
-/// ETSI protection levels: 1 = strongest (lowest code rate, most redundancy),
-/// 4 = weakest (highest code rate, least redundancy).
-/// Higher PI number = more bits kept = less puncturing.
-fn eep_punct_vector(protection: &ProtectionLevel) -> &'static [u8; 32] {
-    match protection {
-        // Level 1 (strongest) → PI_24 (no puncturing, full rate-1/4)
-        ProtectionLevel::EepA(1) | ProtectionLevel::EepB(1) => &PUNCT_VECTORS[23], // PI_24
-        // Level 2 → PI_14 (22 ones)
-        ProtectionLevel::EepA(2) | ProtectionLevel::EepB(2) => &PUNCT_VECTORS[13], // PI_14
-        // Level 3 → PI_8 (16 ones)
-        ProtectionLevel::EepA(3) | ProtectionLevel::EepB(3) => &PUNCT_VECTORS[7], // PI_8
-        // Level 4 (weakest) → PI_3 (11 ones)
-        ProtectionLevel::EepA(4) | ProtectionLevel::EepB(4) => &PUNCT_VECTORS[2], // PI_3
-        ProtectionLevel::Uep(level) => {
-            // Map UEP levels 1-5 to reasonable PI indices
-            let idx = match level {
-                1 => 23, // strongest → PI_24
-                2 => 15, // PI_16
-                3 => 7,  // PI_8
-                4 => 3,  // PI_4
-                _ => 1,  // weakest → PI_2
-            };
-            &PUNCT_VECTORS[idx]
+/// Computes (L1, L2, PI1, PI2) from the component's protection level
+/// and subchannel size, then applies the proper two-region scheme
+/// per ETSI EN 300 401 Tables 8/9.
+fn eep_depuncture(soft: &[f32], component: &Component) -> Vec<f32> {
+    let (l1, l2, pi1, pi2) = match &component.protection {
+        ProtectionLevel::EepA(level) => fec::eep_a_params(component.size, *level),
+        ProtectionLevel::EepB(level) => fec::eep_b_params(component.size, *level),
+        ProtectionLevel::Uep(_level) => {
+            // UEP has up to 4 regions; fall back to uniform depuncturing.
+            // TODO: implement proper UEP multi-region (ETSI EN 300 401 Table 6).
+            let n = component.size as usize / 6;
+            (6 * n.max(1) - 3, 3, 7, 6)
         }
-        _ => &PUNCT_VECTORS[23], // safe default: no puncturing (full rate)
-    }
+    };
+
+    log::debug!(
+        "MSC depuncture: size={} CUs, prot={:?}, L1={}, L2={}, PI{}+PI{}",
+        component.size,
+        component.protection,
+        l1,
+        l2,
+        pi1 + 1,
+        pi2 + 1
+    );
+
+    fec::msc_eep_depuncture(soft, l1, l2, pi1, pi2)
 }
 
 /// Find the first audio component for a service in the ensemble.
@@ -619,7 +697,7 @@ mod tests {
 
     #[test]
     fn msc_decoder_no_target_returns_none() {
-        let dec = MscDecoder::new();
+        let mut dec = MscDecoder::new();
         use protocol::ensemble::{Component, ProtectionLevel, ServiceType};
         let comp = Component {
             subchannel_id: 0,
