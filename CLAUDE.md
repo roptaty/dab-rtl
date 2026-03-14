@@ -29,7 +29,7 @@ cargo test --all               # all crates
 cargo test -p <crate>          # single crate (sdr, ofdm, fec, protocol, audio, dab-rtl)
 cargo test -p <crate> <name>   # single test by name, e.g.: cargo test -p dab-rtl known_channels_resolve
 cargo test -p <crate> -- --nocapture  # with stdout
-cargo test --ignored # Run ignored tests - run this when there have been fundamental changes to OFDM, fec and protocol
+cargo test --ignored -- --test-threads=1 # Run ignored tests (single-threaded to avoid OOM — each test loads a 540 MB IQ file)
 ```
 
 **Lint & Format:**
