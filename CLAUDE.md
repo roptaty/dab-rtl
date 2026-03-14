@@ -72,6 +72,24 @@ RTL-SDR IQ → [sdr] → Complex32 samples
 
 **Threading model:** `pipeline.rs` runs SDR→OFDM→FIC→MSC→audio in a background thread. `PipelineHandle` exposes `update_rx` (events from pipeline) and `cmd_tx` (Play/Stop commands) to the TUI/CLI.
 
+## Dependency management and security
+
+See [DEPENDENCIES.md](./DEPENDENCIES.md) for the full evaluation checklist and
+a table of all current dependencies.
+
+**Quick security checks (run before adding or upgrading any dependency):**
+```bash
+cargo audit                  # known CVEs via RustSec
+cargo deny check             # license, ban, and source policy (deny.toml)
+cargo outdated --workspace   # show stale versions
+cargo machete                # detect unused dependencies
+```
+
+When adding a new dependency, work through every item in the checklist in
+`DEPENDENCIES.md` before opening a PR. The CI `security` workflow enforces
+`cargo audit` and `cargo deny check` on every push and weekly on a schedule.
+
+## Known TODOs
 
 
 ## Soft bit layout (split, not interleaved)

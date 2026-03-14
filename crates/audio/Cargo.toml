@@ -1,7 +1,10 @@
 [package]
-name = "audio"
-version = "0.1.0"
-edition = "2021"
+name        = "audio"
+description = "DAB audio output: cpal ALSA sink and symphonia MP2/AAC decoder"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
 
 [dependencies]
 cpal      = "0.15"

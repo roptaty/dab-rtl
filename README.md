@@ -1,8 +1,8 @@
 # dab-rtl
-**NOT WORKING**
 
+Work in progress. 
 
-
+Most of the code (and contents here) are generated using vibe-coding and Claude from [Anthropic](https://www.anthropic.com/). 
 
 A pure-Rust DAB/DAB+ software-defined radio receiver for RTL-SDR and HackRF.
 
@@ -149,3 +149,22 @@ FIB parser   Viterbi FEC  (fec crate)
 | 13F | 239.200 MHz |
 
 Full table: run `dab-rtl scan --channel <name>` for any channel 5A–13F.
+
+## Thanks
+
+This project stands on the shoulders of the broader open-source SDR community.
+
+- **[welle.io](https://github.com/AlbrechtL/welle.io)** — An open-source DAB/DAB+ receiver that served as the primary inspiration for the signal pipeline and protocol implementation in this project.
+- **[librtlsdr](https://github.com/osmocom/rtl-sdr)** — The foundational C library that enables software-defined radio with low-cost RTL-SDR hardware.
+- **[rtlsdr_mt](https://crates.io/crates/rtlsdr_mt)** — The Rust bindings to librtlsdr used for hardware access.
+- **[Symphonia](https://github.com/pdeljanov/Symphonia)** — A pure-Rust audio decoding library used for MP2 playback.
+- **[rustfft](https://github.com/ejmahler/RustFFT)** — High-performance FFT used in OFDM demodulation.
+- **[ratatui](https://github.com/ratatui/ratatui)** — The terminal UI framework powering the interactive station browser.
+- The **ETSI EN 300 401** standard authors for publicly documenting the DAB specification.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+> **Note:** At runtime, this application links against `librtlsdr`, which is licensed under GPL-2.0+.
+> If you distribute a compiled binary, you may need to comply with the GPL for the combined work.

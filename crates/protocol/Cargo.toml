@@ -1,7 +1,10 @@
 [package]
-name = "protocol"
-version = "0.1.0"
-edition = "2021"
+name        = "protocol"
+description = "DAB FIC/FIB/FIG parser and MSC scheduler for ensemble and service metadata"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
 
 [dependencies]
 fec = { path = "../fec" }
