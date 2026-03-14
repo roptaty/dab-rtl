@@ -1,9 +1,8 @@
 
-## 🔒 Security Checklist
+## 🔒 Security
+
 - [ ] No secrets or credentials hardcoded in code or config
-- [ ] All DB queries use parameterized statements (no string concatenation)
-- [ ] Authorization is enforced server-side on every endpoint touched
-- [ ] All user input is validated server-side before use
-- [ ] Output is encoded for the correct context (HTML / JS / URL)
-- [ ] Error messages don't leak internal details or stack traces
-- [ ] New dependencies have been scanned for known vulnerabilities
+- [ ] No new `unsafe` blocks introduced without a documented justification
+- [ ] CLI input and device data (IQ samples, FIB/FIC bytes) are validated before use
+- [ ] Error messages don't expose sensitive system details
+- [ ] New dependencies follow the checklist in `DEPENDENCIES.md` (`cargo audit` and `cargo deny check` pass)
