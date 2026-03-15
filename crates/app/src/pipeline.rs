@@ -153,236 +153,239 @@ fn run_pipeline(
     let mut current_freq_hz: u32 = device_config.as_ref().map_or(0, |c| c.center_freq_hz);
 
     'pipeline: loop {
-    let mut ofdm = OfdmProcessor::new();
-    let mut fic = FicDecoder::new();
-    let mut msc = MscDecoder::new();
-    let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
-    let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
+        let mut ofdm = OfdmProcessor::new();
+        let mut fic = FicDecoder::new();
+        let mut msc = MscDecoder::new();
+        let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
+        let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
 
-    let mut last_ens_label = String::new();
-    let mut last_svc_count = 0usize;
-    let mut last_svc_labels = String::new();
-    let mut frame_count = 0u64;
-    let mut pending_retune: Option<u32> = None;
+        let mut last_ens_label = String::new();
+        let mut last_svc_count = 0usize;
+        let mut last_svc_labels = String::new();
+        let mut frame_count = 0u64;
+        let mut pending_retune: Option<u32> = None;
 
-    let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
+        let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
-    // Restore playing state if we re-tuned to the same channel.
-    if let Some(sid) = playing_sid {
-        msc.set_target_sid(sid);
-    }
+        // Restore playing state if we re-tuned to the same channel.
+        if let Some(sid) = playing_sid {
+            msc.set_target_sid(sid);
+        }
 
-    'stream: for iq_buf in stream.rx.iter() {
-        // Drain any pending commands.
-        if let Ok(guard) = cmd_rx.try_lock() {
-            while let Ok(cmd) = guard.try_recv() {
-                match cmd {
-                    PipelineCmd::Play(sid) => {
-                        playing_sid = Some(sid);
-                        msc.set_target_sid(sid);
-                    }
-                    PipelineCmd::Stop => {
-                        playing_sid = None;
-                        msc.clear_target();
-                    }
-                    PipelineCmd::Retune(freq_hz) => {
-                        pending_retune = Some(freq_hz);
+        'stream: for iq_buf in stream.rx.iter() {
+            // Drain any pending commands.
+            if let Ok(guard) = cmd_rx.try_lock() {
+                while let Ok(cmd) = guard.try_recv() {
+                    match cmd {
+                        PipelineCmd::Play(sid) => {
+                            playing_sid = Some(sid);
+                            msc.set_target_sid(sid);
+                        }
+                        PipelineCmd::Stop => {
+                            playing_sid = None;
+                            msc.clear_target();
+                        }
+                        PipelineCmd::Retune(freq_hz) => {
+                            pending_retune = Some(freq_hz);
+                        }
                     }
                 }
             }
-        }
 
-        if pending_retune.is_some() {
-            break 'stream;
-        }
-
-        // OFDM demodulation.
-        for frame in ofdm.push_samples(&iq_buf) {
-            frame_count += 1;
-            log::debug!("Pipeline: OFDM frame #{}", frame_count);
-
-            // ── FIC (symbols 0-2) ────────────────────────────────────────── //
-            fic.begin_frame();
-            let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
-            for sym in fic_symbols {
-                fic.process_symbol(sym);
+            if pending_retune.is_some() {
+                break 'stream;
             }
 
-            // Propagate ensemble changes to the TUI.
-            let ens = fic.handler.ensemble();
-            // Build a fingerprint of service labels so we detect when labels
-            // arrive (they come in separate FIG messages after services appear).
-            let svc_labels: String = ens
-                .services
-                .iter()
-                .map(|s| format!("{:04X}:{}", s.id, s.label))
-                .collect::<Vec<_>>()
-                .join(",");
-            if ens.label != last_ens_label
-                || ens.services.len() != last_svc_count
-                || svc_labels != last_svc_labels
-            {
-                last_ens_label = ens.label.clone();
-                last_svc_count = ens.services.len();
-                last_svc_labels = svc_labels;
-                log::info!(
-                    "Ensemble: id={:04X} label={:?} services={}",
-                    ens.id,
-                    ens.label,
-                    ens.services.len()
-                );
-                for svc in &ens.services {
+            // OFDM demodulation.
+            for frame in ofdm.push_samples(&iq_buf) {
+                frame_count += 1;
+                log::debug!("Pipeline: OFDM frame #{}", frame_count);
+
+                // ── FIC (symbols 0-2) ────────────────────────────────────────── //
+                fic.begin_frame();
+                let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
+                for sym in fic_symbols {
+                    fic.process_symbol(sym);
+                }
+
+                // Propagate ensemble changes to the TUI.
+                let ens = fic.handler.ensemble();
+                // Build a fingerprint of service labels so we detect when labels
+                // arrive (they come in separate FIG messages after services appear).
+                let svc_labels: String = ens
+                    .services
+                    .iter()
+                    .map(|s| format!("{:04X}:{}", s.id, s.label))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if ens.label != last_ens_label
+                    || ens.services.len() != last_svc_count
+                    || svc_labels != last_svc_labels
+                {
+                    last_ens_label = ens.label.clone();
+                    last_svc_count = ens.services.len();
+                    last_svc_labels = svc_labels;
                     log::info!(
-                        "  Service: id={:04X} label={:?} dab+={} components={}",
-                        svc.id,
-                        svc.label,
-                        svc.is_dab_plus,
-                        svc.components.len()
+                        "Ensemble: id={:04X} label={:?} services={}",
+                        ens.id,
+                        ens.label,
+                        ens.services.len()
                     );
-                    for comp in &svc.components {
+                    for svc in &ens.services {
                         log::info!(
-                            "    Component: subch={} start={} size={} prot={:?}",
-                            comp.subchannel_id,
-                            comp.start_address,
-                            comp.size,
-                            comp.protection
+                            "  Service: id={:04X} label={:?} dab+={} components={}",
+                            svc.id,
+                            svc.label,
+                            svc.is_dab_plus,
+                            svc.components.len()
                         );
-                    }
-                }
-                let mut ens_snapshot = ens.clone();
-                ens_snapshot.freq_hz = current_freq_hz;
-                let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens_snapshot));
-                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
-                    "Locked — {} services",
-                    ens.services.len()
-                )));
-            }
-
-            // Announce when we start playing.
-            if let Some(sid) = playing_sid {
-                if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
-                    let _ = update_tx.try_send(PipelineUpdate::Playing {
-                        label: svc.label.clone(),
-                    });
-                }
-            }
-
-            // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
-            if playing_sid.is_some() {
-                let ens_snap = ens.clone();
-                let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
-
-                for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
-                    if cif_syms.len() < 18 {
-                        continue;
-                    }
-                    // Flatten CIF symbols → 55296 soft bits.
-                    let cif_soft: Vec<f32> =
-                        cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
-
-                    if let Some(sid) = playing_sid {
-                        let component = find_component(&ens_snap, sid);
-                        if component.is_none() && cif_idx == 0 {
-                            log::debug!(
-                                "MSC: no component found for SId {:04X} (service has {} components)",
-                                sid,
-                                ens_snap
-                                    .services
-                                    .iter()
-                                    .find(|s| s.id == sid)
-                                    .map_or(0, |s| s.components.len())
+                        for comp in &svc.components {
+                            log::info!(
+                                "    Component: subch={} start={} size={} prot={:?}",
+                                comp.subchannel_id,
+                                comp.start_address,
+                                comp.size,
+                                comp.protection
                             );
                         }
-                        if let Some(component) = component {
-                            if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx) {
+                    }
+                    let mut ens_snapshot = ens.clone();
+                    ens_snapshot.freq_hz = current_freq_hz;
+                    let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens_snapshot));
+                    let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                        "Locked — {} services",
+                        ens.services.len()
+                    )));
+                }
+
+                // Announce when we start playing.
+                if let Some(sid) = playing_sid {
+                    if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
+                        let _ = update_tx.try_send(PipelineUpdate::Playing {
+                            label: svc.label.clone(),
+                        });
+                    }
+                }
+
+                // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
+                if playing_sid.is_some() {
+                    let ens_snap = ens.clone();
+                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+
+                    for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
+                        if cif_syms.len() < 18 {
+                            continue;
+                        }
+                        // Flatten CIF symbols → 55296 soft bits.
+                        let cif_soft: Vec<f32> =
+                            cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
+
+                        if let Some(sid) = playing_sid {
+                            let component = find_component(&ens_snap, sid);
+                            if component.is_none() && cif_idx == 0 {
                                 log::debug!(
-                                    "MSC: CIF {} subchannel {} → {} bytes ({})",
-                                    cif_idx,
-                                    frame.subchannel_id,
-                                    frame.data.len(),
-                                    if frame.is_dab_plus { "DAB+" } else { "DAB" }
+                                    "MSC: no component found for SId {:04X} (service has {} components)",
+                                    sid,
+                                    ens_snap
+                                        .services
+                                        .iter()
+                                        .find(|s| s.id == sid)
+                                        .map_or(0, |s| s.components.len())
                                 );
-                                // Set DAB+ superframe size from actual Viterbi output.
-                                if frame.is_dab_plus
-                                    && !frame.data.is_empty()
-                                    && dab_plus.superframe_size != frame.data.len()
+                            }
+                            if let Some(component) = component {
+                                if let Some(frame) =
+                                    msc.process_cif(&cif_soft, component, cif_idx)
                                 {
-                                    log::info!(
-                                        "DAB+: setting per-CIF size to {} bytes (was {})",
+                                    log::debug!(
+                                        "MSC: CIF {} subchannel {} → {} bytes ({})",
+                                        cif_idx,
+                                        frame.subchannel_id,
                                         frame.data.len(),
-                                        dab_plus.superframe_size
+                                        if frame.is_dab_plus { "DAB+" } else { "DAB" }
                                     );
-                                    dab_plus.set_superframe_size(frame.data.len());
-                                }
-                                let pcm = if frame.is_dab_plus {
-                                    dab_plus.push(&frame.data)
-                                } else {
-                                    mp2.push(&frame.data)
-                                };
-                                if pcm.is_empty() {
-                                    log::debug!(
-                                        "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
-                                    );
-                                } else if let Some(ao) = &audio_out {
-                                    let (min, max) =
-                                        pcm.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
-                                            (lo.min(s), hi.max(s))
-                                        });
-                                    log::debug!(
-                                        "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
-                                        pcm.len(),
-                                        min,
-                                        max
-                                    );
-                                    ao.write_samples(&pcm);
-                                } else {
-                                    log::debug!(
-                                        "MSC: {} PCM samples ready but no audio device",
-                                        pcm.len()
-                                    );
+                                    // Set DAB+ superframe size from actual Viterbi output.
+                                    if frame.is_dab_plus
+                                        && !frame.data.is_empty()
+                                        && dab_plus.superframe_size != frame.data.len()
+                                    {
+                                        log::info!(
+                                            "DAB+: setting per-CIF size to {} bytes (was {})",
+                                            frame.data.len(),
+                                            dab_plus.superframe_size
+                                        );
+                                        dab_plus.set_superframe_size(frame.data.len());
+                                    }
+                                    let pcm = if frame.is_dab_plus {
+                                        dab_plus.push(&frame.data)
+                                    } else {
+                                        mp2.push(&frame.data)
+                                    };
+                                    if pcm.is_empty() {
+                                        log::debug!(
+                                            "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
+                                        );
+                                    } else if let Some(ao) = &audio_out {
+                                        let (min, max) = pcm
+                                            .iter()
+                                            .fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
+                                                (lo.min(s), hi.max(s))
+                                            });
+                                        log::debug!(
+                                            "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
+                                            pcm.len(),
+                                            min,
+                                            max
+                                        );
+                                        ao.write_samples(&pcm);
+                                    } else {
+                                        log::debug!(
+                                            "MSC: {} PCM samples ready but no audio device",
+                                            pcm.len()
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-    } // end 'stream: for iq_buf
+        } // end 'stream: for iq_buf
 
-    // Handle retune: drop the old stream and open a new one at the new frequency.
-    match pending_retune.take() {
-        Some(freq_hz) if device_config.is_some() => {
-            let cfg = device_config.as_ref().unwrap();
-            let new_cfg = sdr::DeviceConfig {
-                center_freq_hz: freq_hz,
-                ..cfg.clone()
-            };
-            log::info!("pipeline: retuning to {:.3} MHz", freq_hz as f64 / 1e6);
-            let _ = update_tx.try_send(PipelineUpdate::Status(format!(
-                "Retuning to {:.3} MHz…",
-                freq_hz as f64 / 1e6
-            )));
-            // Drop the old stream so the USB device is released before reopening.
-            drop(stream);
-            match sdr::open_stream(new_cfg, 32_768) {
-                Ok(new_stream) => {
-                    stream = new_stream;
-                    current_freq_hz = freq_hz;
-                    continue 'pipeline;
-                }
-                Err(e) => {
-                    log::error!("pipeline: retune failed: {e}");
-                    let _ = update_tx.try_send(PipelineUpdate::Status(format!(
-                        "Retune failed: {e}"
-                    )));
-                    break 'pipeline;
+        // Handle retune: drop the old stream and open a new one at the new frequency.
+        match pending_retune.take() {
+            Some(freq_hz) if device_config.is_some() => {
+                let cfg = device_config.as_ref().unwrap();
+                let new_cfg = sdr::DeviceConfig {
+                    center_freq_hz: freq_hz,
+                    ..cfg.clone()
+                };
+                log::info!("pipeline: retuning to {:.3} MHz", freq_hz as f64 / 1e6);
+                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                    "Retuning to {:.3} MHz…",
+                    freq_hz as f64 / 1e6
+                )));
+                // Drop the old stream so the USB device is released before reopening.
+                drop(stream);
+                match sdr::open_stream(new_cfg, 32_768) {
+                    Ok(new_stream) => {
+                        stream = new_stream;
+                        current_freq_hz = freq_hz;
+                        continue 'pipeline;
+                    }
+                    Err(e) => {
+                        log::error!("pipeline: retune failed: {e}");
+                        let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                            "Retune failed: {e}"
+                        )));
+                        break 'pipeline;
+                    }
                 }
             }
+            _ => {}
         }
-        _ => {}
-    }
 
-    break 'pipeline; // stream ended naturally
+        break 'pipeline; // stream ended naturally
 
     } // end 'pipeline: loop
 

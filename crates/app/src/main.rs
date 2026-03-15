@@ -217,7 +217,15 @@ fn main() {
             country,
             audio_device,
             file,
-        } => cmd_tune(cli.device, cli.ppm, cli.gain, channel, country, audio_device, file),
+        } => cmd_tune(
+            cli.device,
+            cli.ppm,
+            cli.gain,
+            channel,
+            country,
+            audio_device,
+            file,
+        ),
         Command::Play {
             channel,
             station,
