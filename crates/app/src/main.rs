@@ -3,6 +3,7 @@ mod pipeline;
 mod tui;
 
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "dab-rtl", about = "Pure-Rust DAB/DAB+ radio receiver", version)]
@@ -37,30 +38,38 @@ enum Command {
     /// Scan for DAB stations on the given channel (no TUI)
     Scan {
         /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
-        #[arg(short = 'c', long, required_unless_present = "country")]
+        #[arg(short = 'c', long, required_unless_present_any = ["country", "file"])]
         channel: Option<String>,
 
         /// ISO 3166-1 alpha-2 country code (e.g. NO, GB, DE); scans all channels
-        #[arg(long, conflicts_with = "channel")]
+        #[arg(long, conflicts_with_all = ["channel", "file"])]
         country: Option<String>,
+
+        /// Raw IQ file (u8 interleaved I/Q, e.g. from rtl_sdr) instead of live SDR
+        #[arg(short = 'f', long, conflicts_with = "country")]
+        file: Option<PathBuf>,
     },
 
     /// Tune to a channel and launch the interactive TUI
     Tune {
         /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
-        #[arg(short = 'c', long)]
-        channel: String,
+        #[arg(short = 'c', long, required_unless_present = "file")]
+        channel: Option<String>,
 
         /// Audio output device name (default = system default)
         #[arg(short = 'a', long)]
         audio_device: Option<String>,
+
+        /// Raw IQ file (u8 interleaved I/Q, e.g. from rtl_sdr) instead of live SDR
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
     },
 
     /// Play a specific station (non-interactive)
     Play {
         /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
-        #[arg(short = 'c', long)]
-        channel: String,
+        #[arg(short = 'c', long, required_unless_present = "file")]
+        channel: Option<String>,
 
         /// Station name (case-insensitive substring match)
         #[arg(short = 's', long)]
@@ -69,6 +78,10 @@ enum Command {
         /// Audio output device name (default = system default)
         #[arg(short = 'a', long)]
         audio_device: Option<String>,
+
+        /// Raw IQ file (u8 interleaved I/Q, e.g. from rtl_sdr) instead of live SDR
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
     },
 }
 
@@ -127,6 +140,52 @@ fn resolve_channel(ch: &str) -> u32 {
     })
 }
 
+/// Open an IQ sample stream from either a raw file or a live RTL-SDR device.
+fn open_iq_source(
+    file: Option<&PathBuf>,
+    channel: Option<&str>,
+    device_idx: u32,
+    ppm: i32,
+    gain: i32,
+) -> sdr::SdrStream {
+    if let Some(path) = file {
+        match sdr::open_file_stream(path, 32_768) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let ch = channel.expect("channel or file required");
+        let freq_hz = resolve_channel(ch);
+        let config = sdr::DeviceConfig {
+            index: device_idx,
+            center_freq_hz: freq_hz,
+            gain,
+            ppm_correction: ppm,
+        };
+        match sdr::open_stream(config, 32_768) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Describe the IQ source for user-facing messages.
+fn source_label(file: Option<&PathBuf>, channel: Option<&str>) -> String {
+    if let Some(path) = file {
+        format!("file '{}'", path.display())
+    } else {
+        let ch = channel.expect("channel or file required");
+        let freq_hz = resolve_channel(ch);
+        format!("channel {ch} at {:.3} MHz", freq_hz as f64 / 1e6)
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────── //
 //  Entry point                                                                 //
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -139,38 +198,30 @@ fn main() {
         Command::ListDevices => cmd_list_devices(),
         Command::ListAudio => cmd_list_audio(),
         Command::ListCountries => countries::print_countries(),
-        Command::Scan { channel, country } => {
-            let channels: Vec<String> = if let Some(code) = country {
-                match countries::channels_for_country(&code) {
-                    Some(chs) => chs.iter().map(|s| s.to_string()).collect(),
-                    None => {
-                        eprintln!("error: unknown country code '{code}'. Try `list-countries`.");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                vec![channel.expect("channel or country required")]
-            };
-            for ch in &channels {
-                let freq = resolve_channel(ch);
-                cmd_scan(cli.device, cli.ppm, cli.gain, freq, ch);
-            }
-        }
+        Command::Scan {
+            channel,
+            country,
+            file,
+        } => cmd_scan(cli.device, cli.ppm, cli.gain, channel, country, file),
         Command::Tune {
             channel,
             audio_device,
-        } => {
-            let freq = resolve_channel(&channel);
-            cmd_tune(cli.device, cli.ppm, cli.gain, freq, audio_device);
-        }
+            file,
+        } => cmd_tune(cli.device, cli.ppm, cli.gain, channel, audio_device, file),
         Command::Play {
             channel,
             station,
             audio_device,
-        } => {
-            let freq = resolve_channel(&channel);
-            cmd_play(cli.device, cli.ppm, cli.gain, freq, station, audio_device);
-        }
+            file,
+        } => cmd_play(
+            cli.device,
+            cli.ppm,
+            cli.gain,
+            channel,
+            station,
+            audio_device,
+            file,
+        ),
     }
 }
 
@@ -205,7 +256,40 @@ fn cmd_list_audio() {
 /// Stops when either:
 /// - No ensemble is detected within `NO_LOCK_SECS` seconds, or
 /// - `SETTLE_SECS` seconds pass with no new service appearing.
-fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32, channel: &str) {
+fn cmd_scan(
+    device_idx: u32,
+    ppm: i32,
+    gain: i32,
+    channel: Option<String>,
+    country: Option<String>,
+    file: Option<PathBuf>,
+) {
+    // Country mode: scan all channels for that country (file not supported).
+    if let Some(code) = country {
+        let channels = match countries::channels_for_country(&code) {
+            Some(chs) => chs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            None => {
+                eprintln!("error: unknown country code '{code}'. Try `list-countries`.");
+                std::process::exit(1);
+            }
+        };
+        for ch in &channels {
+            scan_single(device_idx, ppm, gain, Some(ch.as_str()), None);
+        }
+        return;
+    }
+
+    scan_single(device_idx, ppm, gain, channel.as_deref(), file.as_ref());
+}
+
+/// Scan a single IQ source for DAB services.
+fn scan_single(
+    device_idx: u32,
+    ppm: i32,
+    gain: i32,
+    channel: Option<&str>,
+    file: Option<&PathBuf>,
+) {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
     use std::time::{Duration, Instant};
@@ -215,24 +299,10 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32, channel: &str) {
     /// After the first service appears, wait this long for more to arrive.
     const SETTLE_SECS: u64 = 5;
 
-    println!(
-        "Scanning channel {channel} at {:.3} MHz (device {device_idx})…",
-        freq_hz as f64 / 1e6
-    );
+    let label = source_label(file, channel);
+    println!("Scanning {label}…");
 
-    let config = sdr::DeviceConfig {
-        index: device_idx,
-        center_freq_hz: freq_hz,
-        gain,
-        ppm_correction: ppm,
-    };
-    let stream = match sdr::open_stream(config, 32_768) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let stream = open_iq_source(file, channel, device_idx, ppm, gain);
 
     let mut ofdm = OfdmProcessor::new();
     let mut fic = FicDecoder::new();
@@ -299,17 +369,20 @@ fn cmd_scan(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32, channel: &str) {
 }
 
 /// Interactive TUI on a channel: let the user browse and select a station.
-fn cmd_tune(device_idx: u32, ppm: i32, gain: i32, freq_hz: u32, audio_device: Option<String>) {
-    println!("Tuning to {:.3} MHz…", freq_hz as f64 / 1e6);
+fn cmd_tune(
+    device_idx: u32,
+    ppm: i32,
+    gain: i32,
+    channel: Option<String>,
+    audio_device: Option<String>,
+    file: Option<PathBuf>,
+) {
+    let label = source_label(file.as_ref(), channel.as_deref());
+    println!("Tuning to {label}…");
 
-    let config = sdr::DeviceConfig {
-        index: device_idx,
-        center_freq_hz: freq_hz,
-        gain,
-        ppm_correction: ppm,
-    };
+    let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
-    let handle = match pipeline::start(config, audio_device) {
+    let handle = match pipeline::start_with_stream(stream, audio_device) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("error: {e}");
@@ -327,26 +400,19 @@ fn cmd_play(
     device_idx: u32,
     ppm: i32,
     gain: i32,
-    freq_hz: u32,
+    channel: Option<String>,
     station: String,
     audio_device: Option<String>,
+    file: Option<PathBuf>,
 ) {
     use pipeline::{PipelineCmd, PipelineUpdate};
 
-    println!(
-        "Searching for '{}' on {:.3} MHz…  Press Ctrl-C to stop.",
-        station,
-        freq_hz as f64 / 1e6
-    );
+    let label = source_label(file.as_ref(), channel.as_deref());
+    println!("Searching for '{station}' on {label}…  Press Ctrl-C to stop.");
 
-    let config = sdr::DeviceConfig {
-        index: device_idx,
-        center_freq_hz: freq_hz,
-        gain,
-        ppm_correction: ppm,
-    };
+    let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
-    let handle = match pipeline::start(config, audio_device) {
+    let handle = match pipeline::start_with_stream(stream, audio_device) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("error: {e}");

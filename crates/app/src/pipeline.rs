@@ -28,7 +28,6 @@ use protocol::{
     ensemble::{Component, ProtectionLevel},
     Ensemble, FicHandler,
 };
-use sdr::DeviceConfig;
 
 // ─────────────────────────────────────────────────────────────────────────── //
 //  Public API types                                                            //
@@ -63,11 +62,9 @@ pub struct PipelineHandle {
 //  Pipeline launch                                                             //
 // ─────────────────────────────────────────────────────────────────────────── //
 
-/// Start the receive pipeline in background threads.
-///
-/// Returns a `PipelineHandle` for the caller (TUI) to communicate with.
-pub fn start(
-    device_config: DeviceConfig,
+/// Start the receive pipeline from a pre-opened IQ stream.
+pub fn start_with_stream(
+    stream: sdr::SdrStream,
     audio_device: Option<String>,
 ) -> Result<PipelineHandle, String> {
     // Channel: background → TUI updates
@@ -76,9 +73,6 @@ pub fn start(
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipelineCmd>(8);
     // Shared command state so the inner SDR loop can check it.
     let cmd_rx = Arc::new(Mutex::new(cmd_rx));
-
-    // Open SDR stream (produces Vec<Complex32> buffers).
-    let stream = sdr::open_stream(device_config, 32_768).map_err(|e| e.to_string())?;
 
     // AudioOutput contains cpal::Stream which is !Send, so it must be
     // constructed inside the pipeline thread rather than passed across threads.
