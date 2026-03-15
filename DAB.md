@@ -410,6 +410,87 @@ In practice for DAB:
 
 The receiver needs to know the puncturing pattern to depuncture — inserting erasures (zero-confidence soft bits) at the positions where coded bits were deleted — before feeding the data to the Viterbi decoder. The `crates/fec` crate in this project has 24 EEP/UEP depuncturing vectors for this purpose.
 
+## DLS
+
+DLS (Dynamic Label Segment) is a text service that lets broadcasters send short text messages — typically the current song title and artist, or programme information — alongside the audio stream. The text appears on the receiver's display and updates dynamically as each new item plays.
+
+### Transport
+
+DLS is not embedded in the audio sub-channel. It is carried as a separate **packet-mode data component** within the MSC, using its own sub-channel (or CU range). The FIC links it to its parent audio service via:
+
+| FIG | Role |
+|---|---|
+| FIG 0/3 | Declares the service component as packet-mode; assigns its **packet address** (10-bit) and its **Sub-Channel ID** |
+| FIG 0/13 | Signals the **user application** running on that component: AppTy = `0x002` identifies DLS |
+
+A receiver that wants to display DLS text must:
+1. Parse FIG 0/3 to find the packet address and sub-channel for the DLS component linked to the selected audio service
+2. Extract those CUs from the MSC (same depuncture + Viterbi path as audio)
+3. Reassemble the MSC packet stream and filter packets by packet address
+4. Parse the DLS commands inside the packets
+
+### MSC Packet Structure
+
+Each MSC packet is 24, 48, 72, or 96 bytes long. The first 3 bytes are a header:
+
+```
+Bit  23 22 21 20 19 18 17 16 | 15 14 13 12 11 10 9 8 | 7 6 5 4 3 2 1 0
+    ├──────────────────────────┼──────────────────────┼──────────────────┤
+    │  packet address [9:0]    │  CF│  LC│  PdLen[4:0] │   CRC byte 1    │
+    └──────────────────────────┴──────────────────────┴──────────────────┘
+```
+
+- **packet address** (bits 23–14): identifies which data component this packet belongs to
+- **CF** (Continuity Flag, bit 13): toggles each packet to detect loss
+- **LC** (Last flag + Command flag, bits 12–11): indicates first, intermediate, or last segment
+- **PdLen** (bits 10–8 and 7–0 split across bytes): number of data bytes following the 3-byte header plus 2-byte CRC at end
+- **CRC-16** (last 2 bytes of packet): polynomial 0x1021, covers the entire packet
+
+### DLS Commands (ETSI TS 102 980)
+
+The data field of a packet carries one or more **DLS command segments**. Each command begins with a 1-byte command tag:
+
+| Command | Value | Purpose |
+|---|---|---|
+| DL\_Command (set label) | 0x01 | Transmit the current text string |
+| DL\_Plus Command | 0x02 | Tag parts of the label (e.g., mark artist vs. title spans) |
+| Item Toggle | bit in header | Signals that the displayed item has changed |
+
+A **DL\_Command** (set label) carries:
+
+```
+Byte 0:   Command = 0x01
+Byte 1:   Charset[3:0] | Toggle | First | Last | length[7:0]
+Bytes 2…: UTF-8 or EBU Latin text, up to 128 bytes
+```
+
+- **Charset**: `0x00` = EBU Latin (same as FIG label charset), `0x06` = UTF-8
+- **Toggle bit**: flips each time the displayed item changes (allows receivers to detect a new song even if the text happens to be identical)
+- **First / Last**: segment framing for long labels split across multiple packets
+- **length**: number of text bytes that follow
+
+### DL Plus (DL+)
+
+DL Plus (standardised in ETSI TS 102 980 §7) extends DLS by tagging character ranges within the label text with **content type codes**:
+
+| Content Type | Code | Example |
+|---|---|---|
+| Item.Title | 1 | "Bohemian Rhapsody" |
+| Item.Artist | 4 | "Queen" |
+| Programme.Now | 12 | "News at Six" |
+| Programme.Next | 13 | "Sports Report" |
+| Phone.Hotline | 24 | "+44 845 …" |
+| Homepage | 39 | URL of the station website |
+
+A DL+ tag is a tuple `(content_type, start_char, length_char)` referencing byte offsets in the current label string. Receivers that understand DL+ can display artist and title separately or show structured programme metadata; receivers that do not understand it simply display the raw label text unchanged.
+
+### Receiver Behaviour
+
+1. On each new DL\_Command, the receiver compares the **toggle bit** to the previous value. If it has flipped, the item has changed and the display is updated; if not, the packet is a repeat for reliability.
+2. Text encoding must be honoured: EBU Latin maps accented European characters to a Latin codepage; UTF-8 allows arbitrary Unicode.
+3. DLS text is limited to **128 characters**; longer strings are truncated by the broadcaster.
+4. If the DLS data component is absent or its packets are lost, the receiver falls back to the static service label from FIG 1/1.
+
 ## Example
 
 This example traces a complete DAB Mode I frame — one 96 ms transmission cycle — from raw sample offsets through to decoded audio bytes, using realistic but simplified values.
