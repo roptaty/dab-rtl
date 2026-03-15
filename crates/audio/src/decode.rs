@@ -165,9 +165,18 @@ pub fn firecode_check(data: &[u8]) -> bool {
 
 /// Build an AudioSpecificConfig for DAB+ (ETSI TS 102 563).
 ///
-/// Uses 960-sample frames (frameLengthFlag=1), AAC-LC base profile,
-/// with optional SBR and PS signaling via explicit backward-compatible
-/// extension payloads.
+/// Uses 960-sample frames (frameLengthFlag=1), AAC-LC base profile.
+/// When SBR is present, uses **hierarchical signaling** (AOT=5 or AOT=29
+/// as the primary object type) so that fdk-aac reliably activates SBR
+/// upsampling.  This matches the approach used by dablin and welle.io.
+///
+/// ISO 14496-3 hierarchical signaling layout for AOT=5 (SBR):
+///   [5: AOT=5] [4: core_sr_idx] [4: channels] [4: ext_sr_idx]
+///   [5: core_AOT=2] [3: GASpecificConfig]
+///
+/// For AOT=29 (PS, implies SBR):
+///   [5: AOT=29] [4: core_sr_idx] [4: channels] [4: ext_sr_idx]
+///   [5: core_AOT=2] [3: GASpecificConfig]
 fn build_asc(
     core_sr_idx: u8,
     channels: u8,
@@ -178,39 +187,43 @@ fn build_asc(
     let mut bits: u64 = 0;
     let mut nbits: usize = 0;
 
-    // AudioObjectType = 2 (AAC-LC), 5 bits
-    bits = (bits << 5) | 2;
-    nbits += 5;
-    // samplingFrequencyIndex, 4 bits
-    bits = (bits << 4) | (core_sr_idx as u64 & 0xF);
-    nbits += 4;
-    // channelConfiguration, 4 bits
-    bits = (bits << 4) | (channels as u64 & 0xF);
-    nbits += 4;
-    // GASpecificConfig: frameLengthFlag=1 (960 samples), dependsOnCoreCoder=0, extensionFlag=0
-    bits = (bits << 3) | 0b100;
-    nbits += 3;
-
     if sbr_flag {
-        // SBR sync extension: syncExtensionType=0x2B7, extAOT=5, sbrPresent=1, extSrIdx
-        bits = (bits << 11) | 0x2B7;
-        nbits += 11;
-        bits = (bits << 5) | 5; // SBR
+        // Hierarchical signaling: primary AOT = 5 (SBR) or 29 (PS+SBR)
+        let primary_aot: u64 = if ps_flag { 29 } else { 5 };
+        // AudioObjectType (primary), 5 bits
+        bits = (bits << 5) | primary_aot;
         nbits += 5;
-        bits = (bits << 1) | 1; // sbrPresentFlag
-        nbits += 1;
+        // samplingFrequencyIndex = core rate, 4 bits
+        bits = (bits << 4) | (core_sr_idx as u64 & 0xF);
+        nbits += 4;
+        // channelConfiguration, 4 bits
+        bits = (bits << 4) | (channels as u64 & 0xF);
+        nbits += 4;
+        // extensionSamplingFrequencyIndex = SBR output rate, 4 bits
         bits = (bits << 4) | (ext_sr_idx as u64 & 0xF);
         nbits += 4;
-
-        if ps_flag {
-            // PS sync extension: syncExtensionType=0x548, extAOT=22, psPresentFlag=1
-            bits = (bits << 11) | 0x548;
-            nbits += 11;
-            bits = (bits << 5) | 22; // PS
-            nbits += 5;
-            bits = (bits << 1) | 1; // psPresentFlag
-            nbits += 1;
-        }
+        // Core AudioObjectType = 2 (AAC-LC), 5 bits
+        bits = (bits << 5) | 2;
+        nbits += 5;
+        // GASpecificConfig: frameLengthFlag=1 (960 samples),
+        // dependsOnCoreCoder=0, extensionFlag=0
+        bits = (bits << 3) | 0b100;
+        nbits += 3;
+    } else {
+        // Plain AAC-LC (no SBR)
+        // AudioObjectType = 2 (AAC-LC), 5 bits
+        bits = (bits << 5) | 2;
+        nbits += 5;
+        // samplingFrequencyIndex, 4 bits
+        bits = (bits << 4) | (core_sr_idx as u64 & 0xF);
+        nbits += 4;
+        // channelConfiguration, 4 bits
+        bits = (bits << 4) | (channels as u64 & 0xF);
+        nbits += 4;
+        // GASpecificConfig: frameLengthFlag=1 (960 samples),
+        // dependsOnCoreCoder=0, extensionFlag=0
+        bits = (bits << 3) | 0b100;
+        nbits += 3;
     }
 
     // Pad to byte boundary
@@ -696,9 +709,18 @@ mod tests {
     #[test]
     fn build_asc_smoke() {
         // AAC-LC 24kHz stereo with SBR → 48kHz (typical DAB+ config)
+        // With hierarchical signaling, primary AOT = 5 (SBR)
         let asc = build_asc(6, 2, true, 3, false);
         assert!(!asc.is_empty());
-        // First 5 bits = objectType = 2 (AAC-LC) → byte[0] top 5 bits = 00010
-        assert_eq!(asc[0] >> 3, 0b00010);
+        // First 5 bits = objectType = 5 (SBR) → byte[0] top 5 bits = 00101
+        assert_eq!(asc[0] >> 3, 0b00101);
+
+        // Plain AAC-LC (no SBR): AOT = 2
+        let asc_plain = build_asc(3, 2, false, 0, false);
+        assert_eq!(asc_plain[0] >> 3, 0b00010);
+
+        // PS+SBR: primary AOT = 29
+        let asc_ps = build_asc(6, 1, true, 3, true);
+        assert_eq!(asc_ps[0] >> 3, 0b11101);
     }
 }
