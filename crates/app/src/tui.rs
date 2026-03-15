@@ -27,6 +27,8 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
+use nix::unistd;
+
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -280,15 +282,11 @@ pub fn run(handle: PipelineHandle, initial_channels: Vec<(String, u32)>) -> io::
     // active so those messages don't corrupt the alternate-screen rendering.
     // Only do this when stderr is a TTY — if the user has redirected stderr to a
     // file (e.g. `2> debug.log`) we must leave it alone so logs are preserved.
-    let saved_stderr = if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+    let stderr_fd = io::stderr().as_raw_fd();
+    let saved_stderr = if unistd::isatty(stderr_fd).unwrap_or(false) {
         let devnull = OpenOptions::new().write(true).open("/dev/null")?;
-        // Safety: dup/dup2 are async-signal-safe POSIX primitives with no
-        // safety invariants beyond valid fd numbers.
-        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
-        if saved < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        unsafe { libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO) };
+        let saved = unistd::dup(stderr_fd).map_err(io::Error::from)?;
+        unistd::dup2(devnull.as_raw_fd(), stderr_fd).map_err(io::Error::from)?;
         Some(saved)
     } else {
         None
@@ -310,10 +308,8 @@ pub fn run(handle: PipelineHandle, initial_channels: Vec<(String, u32)>) -> io::
 
     // Restore stderr if we redirected it.
     if let Some(saved) = saved_stderr {
-        unsafe {
-            libc::dup2(saved, libc::STDERR_FILENO);
-            libc::close(saved);
-        }
+        let _ = unistd::dup2(saved, stderr_fd);
+        let _ = unistd::close(saved);
     }
 
     result
