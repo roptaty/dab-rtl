@@ -10,6 +10,8 @@ pub struct Ensemble {
     pub country_id: u8,
     /// Services carried in this ensemble.
     pub services: Vec<Service>,
+    /// Tuner centre frequency in Hz (0 = unknown).
+    pub freq_hz: u32,
 }
 
 impl Ensemble {
@@ -41,6 +43,8 @@ pub struct Service {
     pub is_dab_plus: bool,
     /// Service components (audio/data subchannels).
     pub components: Vec<Component>,
+    /// Dynamic Label Segment text (from MSC data packets), if received.
+    pub dls_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]

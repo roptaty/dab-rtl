@@ -53,15 +53,24 @@ enum Command {
     /// Tune to a channel and launch the interactive TUI
     Tune {
         /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
-        #[arg(short = 'c', long, required_unless_present = "file")]
+        #[arg(
+            short = 'c',
+            long,
+            required_unless_present_any = ["file", "country"]
+        )]
         channel: Option<String>,
+
+        /// ISO 3166-1 alpha-2 country code (e.g. NO, GB, DE).
+        /// Scans all channels for that country and lets you pick a station.
+        #[arg(long, conflicts_with_all = ["channel", "file"])]
+        country: Option<String>,
 
         /// Audio output device name (default = system default)
         #[arg(short = 'a', long)]
         audio_device: Option<String>,
 
         /// Raw IQ file (u8 interleaved I/Q, e.g. from rtl_sdr) instead of live SDR
-        #[arg(short = 'f', long)]
+        #[arg(short = 'f', long, conflicts_with = "country")]
         file: Option<PathBuf>,
     },
 
@@ -205,9 +214,10 @@ fn main() {
         } => cmd_scan(cli.device, cli.ppm, cli.gain, channel, country, file),
         Command::Tune {
             channel,
+            country,
             audio_device,
             file,
-        } => cmd_tune(cli.device, cli.ppm, cli.gain, channel, audio_device, file),
+        } => cmd_tune(cli.device, cli.ppm, cli.gain, channel, country, audio_device, file),
         Command::Play {
             channel,
             station,
@@ -368,30 +378,90 @@ fn scan_single(
     }
 }
 
-/// Interactive TUI on a channel: let the user browse and select a station.
+/// Interactive TUI: tune to a specific channel, or scan all channels for a country.
 fn cmd_tune(
     device_idx: u32,
     ppm: i32,
     gain: i32,
     channel: Option<String>,
+    country: Option<String>,
     audio_device: Option<String>,
     file: Option<PathBuf>,
 ) {
+    // Country mode: scan all channels for that country in the TUI.
+    if let Some(ref code) = country {
+        let channels = match countries::channels_for_country(code) {
+            Some(chs) => chs,
+            None => {
+                eprintln!("error: unknown country code '{code}'. Try `list-countries`.");
+                std::process::exit(1);
+            }
+        };
+
+        // Start the pipeline on the first channel; the TUI will retune as it scans.
+        let first_ch = channels[0];
+        let freq_hz = resolve_channel(first_ch);
+        let config = sdr::DeviceConfig {
+            index: device_idx,
+            center_freq_hz: freq_hz,
+            gain,
+            ppm_correction: ppm,
+        };
+        println!("Starting country scan for {code} ({} channels)…", channels.len());
+        let handle = match pipeline::start_for_device(config, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        let ch_list: Vec<(String, u32)> = channels
+            .iter()
+            .filter_map(|&ch| channel_to_freq(ch).map(|f| (ch.to_string(), f)))
+            .collect();
+        if let Err(e) = tui::run(handle, ch_list) {
+            eprintln!("TUI error: {e}");
+        }
+        return;
+    }
+
+    // Single-channel mode (or file mode).
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Tuning to {label}…");
 
-    let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
-
-    let handle = match pipeline::start_with_stream(stream, audio_device) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+    if file.is_none() {
+        // Live SDR: use start_for_device so the TUI can retune via [c] → country select.
+        let ch = channel.as_deref().expect("channel or file required");
+        let freq_hz = resolve_channel(ch);
+        let config = sdr::DeviceConfig {
+            index: device_idx,
+            center_freq_hz: freq_hz,
+            gain,
+            ppm_correction: ppm,
+        };
+        let handle = match pipeline::start_for_device(config, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = tui::run(handle, vec![]) {
+            eprintln!("TUI error: {e}");
         }
-    };
-
-    if let Err(e) = tui::run(handle) {
-        eprintln!("TUI error: {e}");
+    } else {
+        // File mode: retune not supported.
+        let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
+        let handle = match pipeline::start_with_stream(stream, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = tui::run(handle, vec![]) {
+            eprintln!("TUI error: {e}");
+        }
     }
 }
 
@@ -442,6 +512,7 @@ fn cmd_play(
             PipelineUpdate::Status(s) => {
                 log::info!("Pipeline: {s}");
             }
+            PipelineUpdate::Scanning { .. } => {}
         }
     }
 }

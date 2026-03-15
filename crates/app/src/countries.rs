@@ -23,6 +23,11 @@ pub fn channels_for_country(code: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Return a list of all supported countries as `(iso_code, display_name, channels)` triples.
+pub fn country_list() -> &'static [(&'static str, &'static str, &'static [&'static str])] {
+    COUNTRY_TABLE
+}
+
 /// Print a formatted list of all supported countries.
 pub fn print_countries() {
     println!("{:<6}  Country", "Code");

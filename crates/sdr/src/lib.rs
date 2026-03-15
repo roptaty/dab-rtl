@@ -54,6 +54,7 @@ pub fn list_devices() -> Vec<(u32, String)> {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Configuration for opening an RTL-SDR device.
+#[derive(Clone)]
 pub struct DeviceConfig {
     /// Device index (0 = first device).
     pub index: u32,

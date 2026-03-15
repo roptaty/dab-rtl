@@ -42,6 +42,12 @@ pub enum PipelineUpdate {
     Playing { label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
+    /// Scanning progress: processing channel `current` of `total`.
+    Scanning {
+        channel: String,
+        current: usize,
+        total: usize,
+    },
 }
 
 /// Commands sent to the pipeline background thread.
@@ -50,6 +56,9 @@ pub enum PipelineCmd {
     Play(u32),
     /// Stop playback (keep scanning FIC).
     Stop,
+    /// Retune to a new centre frequency (Hz). Resets OFDM/FIC state.
+    /// Only effective when the pipeline was started via `start_for_device`.
+    Retune(u32),
 }
 
 /// Handle to the running pipeline.  Drop to stop all background threads.
@@ -63,6 +72,9 @@ pub struct PipelineHandle {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Start the receive pipeline from a pre-opened IQ stream.
+///
+/// This variant does not support `PipelineCmd::Retune`; retune commands are
+/// silently ignored.  Use `start_for_device` for retune support.
 pub fn start_with_stream(
     stream: sdr::SdrStream,
     audio_device: Option<String>,
@@ -85,7 +97,38 @@ pub fn start_with_stream(
             if let Some(ref ao) = audio_out {
                 ao.play();
             }
-            run_pipeline(stream, audio_out, update_tx, cmd_rx);
+            run_pipeline(stream, None, audio_out, update_tx, cmd_rx);
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(PipelineHandle { update_rx, cmd_tx })
+}
+
+/// Start the receive pipeline from a live RTL-SDR device.
+///
+/// Unlike `start_with_stream`, this variant supports `PipelineCmd::Retune`:
+/// the pipeline will close the current stream and re-open the device at the
+/// new frequency, resetting all OFDM / FIC state.
+pub fn start_for_device(
+    config: sdr::DeviceConfig,
+    audio_device: Option<String>,
+) -> Result<PipelineHandle, String> {
+    let stream = sdr::open_stream(config.clone(), 32_768).map_err(|e| e.to_string())?;
+
+    let (update_tx, update_rx) = mpsc::sync_channel::<PipelineUpdate>(32);
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipelineCmd>(8);
+    let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+
+    thread::Builder::new()
+        .name("pipeline".into())
+        .spawn(move || {
+            let audio_out = audio::AudioOutput::open(audio_device.as_deref(), 48_000, 2)
+                .map_err(|e| log::warn!("audio open failed: {e}"))
+                .ok();
+            if let Some(ref ao) = audio_out {
+                ao.play();
+            }
+            run_pipeline(stream, Some(config), audio_out, update_tx, cmd_rx);
         })
         .map_err(|e| e.to_string())?;
 
@@ -97,27 +140,39 @@ pub fn start_with_stream(
 // ─────────────────────────────────────────────────────────────────────────── //
 
 fn run_pipeline(
-    stream: sdr::SdrStream,
+    initial_stream: sdr::SdrStream,
+    device_config: Option<sdr::DeviceConfig>,
     audio_out: Option<audio::AudioOutput>,
     update_tx: mpsc::SyncSender<PipelineUpdate>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<PipelineCmd>>>,
 ) {
+    let mut stream = initial_stream;
+    // Currently selected SId (None = scan-only).  Preserved across retunes.
+    let mut playing_sid: Option<u32> = None;
+    // Track the current centre frequency so ensemble snapshots carry it.
+    let mut current_freq_hz: u32 = device_config.as_ref().map_or(0, |c| c.center_freq_hz);
+
+    'pipeline: loop {
     let mut ofdm = OfdmProcessor::new();
     let mut fic = FicDecoder::new();
     let mut msc = MscDecoder::new();
     let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
     let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
 
-    // Currently selected SId (None = scan-only).
-    let mut playing_sid: Option<u32> = None;
     let mut last_ens_label = String::new();
     let mut last_svc_count = 0usize;
     let mut last_svc_labels = String::new();
     let mut frame_count = 0u64;
+    let mut pending_retune: Option<u32> = None;
 
     let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
-    for iq_buf in stream.rx.iter() {
+    // Restore playing state if we re-tuned to the same channel.
+    if let Some(sid) = playing_sid {
+        msc.set_target_sid(sid);
+    }
+
+    'stream: for iq_buf in stream.rx.iter() {
         // Drain any pending commands.
         if let Ok(guard) = cmd_rx.try_lock() {
             while let Ok(cmd) = guard.try_recv() {
@@ -130,8 +185,15 @@ fn run_pipeline(
                         playing_sid = None;
                         msc.clear_target();
                     }
+                    PipelineCmd::Retune(freq_hz) => {
+                        pending_retune = Some(freq_hz);
+                    }
                 }
             }
+        }
+
+        if pending_retune.is_some() {
+            break 'stream;
         }
 
         // OFDM demodulation.
@@ -187,7 +249,9 @@ fn run_pipeline(
                         );
                     }
                 }
-                let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens.clone()));
+                let mut ens_snapshot = ens.clone();
+                ens_snapshot.freq_hz = current_freq_hz;
+                let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens_snapshot));
                 let _ = update_tx.try_send(PipelineUpdate::Status(format!(
                     "Locked — {} services",
                     ens.services.len()
@@ -283,9 +347,46 @@ fn run_pipeline(
                 }
             }
         }
+    } // end 'stream: for iq_buf
+
+    // Handle retune: drop the old stream and open a new one at the new frequency.
+    match pending_retune.take() {
+        Some(freq_hz) if device_config.is_some() => {
+            let cfg = device_config.as_ref().unwrap();
+            let new_cfg = sdr::DeviceConfig {
+                center_freq_hz: freq_hz,
+                ..cfg.clone()
+            };
+            log::info!("pipeline: retuning to {:.3} MHz", freq_hz as f64 / 1e6);
+            let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                "Retuning to {:.3} MHz…",
+                freq_hz as f64 / 1e6
+            )));
+            // Drop the old stream so the USB device is released before reopening.
+            drop(stream);
+            match sdr::open_stream(new_cfg, 32_768) {
+                Ok(new_stream) => {
+                    stream = new_stream;
+                    current_freq_hz = freq_hz;
+                    continue 'pipeline;
+                }
+                Err(e) => {
+                    log::error!("pipeline: retune failed: {e}");
+                    let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                        "Retune failed: {e}"
+                    )));
+                    break 'pipeline;
+                }
+            }
+        }
+        _ => {}
     }
 
-    log::info!("pipeline: IQ stream ended, thread exiting");
+    break 'pipeline; // stream ended naturally
+
+    } // end 'pipeline: loop
+
+    log::info!("pipeline: thread exiting");
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -308,6 +409,12 @@ pub struct FicDecoder {
     pub handler: FicHandler,
     /// Accumulation buffer for FIC soft bits across OFDM symbols.
     fic_buf: Vec<f32>,
+}
+
+impl Default for FicDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FicDecoder {
@@ -436,6 +543,12 @@ pub struct MscDecoder {
     deint_count: usize,
     /// Expected subchannel soft-bit count per CIF (reset on subchannel change).
     deint_bits_per_cif: usize,
+}
+
+impl Default for MscDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MscDecoder {
