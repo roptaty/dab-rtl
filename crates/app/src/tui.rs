@@ -10,6 +10,17 @@
 /// │ [↑↓] Navigate  [Enter] Play  [s] Stop  [c] Country  [q] │
 /// └──────────────────────────────────────────────────────────┘
 ///
+/// Layout (Scanning mode): a bottom log box is added between content and status bar.
+/// ┌──────────────────────────────────────────────────────────┐
+/// │ Services (scanning)      │ Now Playing                   │
+/// ├──────────────────────────────────────────────────────────┤
+/// │ Scan Log                                                 │
+/// │   Tuning to 1/10: 5A…                                   │
+/// │   Channel 5A: 0 stations → Tuning to 2/10: 5B…          │
+/// ├──────────────────────────────────────────────────────────┤
+/// │ Scanning… │ Scanning 2/10: 5B                           │
+/// └──────────────────────────────────────────────────────────┘
+///
 /// Layout (CountrySelect mode): a popup overlaid on top.
 use std::io;
 use std::time::{Duration, Instant};
@@ -58,6 +69,8 @@ struct ScanState {
     services: Vec<DiscoveredService>,
     /// SIds already collected across all channels (to avoid duplicates).
     seen_sids: std::collections::HashSet<u32>,
+    /// Number of services found before tuning to the current channel (for per-channel reporting).
+    channel_start_count: usize,
 }
 
 impl ScanState {
@@ -68,6 +81,7 @@ impl ScanState {
             ticks: 0,
             services: Vec::new(),
             seen_sids: std::collections::HashSet::new(),
+            channel_start_count: 0,
         }
     }
 
@@ -82,9 +96,6 @@ impl ScanState {
         self.channels.len()
     }
 
-    fn current_number(&self) -> usize {
-        self.current_idx + 1
-    }
 }
 
 /// Which top-level view is active.
@@ -103,6 +114,9 @@ enum UiMode {
 /// How many 200 ms ticks to spend on each channel during a scan.
 /// 25 ticks = 5 seconds.
 const SCAN_TICKS_PER_CHANNEL: u32 = 25;
+
+/// Maximum number of log lines kept in the scan log ring buffer.
+const MAX_SCAN_LOG: usize = 200;
 
 struct AppState {
     /// Most recent ensemble received from the pipeline.
@@ -125,6 +139,8 @@ struct AppState {
     scan_state: Option<ScanState>,
     /// Accumulated services discovered across a completed (or in-progress) scan.
     discovered: Vec<DiscoveredService>,
+    /// Log messages shown in the bottom scan-log panel during scanning.
+    scan_log: std::collections::VecDeque<String>,
 }
 
 impl AppState {
@@ -144,6 +160,15 @@ impl AppState {
             country_list_state,
             scan_state: None,
             discovered: Vec::new(),
+            scan_log: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Append a message to the scan log ring buffer, capped at `MAX_SCAN_LOG` lines.
+    fn push_scan_log(&mut self, msg: String) {
+        self.scan_log.push_back(msg);
+        while self.scan_log.len() > MAX_SCAN_LOG {
+            self.scan_log.pop_front();
         }
     }
 
@@ -363,6 +388,9 @@ fn start_scan(state: &mut AppState, handle: &PipelineHandle, channels: Vec<(Stri
     state.discovered.clear();
     state.list_state.select(None);
     state.status = format!("Scanning 1/{total}: {first_name}…");
+    state.scan_log.clear();
+    state.push_scan_log(format!("Starting scan: {total} channels"));
+    state.push_scan_log(format!("Tuning to channel 1/{total}: {first_name}…"));
     state.scan_state = Some(ScanState::new(channels));
 
     let _ = handle.cmd_tx.try_send(PipelineCmd::Stop);
@@ -381,30 +409,46 @@ fn advance_scan(state: &mut AppState, handle: &PipelineHandle) {
             return;
         }
         scan.ticks = 0;
+
+        let prev_name = scan.channel_name().to_string();
+        let found_on_channel = scan.services.len() - scan.channel_start_count;
+
         scan.current_idx += 1;
         scan.seen_sids.clear();
 
         let idx = scan.current_idx;
         let total = scan.total();
         let next = scan.channels.get(idx).cloned();
-        (idx, total, next)
+
+        scan.channel_start_count = scan.services.len();
+
+        (idx, total, prev_name, found_on_channel, next)
     }; // mutable borrow of state.scan_state ends here
 
-    let (idx, total, next_channel) = action;
+    let (idx, total, prev_name, found_on_channel, next_channel) = action;
+
+    // Log the result for the channel we just finished.
+    let station_word = if found_on_channel == 1 { "station" } else { "stations" };
+    state.push_scan_log(format!(
+        "  {prev_name}: {found_on_channel} {station_word} found"
+    ));
 
     if let Some((next_name, next_freq)) = next_channel {
         state.status = format!("Scanning {}/{total}: {next_name}…", idx + 1);
+        state.push_scan_log(format!("Tuning to channel {}/{total}: {next_name}…", idx + 1));
         let _ = handle.cmd_tx.try_send(PipelineCmd::Retune(next_freq));
     } else {
         // Scan complete — safe to take because the borrow above has ended.
         let services = state.scan_state.take().unwrap().services;
         let count = services.len();
         state.discovered = services;
-        if count == 0 {
-            state.status = "Scan complete — no stations found".into();
+        let msg = if count == 0 {
+            "Scan complete — no stations found".to_string()
         } else {
-            state.status = format!("Scan complete — {count} stations found");
-        }
+            format!("Scan complete — {count} stations found")
+        };
+        state.status = msg.clone();
+        state.push_scan_log(msg);
         state.list_state.select(if count > 0 { Some(0) } else { None });
     }
 }
@@ -470,30 +514,39 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
 
 fn render(f: &mut Frame, state: &mut AppState) {
     let area = f.size();
+    let scanning = state.scan_state.is_some();
 
-    // Outer: vertical split — main content / status bar.
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
-        .split(area);
+    // During scanning, insert a bottom log panel between content and status bar.
+    let (content_area, log_area, status_area) = if scanning {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(6), Constraint::Length(3)])
+            .split(area);
+        (outer[0], Some(outer[1]), outer[2])
+    } else {
+        let outer = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .split(area);
+        (outer[0], None, outer[1])
+    };
 
     // Main: horizontal split — service list / now playing.
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(outer[0]);
+        .split(content_area);
 
     render_service_list(f, state, main[0]);
     render_now_playing(f, state, main[1]);
-    render_status_bar(f, state, outer[1]);
+    if let Some(log) = log_area {
+        render_scan_log(f, state, log);
+    }
+    render_status_bar(f, state, status_area);
 
     // Overlays drawn last so they appear on top.
     if let UiMode::CountrySelect = state.mode {
         render_country_popup(f, state, area);
-    }
-
-    if state.scan_state.is_some() {
-        render_scan_banner(f, state, outer[0]);
     }
 }
 
@@ -678,47 +731,29 @@ fn render_country_popup(f: &mut Frame, state: &mut AppState, area: Rect) {
     f.render_stateful_widget(list, popup_area, &mut state.country_list_state);
 }
 
-/// Banner shown at the top of the content area while scanning channels.
-fn render_scan_banner(f: &mut Frame, state: &AppState, area: Rect) {
-    let Some(ref scan) = state.scan_state else {
-        return;
-    };
+/// Bottom panel shown during scanning, displaying a scrolling log of channel scan progress.
+fn render_scan_log(f: &mut Frame, state: &AppState, area: Rect) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let log_len = state.scan_log.len();
+    let skip = log_len.saturating_sub(inner_height);
 
-    let banner_height = 3u16;
-    if area.height < banner_height + 2 {
-        return;
-    }
+    let items: Vec<ListItem> = state
+        .scan_log
+        .iter()
+        .skip(skip)
+        .map(|msg| ListItem::new(msg.as_str()))
+        .collect();
 
-    let banner_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: banner_height,
-    };
+    // Show how many stations have been found so far in the title.
+    let found = state.scan_state.as_ref().map_or(0, |s| s.services.len());
+    let title = format!(" Scan Log — {found} stations found so far ");
 
-    f.render_widget(Clear, banner_area);
-
-    let progress = format!(
-        "  Scanning channel {} of {} — {}    {} stations found so far",
-        scan.current_number(),
-        scan.total(),
-        scan.channel_name(),
-        scan.services.len(),
-    );
-
-    let para = Paragraph::new(Line::from(Span::styled(
-        &progress,
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )))
-    .block(
+    let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .style(Style::default().bg(Color::Cyan).fg(Color::Black))
-            .title(" Scanning "),
+            .title(title)
+            .title_alignment(Alignment::Left),
     );
 
-    f.render_widget(para, banner_area);
+    f.render_widget(list, area);
 }
