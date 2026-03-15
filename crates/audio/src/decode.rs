@@ -483,6 +483,12 @@ impl DabPlusDecoder {
         let aac = self.aac.as_mut().unwrap();
         let mut out = Vec::new();
 
+        // Expected output sample rate when SBR is active.
+        let expected_sr: u32 = match dac_rate {
+            0 => 32_000,
+            _ => 48_000,
+        };
+
         for i in 0..num_aus {
             let start = au_starts[i];
             let end = au_starts[i + 1];
@@ -522,28 +528,71 @@ impl DabPlusDecoder {
             match aac.decoder.decode_frame() {
                 Ok(frame_size) if frame_size > 0 => {
                     let pcm_i16 = &aac.decoder.pcm_buf[..frame_size];
-                    let out_channels = aac.decoder.stream_info().num_channels;
+                    let info = aac.decoder.stream_info();
+                    let out_channels = info.num_channels;
+                    let decoder_sr = info.sample_rate as u32;
 
-                    if out_channels == 1 {
-                        for &s in pcm_i16 {
-                            let f = s as f32 / i16::MAX as f32;
-                            out.push(f);
-                            out.push(f);
-                        }
+                    // Check if SBR upsampling is needed but wasn't applied by fdk-aac.
+                    let need_upsample = sbr_flag != 0 && decoder_sr > 0 && decoder_sr < expected_sr;
+                    let upsample_ratio = if need_upsample {
+                        expected_sr / decoder_sr
                     } else {
-                        for &s in pcm_i16 {
-                            out.push(s as f32 / i16::MAX as f32);
-                        }
-                    }
+                        1
+                    };
 
                     if i == 0 && log::log_enabled!(log::Level::Debug) {
-                        let info = aac.decoder.stream_info();
                         log::debug!(
-                            "AAC: decoded AU[0]: {} samples, {} ch, {} Hz",
+                            "AAC: decoded AU[0]: {} samples, {} ch, {} Hz (upsample {}x)",
                             info.frame_size,
                             info.num_channels,
-                            info.sample_rate
+                            decoder_sr,
+                            upsample_ratio
                         );
+                    }
+
+                    if out_channels == 1 {
+                        // Mono → stereo with optional upsampling.
+                        for j in 0..pcm_i16.len() {
+                            let f = pcm_i16[j] as f32 / i16::MAX as f32;
+                            if upsample_ratio == 2 && j + 1 < pcm_i16.len() {
+                                let f_next = pcm_i16[j + 1] as f32 / i16::MAX as f32;
+                                let mid = (f + f_next) * 0.5;
+                                out.push(f);
+                                out.push(f);
+                                out.push(mid);
+                                out.push(mid);
+                            } else {
+                                out.push(f);
+                                out.push(f);
+                            }
+                        }
+                    } else {
+                        // Stereo (interleaved L,R pairs) with optional upsampling.
+                        let samples = pcm_i16.chunks_exact(2);
+                        let pairs: Vec<(f32, f32)> = samples
+                            .map(|lr| {
+                                (
+                                    lr[0] as f32 / i16::MAX as f32,
+                                    lr[1] as f32 / i16::MAX as f32,
+                                )
+                            })
+                            .collect();
+
+                        for j in 0..pairs.len() {
+                            let (l, r) = pairs[j];
+                            out.push(l);
+                            out.push(r);
+                            if upsample_ratio == 2 {
+                                // Linear interpolation with next sample, or repeat last.
+                                let (l_next, r_next) = if j + 1 < pairs.len() {
+                                    pairs[j + 1]
+                                } else {
+                                    (l, r)
+                                };
+                                out.push((l + l_next) * 0.5);
+                                out.push((r + r_next) * 0.5);
+                            }
+                        }
                     }
                 }
                 Ok(_) => {}
