@@ -13,14 +13,17 @@ sudo apt-get remove rustc cargo rust-all
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-# Native libraries
-sudo apt-get install librtlsdr-dev libasound2-dev libfdk-aac-dev pkg-config
+# Native libraries (libfdk-aac-dev is optional — only needed for DAB+ audio)
+sudo apt-get install librtlsdr-dev libasound2-dev pkg-config
+# For DAB+ HE-AAC v2 audio playback, also install:
+# sudo apt-get install libfdk-aac-dev
 ```
 
 **Build:**
 ```bash
-cargo build --release          # full workspace
-cargo build --release -p dab-rtl  # just the binary
+cargo build --release                       # minimal build (no DAB+ audio playback)
+cargo build --release --features fdk-aac   # with DAB+ audio via libfdk-aac
+cargo build --release -p dab-rtl           # just the binary (minimal)
 ```
 
 **Test:**

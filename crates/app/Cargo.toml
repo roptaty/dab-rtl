@@ -10,6 +10,11 @@ repository.workspace = true
 name = "dab-rtl"
 path = "src/main.rs"
 
+[features]
+# Enable DAB+ HE-AAC v2 audio playback via libfdk-aac (requires libfdk-aac-dev).
+# When disabled, DAB+ stations can still be scanned but audio is silenced.
+fdk-aac = ["audio/fdk-aac"]
+
 [dependencies]
 sdr      = { path = "../sdr" }
 ofdm     = { path = "../ofdm" }

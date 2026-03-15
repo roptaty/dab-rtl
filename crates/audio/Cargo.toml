@@ -6,6 +6,12 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
+[features]
+# Link the system libfdk-aac library for DAB+ HE-AAC v2 decoding.
+# Requires libfdk-aac-dev on Debian/Ubuntu.
+# When disabled, DAB+ scanning still works but audio playback is silenced.
+fdk-aac = []
+
 [dependencies]
 cpal      = "0.15"
 log       = "0.4"

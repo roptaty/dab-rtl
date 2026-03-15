@@ -1,4 +1,4 @@
-/// Minimal FFI bindings for libfdk-aac decoder.
+/// Minimal FFI bindings for libfdk-aac decoder (only compiled with `fdk-aac` feature).
 ///
 /// Links to the system `libfdk-aac` (install `libfdk-aac-dev` on Debian/Ubuntu).
 /// Only the decoder API is exposed; the encoder is not needed.

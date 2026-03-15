@@ -2,8 +2,18 @@
 ///
 /// DAB audio is carried as raw MPEG Layer 2 frames (decoded via Symphonia).
 /// DAB+ audio is carried as HE-AAC v2 Access Units packed inside a DAB+
-/// superframe (ETSI TS 102 563).  Raw AUs are fed to fdk-aac via RAW
-/// transport with an AudioSpecificConfig (960-sample frames, SBR/PS).
+/// superframe (ETSI TS 102 563).  When the `fdk-aac` Cargo feature is
+/// enabled, raw AUs are fed to libfdk-aac via RAW transport with an
+/// AudioSpecificConfig (960-sample frames, SBR/PS).  Without `fdk-aac`
+/// the decoder is present but returns silence — DAB+ scanning still works.
+///
+/// # Replacing libfdk-aac
+///
+/// Symphonia (`symphonia-codec-aac`) implements AAC-LC but does not yet
+/// support SBR (Spectral Band Replication) or PS (Parametric Stereo),
+/// both of which are required for DAB+ HE-AAC v2 streams.  When upstream
+/// Symphonia gains SBR/PS support it can be wired in here as a second
+/// backend behind a feature flag without changing the public API.
 use symphonia::core::{
     audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
     meta::MetadataOptions, probe::Hint,
@@ -243,10 +253,12 @@ fn build_asc(
 ///
 /// RAW transport with explicit AudioSpecificConfig is required for DAB+
 /// because ADTS doesn't support 960-sample frames.
+#[cfg(feature = "fdk-aac")]
 struct AacState {
     decoder: crate::fdk::Decoder,
 }
 
+#[cfg(feature = "fdk-aac")]
 impl AacState {
     fn new_raw(asc: &[u8]) -> Result<Self, String> {
         let mut decoder = crate::fdk::Decoder::new_raw();
@@ -262,6 +274,10 @@ impl AacState {
 /// Accumulates raw bytes until a full superframe (5 CIFs) is available,
 /// then decodes.  Uses Firecode CRC to synchronize to the correct 5-CIF
 /// superframe boundary before decoding.
+///
+/// Audio output requires the `fdk-aac` Cargo feature.  Without it the
+/// struct still performs superframe framing and CRC checks but returns
+/// silence, allowing DAB+ services to be scanned and selected.
 pub struct DabPlusDecoder {
     buf: Vec<u8>,
     /// Per-CIF byte count.  Set from the first actual decoded frame.
@@ -269,6 +285,7 @@ pub struct DabPlusDecoder {
     /// Whether we have found a valid Firecode alignment.
     synced: bool,
     /// Persistent fdk-aac decoder (SBR/PS/window state survives across superframes).
+    #[cfg(feature = "fdk-aac")]
     aac: Option<AacState>,
 }
 
@@ -283,6 +300,7 @@ impl DabPlusDecoder {
             buf: Vec::new(),
             superframe_size,
             synced: false,
+            #[cfg(feature = "fdk-aac")]
             aac: None,
         }
     }
@@ -292,6 +310,10 @@ impl DabPlusDecoder {
         self.superframe_size = size;
         self.buf.clear();
         self.synced = false;
+        #[cfg(feature = "fdk-aac")]
+        {
+            self.aac = None;
+        }
     }
 
     /// Push bytes for one CIF and return any decoded PCM samples.
@@ -390,218 +412,244 @@ impl DabPlusDecoder {
             return Vec::new();
         }
 
-        let header_byte = data[2];
-        // Bit layout (ETSI TS 102 563, Table 1):
-        //   bit 7: rfa, bit 6: dac_rate, bit 5: sbr_flag,
-        //   bit 4: aac_channel_mode, bit 3: ps_flag, bits 2-0: mpeg_surround_config
-        let dac_rate = (header_byte >> 6) & 1;
-        let sbr_flag = (header_byte >> 5) & 1;
-        let aac_channel_mode = (header_byte >> 4) & 1;
-        let ps_flag = (header_byte >> 3) & 1;
-
-        // ETSI TS 102 563, Table 2 (verified against dablin):
-        let num_aus: usize = match (dac_rate, sbr_flag) {
-            (0, 0) => 4,
-            (0, 1) => 2,
-            (1, 0) => 6,
-            (1, 1) => 3,
-            _ => unreachable!(),
-        };
-
-        // Core sample rate index (for ASC)
-        let core_sr_idx: u8 = match (dac_rate, sbr_flag) {
-            (0, 0) => 5, // 32 kHz
-            (0, 1) => 8, // 16 kHz core (SBR → 32 kHz)
-            (1, 0) => 3, // 48 kHz
-            (1, 1) => 6, // 24 kHz core (SBR → 48 kHz)
-            _ => unreachable!(),
-        };
-
-        // Output (SBR) sample rate index
-        let ext_sr_idx: u8 = match dac_rate {
-            0 => 5, // 32 kHz
-            1 => 3, // 48 kHz
-            _ => unreachable!(),
-        };
-
-        let channels: u8 = if aac_channel_mode == 0 { 1 } else { 2 };
-
-        // AU[0] start offset — fixed per ETSI TS 102 563, Table 3 (dablin).
-        let first_au_offset: usize = match (dac_rate, sbr_flag) {
-            (0, 0) => 8,
-            (0, 1) => 5,
-            (1, 0) => 11,
-            (1, 1) => 6,
-            _ => unreachable!(),
-        };
-
-        if first_au_offset >= audio_len {
+        // Without the `fdk-aac` feature there is no AAC backend available.
+        // DAB+ scanning still works; only audio output is silenced.
+        #[cfg(not(feature = "fdk-aac"))]
+        {
             log::debug!(
-                "DAB+: superframe too short for header ({} bytes)",
-                audio_len
+                "DAB+ audio requires the `fdk-aac` Cargo feature \
+                 (rebuild with --features fdk-aac). Returning silence."
             );
             return Vec::new();
         }
 
-        // AU start offsets (absolute byte positions in decoded superframe).
-        let mut au_starts: Vec<usize> = Vec::with_capacity(num_aus + 1);
-        au_starts.push(first_au_offset);
+        // The block below is only compiled when fdk-aac is enabled.
+        // The `#[cfg(not)]` branch above always returns, so this is
+        // unreachable without the feature.
+        #[cfg(feature = "fdk-aac")]
+        {
+            let header_byte = data[2];
+            // Bit layout (ETSI TS 102 563, Table 1):
+            //   bit 7: rfa, bit 6: dac_rate, bit 5: sbr_flag,
+            //   bit 4: aac_channel_mode, bit 3: ps_flag, bits 2-0: mpeg_surround_config
+            let dac_rate = (header_byte >> 6) & 1;
+            let sbr_flag = (header_byte >> 5) & 1;
+            let aac_channel_mode = (header_byte >> 4) & 1;
+            let ps_flag = (header_byte >> 3) & 1;
 
-        // AU[1..n-1] addresses from 12-bit fields starting at bit 24.
-        for i in 0..(num_aus - 1) {
-            let addr = read_12bits(data, 24 + i * 12) as usize;
-            au_starts.push(addr);
-        }
+            // ETSI TS 102 563, Table 2 (verified against dablin):
+            let num_aus: usize = match (dac_rate, sbr_flag) {
+                (0, 0) => 4,
+                (0, 1) => 2,
+                (1, 0) => 6,
+                (1, 1) => 3,
+                _ => unreachable!(),
+            };
 
-        // Sentinel: end of audio data (excludes RS parity).
-        au_starts.push(audio_len);
+            // Core sample rate index (for ASC)
+            let core_sr_idx: u8 = match (dac_rate, sbr_flag) {
+                (0, 0) => 5, // 32 kHz
+                (0, 1) => 8, // 16 kHz core (SBR → 32 kHz)
+                (1, 0) => 3, // 48 kHz
+                (1, 1) => 6, // 24 kHz core (SBR → 48 kHz)
+                _ => unreachable!(),
+            };
 
-        // Initialise persistent RAW decoder with AudioSpecificConfig on first use.
-        if self.aac.is_none() {
-            let asc = build_asc(
-                core_sr_idx,
-                channels,
-                sbr_flag != 0,
-                ext_sr_idx,
-                ps_flag != 0 && aac_channel_mode == 0,
-            );
-            match AacState::new_raw(&asc) {
-                Ok(state) => {
-                    log::info!(
-                        "DAB+ AAC: dac_rate={}, sbr={}, ch_mode={}, ps={}, num_aus={}, core_sr_idx={}, ASC={:02X?}",
-                        dac_rate, sbr_flag, aac_channel_mode, ps_flag, num_aus, core_sr_idx, asc
-                    );
-                    self.aac = Some(state);
-                }
-                Err(e) => {
-                    log::error!("DAB+ AAC init failed: {}", e);
-                    return Vec::new();
-                }
-            }
-        }
+            // Output (SBR) sample rate index
+            let ext_sr_idx: u8 = match dac_rate {
+                0 => 5, // 32 kHz
+                1 => 3, // 48 kHz
+                _ => unreachable!(),
+            };
 
-        let aac = self.aac.as_mut().unwrap();
-        let mut out = Vec::new();
+            let channels: u8 = if aac_channel_mode == 0 { 1 } else { 2 };
 
-        // Expected output sample rate when SBR is active.
-        let expected_sr: u32 = match dac_rate {
-            0 => 32_000,
-            _ => 48_000,
-        };
+            // AU[0] start offset — fixed per ETSI TS 102 563, Table 3 (dablin).
+            let first_au_offset: usize = match (dac_rate, sbr_flag) {
+                (0, 0) => 8,
+                (0, 1) => 5,
+                (1, 0) => 11,
+                (1, 1) => 6,
+                _ => unreachable!(),
+            };
 
-        for i in 0..num_aus {
-            let start = au_starts[i];
-            let end = au_starts[i + 1];
-
-            if start + 2 >= end || end > audio_len {
+            if first_au_offset >= audio_len {
                 log::debug!(
-                    "DAB+: AU[{}] invalid range {}..{} (audio_len={})",
-                    i,
-                    start,
-                    end,
+                    "DAB+: superframe too short for header ({} bytes)",
                     audio_len
                 );
-                continue;
+                return Vec::new();
             }
 
-            // Per-AU CRC: last 2 bytes of each AU are CRC-CCITT.
-            let au_crc_stored = ((data[end - 2] as u16) << 8) | data[end - 1] as u16;
-            let au_data = &data[start..end - 2];
-            let au_crc_calc = crc16_ccitt(au_data);
+            // AU start offsets (absolute byte positions in decoded superframe).
+            let mut au_starts: Vec<usize> = Vec::with_capacity(num_aus + 1);
+            au_starts.push(first_au_offset);
 
-            if au_crc_stored != au_crc_calc {
-                log::debug!(
-                    "DAB+: AU[{}] CRC mismatch (stored=0x{:04X}, calc=0x{:04X})",
-                    i,
-                    au_crc_stored,
-                    au_crc_calc
+            // AU[1..n-1] addresses from 12-bit fields starting at bit 24.
+            for i in 0..(num_aus - 1) {
+                let addr = read_12bits(data, 24 + i * 12) as usize;
+                au_starts.push(addr);
+            }
+
+            // Sentinel: end of audio data (excludes RS parity).
+            au_starts.push(audio_len);
+
+            // Initialise persistent RAW decoder with AudioSpecificConfig on first use.
+            if self.aac.is_none() {
+                let asc = build_asc(
+                    core_sr_idx,
+                    channels,
+                    sbr_flag != 0,
+                    ext_sr_idx,
+                    ps_flag != 0 && aac_channel_mode == 0,
                 );
-                continue;
-            }
-
-            // Feed raw AU data (no ADTS header) to the RAW transport decoder.
-            if let Err(e) = aac.decoder.fill(au_data) {
-                log::debug!("AAC fill error: 0x{:04X}", e);
-                continue;
-            }
-
-            match aac.decoder.decode_frame() {
-                Ok(frame_size) if frame_size > 0 => {
-                    let pcm_i16 = &aac.decoder.pcm_buf[..frame_size];
-                    let info = aac.decoder.stream_info();
-                    let out_channels = info.num_channels;
-                    let decoder_sr = info.sample_rate as u32;
-
-                    // Check if SBR upsampling is needed but wasn't applied by fdk-aac.
-                    let need_upsample = sbr_flag != 0 && decoder_sr > 0 && decoder_sr < expected_sr;
-                    let upsample_ratio = if need_upsample {
-                        expected_sr / decoder_sr
-                    } else {
-                        1
-                    };
-
-                    if i == 0 && log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "AAC: decoded AU[0]: {} samples, {} ch, {} Hz (upsample {}x)",
-                            info.frame_size,
-                            info.num_channels,
-                            decoder_sr,
-                            upsample_ratio
+                match AacState::new_raw(&asc) {
+                    Ok(state) => {
+                        log::info!(
+                            "DAB+ AAC: dac_rate={}, sbr={}, ch_mode={}, ps={}, num_aus={}, core_sr_idx={}, ASC={:02X?}",
+                            dac_rate, sbr_flag, aac_channel_mode, ps_flag, num_aus, core_sr_idx, asc
                         );
+                        self.aac = Some(state);
                     }
-
-                    if out_channels == 1 {
-                        // Mono → stereo with optional upsampling.
-                        for j in 0..pcm_i16.len() {
-                            let f = pcm_i16[j] as f32 / i16::MAX as f32;
-                            if upsample_ratio == 2 && j + 1 < pcm_i16.len() {
-                                let f_next = pcm_i16[j + 1] as f32 / i16::MAX as f32;
-                                let mid = (f + f_next) * 0.5;
-                                out.push(f);
-                                out.push(f);
-                                out.push(mid);
-                                out.push(mid);
-                            } else {
-                                out.push(f);
-                                out.push(f);
-                            }
-                        }
-                    } else {
-                        // Stereo (interleaved L,R pairs) with optional upsampling.
-                        let samples = pcm_i16.chunks_exact(2);
-                        let pairs: Vec<(f32, f32)> = samples
-                            .map(|lr| {
-                                (
-                                    lr[0] as f32 / i16::MAX as f32,
-                                    lr[1] as f32 / i16::MAX as f32,
-                                )
-                            })
-                            .collect();
-
-                        for j in 0..pairs.len() {
-                            let (l, r) = pairs[j];
-                            out.push(l);
-                            out.push(r);
-                            if upsample_ratio == 2 {
-                                // Linear interpolation with next sample, or repeat last.
-                                let (l_next, r_next) = if j + 1 < pairs.len() {
-                                    pairs[j + 1]
-                                } else {
-                                    (l, r)
-                                };
-                                out.push((l + l_next) * 0.5);
-                                out.push((r + r_next) * 0.5);
-                            }
-                        }
+                    Err(e) => {
+                        log::error!("DAB+ AAC init failed: {}", e);
+                        return Vec::new();
                     }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::debug!("AAC AU[{}] decode error: 0x{:04X}", i, e);
                 }
             }
+
+            let aac = self.aac.as_mut().unwrap();
+            let mut out = Vec::new();
+
+            // Expected output sample rate when SBR is active.
+            let expected_sr: u32 = match dac_rate {
+                0 => 32_000,
+                _ => 48_000,
+            };
+
+            for i in 0..num_aus {
+                let start = au_starts[i];
+                let end = au_starts[i + 1];
+
+                if start + 2 >= end || end > audio_len {
+                    log::debug!(
+                        "DAB+: AU[{}] invalid range {}..{} (audio_len={})",
+                        i,
+                        start,
+                        end,
+                        audio_len
+                    );
+                    continue;
+                }
+
+                // Per-AU CRC: last 2 bytes of each AU are CRC-CCITT.
+                let au_crc_stored = ((data[end - 2] as u16) << 8) | data[end - 1] as u16;
+                let au_data = &data[start..end - 2];
+                let au_crc_calc = crc16_ccitt(au_data);
+
+                if au_crc_stored != au_crc_calc {
+                    log::debug!(
+                        "DAB+: AU[{}] CRC mismatch (stored=0x{:04X}, calc=0x{:04X})",
+                        i,
+                        au_crc_stored,
+                        au_crc_calc
+                    );
+                    continue;
+                }
+
+                // Feed raw AU data (no ADTS header) to the RAW transport decoder.
+                if let Err(e) = aac.decoder.fill(au_data) {
+                    log::debug!("AAC fill error: 0x{:04X}", e);
+                    continue;
+                }
+
+                match aac.decoder.decode_frame() {
+                    Ok(frame_size) if frame_size > 0 => {
+                        let pcm_i16 = &aac.decoder.pcm_buf[..frame_size];
+                        let info = aac.decoder.stream_info();
+                        let out_channels = info.num_channels;
+                        let decoder_sr = info.sample_rate as u32;
+
+                        // Check if SBR upsampling is needed but wasn't applied by fdk-aac.
+                        let need_upsample =
+                            sbr_flag != 0 && decoder_sr > 0 && decoder_sr < expected_sr;
+                        let upsample_ratio = if need_upsample {
+                            expected_sr / decoder_sr
+                        } else {
+                            1
+                        };
+
+                        if i == 0 && log::log_enabled!(log::Level::Debug) {
+                            log::debug!(
+                                "AAC: decoded AU[0]: {} samples, {} ch, {} Hz (upsample {}x)",
+                                info.frame_size,
+                                info.num_channels,
+                                decoder_sr,
+                                upsample_ratio
+                            );
+                        }
+
+                        if out_channels == 1 {
+                            // Mono → stereo with optional upsampling.
+                            for j in 0..pcm_i16.len() {
+                                let f = pcm_i16[j] as f32 / i16::MAX as f32;
+                                if upsample_ratio == 2 && j + 1 < pcm_i16.len() {
+                                    let f_next = pcm_i16[j + 1] as f32 / i16::MAX as f32;
+                                    let mid = (f + f_next) * 0.5;
+                                    out.push(f);
+                                    out.push(f);
+                                    out.push(mid);
+                                    out.push(mid);
+                                } else {
+                                    out.push(f);
+                                    out.push(f);
+                                }
+                            }
+                        } else {
+                            // Stereo (interleaved L,R pairs) with optional upsampling.
+                            let samples = pcm_i16.chunks_exact(2);
+                            let pairs: Vec<(f32, f32)> = samples
+                                .map(|lr| {
+                                    (
+                                        lr[0] as f32 / i16::MAX as f32,
+                                        lr[1] as f32 / i16::MAX as f32,
+                                    )
+                                })
+                                .collect();
+
+                            for j in 0..pairs.len() {
+                                let (l, r) = pairs[j];
+                                out.push(l);
+                                out.push(r);
+                                if upsample_ratio == 2 {
+                                    // Linear interpolation with next sample, or repeat last.
+                                    let (l_next, r_next) = if j + 1 < pairs.len() {
+                                        pairs[j + 1]
+                                    } else {
+                                        (l, r)
+                                    };
+                                    out.push((l + l_next) * 0.5);
+                                    out.push((r + r_next) * 0.5);
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::debug!("AAC AU[{}] decode error: 0x{:04X}", i, e);
+                    }
+                }
+            }
+            return out;
         }
-        out
+
+        // Unreachable: the cfg(not(feature = "fdk-aac")) branch always returns
+        // early, and the cfg(feature = "fdk-aac") block above ends with
+        // `return out`.  This final expression is only here to satisfy the
+        // compiler's type checker in configurations where both cfg blocks are
+        // absent (which cannot happen in practice).
+        #[allow(unreachable_code)]
+        Vec::new()
     }
 }
 
@@ -748,6 +796,7 @@ mod tests {
         let _ = dec.push(&data); // must not panic
     }
 
+    #[cfg(feature = "fdk-aac")]
     #[test]
     fn fdk_aac_decoder_constructs_raw() {
         // Verify fdk-aac decoder can be instantiated with a DAB+ ASC.

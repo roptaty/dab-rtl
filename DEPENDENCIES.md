@@ -20,7 +20,8 @@ introduce a new crate or upgrade an existing one.
 | `ratatui` | 0.26 | `app` | Terminal UI framework | MIT |
 | `crossterm` | 0.27 | `app` | Cross-platform terminal control | MIT |
 | `cpal` | 0.15 | `audio` | Cross-platform audio output (ALSA) | Apache-2.0 |
-| `symphonia` | 0.5 | `audio` | MP2 / AAC audio decoding | MPL-2.0 |
+| `symphonia` | 0.5 | `audio` | MP2 audio decoding | MPL-2.0 |
+| `libfdk-aac` (system) | — | `audio` (feature `fdk-aac`) | DAB+ HE-AAC v2 decoding. **Optional** — Fraunhofer FDK AAC license. Not a Rust crate; linked via build.rs. | [FDK AAC](https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE) |
 
 ---
 

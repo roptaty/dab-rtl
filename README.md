@@ -17,18 +17,29 @@ A pure-Rust DAB/DAB+ software-defined radio receiver for RTL-SDR and HackRF.
 
 ### Native build
 
-| Dependency | Debian/Ubuntu package |
-|---|---|
-| librtlsdr | `librtlsdr-dev` |
-| ALSA | `libasound2-dev` |
-| PulseAudio (optional) | `libpulse-dev` |
-| libfdk-aac (DAB+ HE-AAC) | `libfdk-aac-dev` |
-| pkg-config | `pkg-config` |
+| Dependency | Debian/Ubuntu package | Required? |
+|---|---|---|
+| librtlsdr | `librtlsdr-dev` | Yes |
+| ALSA | `libasound2-dev` | Yes |
+| PulseAudio (optional) | `libpulse-dev` | No |
+| libfdk-aac (DAB+ audio) | `libfdk-aac-dev` | Optional |
+| pkg-config | `pkg-config` | Yes |
 
 ```bash
-sudo apt-get install librtlsdr-dev libasound2-dev libfdk-aac-dev pkg-config
+# Minimal build (DAB + DAB+ scanning, no DAB+ audio)
+sudo apt-get install librtlsdr-dev libasound2-dev pkg-config
 cargo build --release
+
+# Full build with DAB+ audio playback (requires libfdk-aac)
+sudo apt-get install librtlsdr-dev libasound2-dev libfdk-aac-dev pkg-config
+cargo build --release --features fdk-aac
 ```
+
+> **DAB+ audio note:** `libfdk-aac` (Fraunhofer FDK AAC) is required for DAB+ HE-AAC v2
+> audio playback. It is licensed under the [Fraunhofer FDK AAC license](https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE),
+> which is intentionally kept opt-in. DAB+ station scanning and metadata work
+> without it. A pure open-source replacement (Symphonia HE-AAC v2) will be
+> wired in once upstream SBR/PS support is available.
 
 ## Usage
 

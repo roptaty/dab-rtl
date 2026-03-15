@@ -1,4 +1,5 @@
 pub mod decode;
+#[cfg(feature = "fdk-aac")]
 mod fdk;
 pub use decode::{decode_mp2, firecode_check, DabPlusDecoder, Mp2Decoder};
 
