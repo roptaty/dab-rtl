@@ -469,7 +469,7 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 fn render(f: &mut Frame, state: &mut AppState) {
-    let area = f.area();
+    let area = f.size();
 
     // Outer: vertical split — main content / status bar.
     let outer = Layout::default()
