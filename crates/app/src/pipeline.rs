@@ -2222,4 +2222,136 @@ mod tests {
         }
         eprintln!("Without de-dispersal: pass={}", pass2);
     }
+
+    /// End-to-end DAB+ audio decode: IQ file → OFDM → FIC → MSC → fdk-aac.
+    ///
+    /// Verifies that the full pipeline produces non-empty PCM audio from the
+    /// test IQ recording using the fdk-aac HE-AAC v2 decoder.
+    #[test]
+    #[ignore] // slow: processes full IQ capture; run with --ignored --test-threads=1
+    fn dab_plus_audio_decode_from_iq_file() {
+        use audio::DabPlusDecoder;
+        use num_complex::Complex32;
+
+        let iq_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../..",
+            "/testdata/dab_13b_2min.raw"
+        );
+        if !std::path::Path::new(iq_path).exists() {
+            eprintln!("Skipping: IQ file not found at {iq_path}");
+            return;
+        }
+
+        let raw = std::fs::read(iq_path).unwrap();
+        let samples: Vec<Complex32> = raw
+            .chunks_exact(2)
+            .map(|c| Complex32::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
+            .collect();
+        eprintln!(
+            "Loaded {} IQ samples ({:.1} s)",
+            samples.len(),
+            samples.len() as f64 / 2_048_000.0
+        );
+
+        let mut ofdm = OfdmProcessor::new();
+        let mut fic = FicDecoder::new();
+        let mut msc = MscDecoder::new();
+        let mut dab_plus_dec: Option<DabPlusDecoder> = None;
+
+        let chunk_size = 65536;
+        let limit = samples.len();
+
+        let mut first_service_sid: Option<u32> = None;
+        let mut total_pcm_samples = 0usize;
+        let mut superframes_decoded = 0usize;
+        let mut frame_count = 0usize;
+
+        for chunk_start in (0..limit).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(limit);
+            let chunk = &samples[chunk_start..chunk_end];
+
+            for frame in ofdm.push_samples(chunk) {
+                frame_count += 1;
+
+                // FIC
+                fic.begin_frame();
+                for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+                    fic.process_symbol(sym);
+                }
+
+                let ens = fic.handler.ensemble();
+
+                // Pick METRO (SId=0xF695) for testing.
+                if first_service_sid.is_none() {
+                    for svc in &ens.services {
+                        if svc.id == 0xF695 {
+                            if let Some(comp) = svc.components.first() {
+                                if comp.size > 0 {
+                                    first_service_sid = Some(svc.id);
+                                    msc.set_target_sid(svc.id);
+                                    eprintln!(
+                                        "Selected DAB+ service: {:04X} {:?} (start={}, size={}, prot={:?})",
+                                        svc.id, svc.label, comp.start_address, comp.size, comp.protection
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // MSC → DAB+ audio decode
+                if let Some(sid) = first_service_sid {
+                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+                    for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
+                        if cif_syms.len() < 18 {
+                            continue;
+                        }
+                        let cif_soft: Vec<f32> =
+                            cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
+                        if let Some(component) = find_component(ens, sid) {
+                            if let Some(af) = msc.process_cif(&cif_soft, component, cif_idx) {
+                                let dec = dab_plus_dec
+                                    .get_or_insert_with(|| DabPlusDecoder::new(af.data.len()));
+
+                                let pcm = dec.push(&af.data);
+                                if !pcm.is_empty() {
+                                    superframes_decoded += 1;
+                                    total_pcm_samples += pcm.len();
+
+                                    let max_abs =
+                                        pcm.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                                    assert!(
+                                        max_abs <= 1.5,
+                                        "PCM values out of range: max_abs={}",
+                                        max_abs
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!(
+            "Results: frames={}, superframes_decoded={}, total_pcm_samples={}",
+            frame_count, superframes_decoded, total_pcm_samples
+        );
+
+        assert!(
+            first_service_sid.is_some(),
+            "should discover at least one DAB+ service"
+        );
+        assert!(
+            superframes_decoded > 0,
+            "should decode at least one DAB+ superframe to PCM audio"
+        );
+        assert!(
+            total_pcm_samples > 10000,
+            "should produce substantial PCM output (got {})",
+            total_pcm_samples
+        );
+    }
 }

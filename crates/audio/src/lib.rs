@@ -1,4 +1,5 @@
 pub mod decode;
+mod fdk;
 pub use decode::{decode_mp2, firecode_check, DabPlusDecoder, Mp2Decoder};
 
 /// Audio output via cpal (ALSA or PulseAudio on Linux).

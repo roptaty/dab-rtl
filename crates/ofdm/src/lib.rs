@@ -122,7 +122,7 @@ impl OfdmProcessor {
             // 30 ppm) and unverified predictions from the previous iteration.
             let refined = Self::refine_tracking(&self.sample_buf, prs_start);
             let corr = Self::guard_corr(&self.sample_buf, refined);
-            if corr < 0.8 {
+            if corr < 0.5 {
                 // Signal lost — fall back to re-sync (preserving energy estimate).
                 log::warn!(
                     "Frame tracking lost: guard_corr={:.4} at refined PRS {} — re-syncing",

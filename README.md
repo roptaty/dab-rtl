@@ -22,10 +22,11 @@ A pure-Rust DAB/DAB+ software-defined radio receiver for RTL-SDR and HackRF.
 | librtlsdr | `librtlsdr-dev` |
 | ALSA | `libasound2-dev` |
 | PulseAudio (optional) | `libpulse-dev` |
+| libfdk-aac (DAB+ HE-AAC) | `libfdk-aac-dev` |
 | pkg-config | `pkg-config` |
 
 ```bash
-sudo apt-get install librtlsdr-dev libasound2-dev pkg-config
+sudo apt-get install librtlsdr-dev libasound2-dev libfdk-aac-dev pkg-config
 cargo build --release
 ```
 

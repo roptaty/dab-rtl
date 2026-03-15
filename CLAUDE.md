@@ -14,7 +14,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
 # Native libraries
-sudo apt-get install librtlsdr-dev libasound2-dev pkg-config
+sudo apt-get install librtlsdr-dev libasound2-dev libfdk-aac-dev pkg-config
 ```
 
 **Build:**
@@ -67,7 +67,7 @@ RTL-SDR IQ → [sdr] → Complex32 samples
 - `crates/ofdm` — DAB Mode I OFDM: null symbol frame sync, FFT (2048 pt), π/4-DQPSK differential product, frequency deinterleaver. Key type: `OfdmProcessor` (returns `OfdmFrame`)
 - `crates/fec` — Soft-decision Viterbi (K=7, rate 1/4, 64 states) + 24 EEP/UEP depuncturing vectors
 - `crates/protocol` — FIC/FIB/FIG parsing (`FicHandler`), ensemble/service/subchannel types, MSC scheduling (`MscHandler`)
-- `crates/audio` — cpal `AudioOutput` (ALSA default), symphonia `Mp2Decoder` for DAB audio
+- `crates/audio` — cpal `AudioOutput` (ALSA default), symphonia `Mp2Decoder` for DAB audio, fdk-aac `DabPlusDecoder` for DAB+ HE-AAC v2 (960-sample frames, SBR/PS via RAW transport)
 - `crates/app` — Binary entry point. `pipeline.rs` wires the full threaded pipeline; `tui.rs` is the ratatui TUI; `countries.rs` maps country codes to Band III channels; `main.rs` has the Band III channel→frequency table (5A–13F)
 
 **Threading model:** `pipeline.rs` runs SDR→OFDM→FIC→MSC→audio in a background thread. `PipelineHandle` exposes `update_rx` (events from pipeline) and `cmd_tx` (Play/Stop commands) to the TUI/CLI.
