@@ -20,7 +20,7 @@ A pure-Rust DAB/DAB+ software-defined radio receiver for RTL-SDR and HackRF.
 | librtlsdr | `librtlsdr-dev` |
 | ALSA | `libasound2-dev` |
 | PulseAudio (optional) | `libpulse-dev` |
-| libfdk-aac (DAB+ HE-AAC) | `libfdk-aac-dev` |
+| libfdk-aac (DAB+ HE-AAC) — [Fraunhofer FDK AAC License](https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE) | `libfdk-aac-dev` |
 | pkg-config | `pkg-config` |
 
 ```bash
@@ -167,3 +167,9 @@ This project is licensed under the [MIT License](LICENSE).
 
 > **Note:** At runtime, this application links against `librtlsdr`, which is licensed under GPL-2.0+.
 > If you distribute a compiled binary, you may need to comply with the GPL for the combined work.
+
+> **Note:** At runtime, this application also links against `libfdk-aac`, which is licensed under the
+> [Fraunhofer FDK AAC License](https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE).
+> This license permits free use for personal, non-commercial purposes but **restricts commercial use**
+> and redistribution. If you distribute a compiled binary with DAB+ audio support, you must comply
+> with the Fraunhofer FDK AAC License terms.
