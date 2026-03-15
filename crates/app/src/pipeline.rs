@@ -42,12 +42,6 @@ pub enum PipelineUpdate {
     Playing { label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
-    /// Scanning progress: processing channel `current` of `total`.
-    Scanning {
-        channel: String,
-        current: usize,
-        total: usize,
-    },
 }
 
 /// Commands sent to the pipeline background thread.
@@ -294,8 +288,7 @@ fn run_pipeline(
                                 );
                             }
                             if let Some(component) = component {
-                                if let Some(frame) =
-                                    msc.process_cif(&cif_soft, component, cif_idx)
+                                if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx)
                                 {
                                     log::debug!(
                                         "MSC: CIF {} subchannel {} → {} bytes ({})",
@@ -375,9 +368,8 @@ fn run_pipeline(
                     }
                     Err(e) => {
                         log::error!("pipeline: retune failed: {e}");
-                        let _ = update_tx.try_send(PipelineUpdate::Status(format!(
-                            "Retune failed: {e}"
-                        )));
+                        let _ = update_tx
+                            .try_send(PipelineUpdate::Status(format!("Retune failed: {e}")));
                         break 'pipeline;
                     }
                 }
@@ -386,7 +378,6 @@ fn run_pipeline(
         }
 
         break 'pipeline; // stream ended naturally
-
     } // end 'pipeline: loop
 
     log::info!("pipeline: thread exiting");

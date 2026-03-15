@@ -415,7 +415,10 @@ fn cmd_tune(
             gain,
             ppm_correction: ppm,
         };
-        println!("Starting country scan for {code} ({} channels)…", channels.len());
+        println!(
+            "Starting country scan for {code} ({} channels)…",
+            channels.len()
+        );
         let handle = match pipeline::start_for_device(config, audio_device) {
             Ok(h) => h,
             Err(e) => {
@@ -520,7 +523,6 @@ fn cmd_play(
             PipelineUpdate::Status(s) => {
                 log::info!("Pipeline: {s}");
             }
-            PipelineUpdate::Scanning { .. } => {}
         }
     }
 }

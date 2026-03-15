@@ -22,11 +22,13 @@
 /// └──────────────────────────────────────────────────────────┘
 ///
 /// Layout (CountrySelect mode): a popup overlaid on top.
+use std::fs::OpenOptions;
 use std::io;
+use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -95,7 +97,6 @@ impl ScanState {
     fn total(&self) -> usize {
         self.channels.len()
     }
-
 }
 
 /// Which top-level view is active.
@@ -274,6 +275,25 @@ impl AppState {
 /// to scan automatically on startup (e.g. for a country-mode launch).
 /// Pass an empty slice for single-channel mode.
 pub fn run(handle: PipelineHandle, initial_channels: Vec<(String, u32)>) -> io::Result<()> {
+    // The RTL-SDR C library writes "Found … tuner" and "Allocating … buffers"
+    // directly to fd 2 (stderr).  Redirect stderr to /dev/null while the TUI is
+    // active so those messages don't corrupt the alternate-screen rendering.
+    // Only do this when stderr is a TTY — if the user has redirected stderr to a
+    // file (e.g. `2> debug.log`) we must leave it alone so logs are preserved.
+    let saved_stderr = if unsafe { libc::isatty(libc::STDERR_FILENO) } != 0 {
+        let devnull = OpenOptions::new().write(true).open("/dev/null")?;
+        // Safety: dup/dup2 are async-signal-safe POSIX primitives with no
+        // safety invariants beyond valid fd numbers.
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if saved < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { libc::dup2(devnull.as_raw_fd(), libc::STDERR_FILENO) };
+        Some(saved)
+    } else {
+        None
+    };
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -287,6 +307,14 @@ pub fn run(handle: PipelineHandle, initial_channels: Vec<(String, u32)>) -> io::
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    // Restore stderr if we redirected it.
+    if let Some(saved) = saved_stderr {
+        unsafe {
+            libc::dup2(saved, libc::STDERR_FILENO);
+            libc::close(saved);
+        }
+    }
 
     result
 }
@@ -336,9 +364,6 @@ fn run_loop(
                         log::debug!("pipeline status (suppressed during scan): {s}");
                     }
                 }
-                PipelineUpdate::Scanning { channel, current, total } => {
-                    state.status = format!("Scanning {current}/{total}: {channel}");
-                }
             }
         }
 
@@ -356,6 +381,10 @@ fn run_loop(
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
+                }
+                // Ctrl-C always quits immediately regardless of mode or scan state.
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(());
                 }
                 // Capture mode before handling the key (it may change inside).
                 let was_normal = matches!(state.mode, UiMode::Normal);
@@ -428,14 +457,21 @@ fn advance_scan(state: &mut AppState, handle: &PipelineHandle) {
     let (idx, total, prev_name, found_on_channel, next_channel) = action;
 
     // Log the result for the channel we just finished.
-    let station_word = if found_on_channel == 1 { "station" } else { "stations" };
+    let station_word = if found_on_channel == 1 {
+        "station"
+    } else {
+        "stations"
+    };
     state.push_scan_log(format!(
         "  {prev_name}: {found_on_channel} {station_word} found"
     ));
 
     if let Some((next_name, next_freq)) = next_channel {
         state.status = format!("Scanning {}/{total}: {next_name}…", idx + 1);
-        state.push_scan_log(format!("Tuning to channel {}/{total}: {next_name}…", idx + 1));
+        state.push_scan_log(format!(
+            "Tuning to channel {}/{total}: {next_name}…",
+            idx + 1
+        ));
         let _ = handle.cmd_tx.try_send(PipelineCmd::Retune(next_freq));
     } else {
         // Scan complete — safe to take because the borrow above has ended.
@@ -449,7 +485,9 @@ fn advance_scan(state: &mut AppState, handle: &PipelineHandle) {
         };
         state.status = msg.clone();
         state.push_scan_log(msg);
-        state.list_state.select(if count > 0 { Some(0) } else { None });
+        state
+            .list_state
+            .select(if count > 0 { Some(0) } else { None });
     }
 }
 
@@ -520,7 +558,11 @@ fn render(f: &mut Frame, state: &mut AppState) {
     let (content_area, log_area, status_area) = if scanning {
         let outer = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(6), Constraint::Length(3)])
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(6),
+                Constraint::Length(3),
+            ])
             .split(area);
         (outer[0], Some(outer[1]), outer[2])
     } else {
@@ -675,9 +717,7 @@ fn render_status_bar(f: &mut Frame, state: &AppState, area: Rect) {
     let help_text = match state.mode {
         UiMode::CountrySelect => " [↑↓/jk] Navigate  [Enter] Select  [Esc/q] Cancel ",
         UiMode::Normal if state.scan_state.is_some() => " Scanning… ",
-        UiMode::Normal => {
-            " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [c] Country  [q] Quit "
-        }
+        UiMode::Normal => " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [c] Country  [q] Quit ",
     };
     let help = Span::styled(help_text, Style::default().fg(Color::DarkGray));
     let status = Span::styled(
