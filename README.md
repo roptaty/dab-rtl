@@ -1,6 +1,9 @@
 # dab-rtl
 
-Most of the code (and contents here) are generated using vibe-coding and Claude from [Anthropic](https://www.anthropic.com/). 
+[![CI](https://github.com/roptaty/dab-rtl/actions/workflows/ci.yml/badge.svg)](https://github.com/roptaty/dab-rtl/actions/workflows/ci.yml)
+[![Security](https://github.com/roptaty/dab-rtl/actions/workflows/security.yml/badge.svg)](https://github.com/roptaty/dab-rtl/actions/workflows/security.yml)
+
+Most of the code (and contents here) are generated using vibe-coding and Claude from [Anthropic](https://www.anthropic.com/).
 
 A pure-Rust DAB/DAB+ software-defined radio receiver for RTL-SDR and HackRF.
 
