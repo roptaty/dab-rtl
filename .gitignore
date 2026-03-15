@@ -21,3 +21,4 @@ Thumbs.db
 
 # Local environment overrides
 .env
+testdata/dab_13b_2min.raw

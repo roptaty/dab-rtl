@@ -14,7 +14,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
 # Native libraries
-sudo apt-get install librtlsdr-dev libasound2-dev pkg-config
+sudo apt-get install librtlsdr-dev libasound2-dev libfdk-aac-dev pkg-config
 ```
 
 **Build:**
@@ -29,7 +29,7 @@ cargo test --all               # all crates
 cargo test -p <crate>          # single crate (sdr, ofdm, fec, protocol, audio, dab-rtl)
 cargo test -p <crate> <name>   # single test by name, e.g.: cargo test -p dab-rtl known_channels_resolve
 cargo test -p <crate> -- --nocapture  # with stdout
-cargo test --ignored # Run ignored tests - run this when there have been fundamental changes to OFDM, fec and protocol
+cargo test --ignored -- --test-threads=1 # Run ignored tests (single-threaded to avoid OOM — each test loads a 540 MB IQ file)
 ```
 
 **Lint & Format:**
@@ -67,7 +67,7 @@ RTL-SDR IQ → [sdr] → Complex32 samples
 - `crates/ofdm` — DAB Mode I OFDM: null symbol frame sync, FFT (2048 pt), π/4-DQPSK differential product, frequency deinterleaver. Key type: `OfdmProcessor` (returns `OfdmFrame`)
 - `crates/fec` — Soft-decision Viterbi (K=7, rate 1/4, 64 states) + 24 EEP/UEP depuncturing vectors
 - `crates/protocol` — FIC/FIB/FIG parsing (`FicHandler`), ensemble/service/subchannel types, MSC scheduling (`MscHandler`)
-- `crates/audio` — cpal `AudioOutput` (ALSA default), symphonia `Mp2Decoder` for DAB audio
+- `crates/audio` — cpal `AudioOutput` (ALSA default), symphonia `Mp2Decoder` for DAB audio, fdk-aac `DabPlusDecoder` for DAB+ HE-AAC v2 (960-sample frames, SBR/PS via RAW transport)
 - `crates/app` — Binary entry point. `pipeline.rs` wires the full threaded pipeline; `tui.rs` is the ratatui TUI; `countries.rs` maps country codes to Band III channels; `main.rs` has the Band III channel→frequency table (5A–13F)
 
 **Threading model:** `pipeline.rs` runs SDR→OFDM→FIC→MSC→audio in a background thread. `PipelineHandle` exposes `update_rx` (events from pipeline) and `cmd_tx` (Play/Stop commands) to the TUI/CLI.
@@ -91,10 +91,6 @@ When adding a new dependency, work through every item in the checklist in
 
 ## Known TODOs
 
-1. **EEP two-region puncturing** — currently single-vector approximation; needs ETSI EN 300 401 Table 8a/8b
-2. **DAB+ HE-AAC** — requires `fdk-aac` (FFI C dep, unavoidable for DAB+)
-3. **DLS** (Programme Associated Data / scrolling text)
-4. **Scan caching** — persist results to `~/.config/dab-rtl/`
 
 ## Soft bit layout (split, not interleaved)
 

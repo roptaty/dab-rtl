@@ -3,6 +3,7 @@
 /// Wraps `rtlsdr_mt` 2.x to provide a channel-based IQ sample stream and
 /// convenience helpers for device enumeration and IQ conversion.
 use num_complex::Complex32;
+use std::path::Path;
 use std::sync::mpsc;
 use thiserror::Error;
 
@@ -163,6 +164,59 @@ pub fn open_stream(config: DeviceConfig, buf_size: u32) -> Result<SdrStream, Sdr
     Ok(SdrStream {
         rx,
         ctl: Some(ctl),
+        thread: Some(thread),
+    })
+}
+
+/// Open a raw IQ file and return a stream handle delivering sample buffers.
+///
+/// The file must contain interleaved unsigned 8-bit I/Q pairs (the same format
+/// produced by `rtl_sdr`).  Samples are read in chunks and converted to
+/// `Complex32`, then delivered through the same `mpsc::Receiver` interface as
+/// a live RTL-SDR stream.
+///
+/// The stream ends (receiver returns `RecvError`) when the file has been fully
+/// read.
+pub fn open_file_stream(path: &Path, buf_size: usize) -> Result<SdrStream, SdrError> {
+    use std::fs::File;
+    use std::io::Read;
+
+    let mut file =
+        File::open(path).map_err(|e| SdrError::Device(format!("open {}: {e}", path.display())))?;
+
+    let (tx, rx) = mpsc::sync_channel::<Vec<Complex32>>(8);
+
+    let thread = std::thread::Builder::new()
+        .name("file-reader".into())
+        .spawn(move || {
+            let mut raw = vec![0u8; buf_size];
+            loop {
+                match file.read(&mut raw) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => {
+                        // Ensure we only convert complete I/Q pairs.
+                        let usable = n & !1;
+                        if usable == 0 {
+                            continue;
+                        }
+                        let samples = iq_to_complex(&raw[..usable]);
+                        if tx.send(samples).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("file-reader: {e}");
+                        break;
+                    }
+                }
+            }
+            log::info!("file-reader: finished");
+        })
+        .map_err(|e| SdrError::Device(e.to_string()))?;
+
+    Ok(SdrStream {
+        rx,
+        ctl: None,
         thread: Some(thread),
     })
 }

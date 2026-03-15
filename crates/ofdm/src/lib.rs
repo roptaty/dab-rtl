@@ -10,7 +10,7 @@ pub use sync::{FrameStart, FrameSync};
 use num_complex::Complex32;
 use thiserror::Error;
 
-use params::{FFT_SIZE, FRAME_SYMBOLS, GUARD_SIZE, NUM_CARRIERS, SYMBOL_SIZE};
+use params::{FFT_SIZE, FRAME_SYMBOLS, GUARD_SIZE, NULL_SIZE, NUM_CARRIERS, SYMBOL_SIZE};
 
 // -------------------------------------------------------------------------- //
 //  Error type                                                                 //
@@ -71,6 +71,7 @@ impl OfdmProcessor {
     pub fn push_samples(&mut self, samples: &[Complex32]) -> Vec<OfdmFrame> {
         self.sample_buf.extend_from_slice(samples);
         let mut frames = Vec::new();
+        let mut resync_attempts = 0u32;
 
         loop {
             // ----------------------------------------------------------------
@@ -108,12 +109,48 @@ impl OfdmProcessor {
             // ----------------------------------------------------------------
             // Phase 2: we know where the PRS starts; extract the full frame.
             // ----------------------------------------------------------------
-            let prs_start = self.prs_offset.unwrap();
+            let mut prs_start = self.prs_offset.unwrap();
 
             // A full frame requires: 1 PRS symbol + 75 data symbols.
             let needed = prs_start + FRAME_SYMBOLS * SYMBOL_SIZE;
             if self.sample_buf.len() < needed {
                 break; // not enough samples yet
+            }
+
+            // Refine PRS position using guard-interval correlation search.
+            // This compensates for sample clock drift (±6 samples/frame at
+            // 30 ppm) and unverified predictions from the previous iteration.
+            let refined = Self::refine_tracking(&self.sample_buf, prs_start);
+            let corr = Self::guard_corr(&self.sample_buf, refined);
+            if corr < 0.5 {
+                // Signal lost — fall back to re-sync (preserving energy estimate).
+                log::warn!(
+                    "Frame tracking lost: guard_corr={:.4} at refined PRS {} — re-syncing",
+                    corr,
+                    refined
+                );
+
+                // Drain past the bad region so we don't re-find the same null.
+                // Skip at least one full frame's worth of samples.
+                let drain_amount =
+                    (prs_start + FRAME_SYMBOLS * SYMBOL_SIZE).min(self.sample_buf.len());
+                self.sample_buf.drain(..drain_amount);
+
+                self.prs_offset = None;
+                self.sync.reset_for_resync();
+
+                resync_attempts += 1;
+                if resync_attempts >= 3 {
+                    log::warn!("Too many re-sync attempts, waiting for more data");
+                    break;
+                }
+                continue;
+            }
+            prs_start = refined;
+            self.prs_offset = Some(prs_start);
+            let needed = prs_start + FRAME_SYMBOLS * SYMBOL_SIZE;
+            if self.sample_buf.len() < needed {
+                break;
             }
 
             // --- Phase-reference symbol ---
@@ -164,14 +201,22 @@ impl OfdmProcessor {
             frames.push(OfdmFrame { soft_bits });
 
             // ----------------------------------------------------------------
-            // Phase 3: advance buffer and reset for the next frame.
+            // Phase 3: advance buffer and predict next frame position.
             // ----------------------------------------------------------------
-            // Discard all samples up to and including this frame.  The sync
-            // is also reset because its internal sample_count refers to
-            // absolute positions that change after the drain.
-            self.sample_buf.drain(..needed.min(self.sample_buf.len()));
-            self.prs_offset = None;
-            self.sync = FrameSync::new();
+            // DAB frames are exactly periodic.  The next null symbol starts
+            // right after the last data symbol we just consumed, and the next
+            // PRS starts NULL_SIZE samples after that.
+            //
+            // We predict the next PRS position; Phase 2 will refine it with
+            // guard-interval correlation before extracting the next frame.
+            let drain_to = needed.min(self.sample_buf.len());
+            self.sample_buf.drain(..drain_to);
+
+            // After draining, the next PRS is expected at index NULL_SIZE
+            // in the remaining buffer (null symbol sits right at position 0).
+            // Phase 2's refine_tracking() will search ±16 samples to
+            // compensate for clock drift.
+            self.prs_offset = Some(NULL_SIZE);
         }
 
         frames
@@ -179,6 +224,64 @@ impl OfdmProcessor {
 }
 
 impl OfdmProcessor {
+    /// Refine the predicted PRS position by searching ±64 samples around
+    /// the prediction using guard-interval correlation.
+    ///
+    /// The wider range handles RTL-SDR clock drift (~6 samples/frame at
+    /// 30 ppm) and accumulated error after re-sync.
+    ///
+    /// Returns the best position found.  If no good correlation is found
+    /// (all below 0.3), returns the original prediction unchanged — the
+    /// caller should fall back to re-sync.
+    fn refine_tracking(buf: &[Complex32], predicted: usize) -> usize {
+        let search_range: usize = 64;
+        let start = predicted.saturating_sub(search_range);
+        let end = (predicted + search_range).min(buf.len().saturating_sub(SYMBOL_SIZE));
+
+        let mut best_pos = predicted;
+        let mut best_corr = 0.0f32;
+
+        // Coarse search (step 4)
+        let mut pos = start;
+        while pos <= end {
+            let corr = Self::guard_corr(buf, pos);
+            if corr > best_corr {
+                best_corr = corr;
+                best_pos = pos;
+            }
+            pos += 4;
+        }
+
+        // Fine-tune (single-sample)
+        let fine_start = best_pos.saturating_sub(4);
+        let fine_end = (best_pos + 4).min(buf.len().saturating_sub(SYMBOL_SIZE));
+        for p in fine_start..=fine_end {
+            let corr = Self::guard_corr(buf, p);
+            if corr > best_corr {
+                best_corr = corr;
+                best_pos = p;
+            }
+        }
+
+        if best_pos != predicted {
+            log::debug!(
+                "Frame tracking: refined PRS {} → {} (Δ={}), guard_corr={:.4}",
+                predicted,
+                best_pos,
+                best_pos as i64 - predicted as i64,
+                best_corr
+            );
+        } else {
+            log::debug!(
+                "Frame tracking: PRS at {}, guard_corr={:.4}",
+                predicted,
+                best_corr
+            );
+        }
+
+        best_pos
+    }
+
     /// Refine the PRS start position using guard-interval correlation.
     ///
     /// The energy-based null detector has ~256-sample lag from its sliding

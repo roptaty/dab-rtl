@@ -1,5 +1,6 @@
 pub mod decode;
-pub use decode::{decode_mp2, DabPlusDecoder, Mp2Decoder};
+mod fdk;
+pub use decode::{decode_mp2, firecode_check, DabPlusDecoder, Mp2Decoder};
 
 /// Audio output via cpal (ALSA or PulseAudio on Linux).
 ///
@@ -80,11 +81,18 @@ impl AudioOutput {
                 .ok_or(AudioError::NoDevice)?,
         };
 
+        // Query the device's default output config to find a supported format.
+        let default_config = device
+            .default_output_config()
+            .map_err(|e| AudioError::Device(e.to_string()))?;
+
+        let sample_format = default_config.sample_format();
         log::info!(
-            "Audio output: {} ({} Hz, {} ch)",
+            "Audio output: {} ({} Hz, {} ch, {:?})",
             device.name().unwrap_or_default(),
             sample_rate,
-            channels
+            channels,
+            sample_format,
         );
 
         let config = cpal::StreamConfig {
@@ -93,27 +101,76 @@ impl AudioOutput {
             buffer_size: cpal::BufferSize::Default,
         };
 
-        // Shared ring buffer: caller writes, cpal callback reads.
+        // Shared ring buffer: caller writes f32, cpal callback reads.
         let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let buf_reader = Arc::clone(&buf);
 
-        let stream = device
-            .build_output_stream(
-                &config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut guard = buf_reader.lock().unwrap();
-                    let available = guard.len().min(data.len());
-                    data[..available].copy_from_slice(&guard[..available]);
-                    guard.drain(..available);
-                    // Fill remainder with silence on underrun.
-                    for s in &mut data[available..] {
-                        *s = 0.0;
-                    }
-                },
-                |err| log::error!("Audio stream error: {err}"),
-                None, // timeout
-            )
-            .map_err(|e| AudioError::Stream(e.to_string()))?;
+        let stream = match sample_format {
+            cpal::SampleFormat::I16 => {
+                let buf_r = buf_reader;
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                            let mut guard = buf_r.lock().unwrap();
+                            let available = guard.len().min(data.len());
+                            for (out, &inp) in
+                                data[..available].iter_mut().zip(guard[..available].iter())
+                            {
+                                *out = (inp.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                            }
+                            guard.drain(..available);
+                            for s in &mut data[available..] {
+                                *s = 0;
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {err}"),
+                        None,
+                    )
+                    .map_err(|e| AudioError::Stream(e.to_string()))?
+            }
+            cpal::SampleFormat::F32 => {
+                let buf_r = buf_reader;
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            let mut guard = buf_r.lock().unwrap();
+                            let available = guard.len().min(data.len());
+                            data[..available].copy_from_slice(&guard[..available]);
+                            guard.drain(..available);
+                            for s in &mut data[available..] {
+                                *s = 0.0;
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {err}"),
+                        None,
+                    )
+                    .map_err(|e| AudioError::Stream(e.to_string()))?
+            }
+            _ => {
+                log::warn!(
+                    "Unsupported sample format {:?}, trying f32 anyway",
+                    sample_format
+                );
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            let mut guard = buf_reader.lock().unwrap();
+                            let available = guard.len().min(data.len());
+                            data[..available].copy_from_slice(&guard[..available]);
+                            guard.drain(..available);
+                            for s in &mut data[available..] {
+                                *s = 0.0;
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {err}"),
+                        None,
+                    )
+                    .map_err(|e| AudioError::Stream(e.to_string()))?
+            }
+        };
 
         Ok(AudioOutput {
             stream,
