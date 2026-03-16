@@ -7,7 +7,7 @@
 /// │    BBC Radio 2           │  Ensemble: BBC National DAB   │
 /// │    BBC Radio 3           │                               │
 /// ├──────────────────────────────────────────────────────────┤
-/// │ [↑↓] Navigate  [Enter] Play  [s] Stop  [q] Quit  Status │
+/// │ [↑↓] Navigate  [Enter] Play  [s] Stop  [X] Clear cache  │
 /// └──────────────────────────────────────────────────────────┘
 use std::io;
 use std::time::{Duration, Instant};
@@ -28,6 +28,7 @@ use ratatui::{
 
 use protocol::Ensemble;
 
+use crate::cache;
 use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -39,17 +40,50 @@ struct AppState {
     list_state: ListState,
     playing_label: Option<String>,
     status: String,
+    /// True while the service list is populated from cache, not live FIC.
+    is_cached: bool,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(channel: Option<String>) -> Self {
         let mut list_state = ListState::default();
-        list_state.select(Some(0));
+        let mut ensemble = Ensemble::default();
+        let mut is_cached = false;
+
+        // Pre-populate from cache if we have a channel name.
+        if let Some(ref ch) = channel {
+            if let Some(cached) = cache::get_ensemble(ch) {
+                ensemble.id = cached.id;
+                ensemble.label = cached.label.clone();
+                ensemble.services = cached
+                    .services
+                    .iter()
+                    .map(|s| {
+                        let mut svc = protocol::Service::default();
+                        svc.id = s.id;
+                        svc.label = s.label.clone();
+                        svc.is_dab_plus = s.is_dab_plus;
+                        svc
+                    })
+                    .collect();
+                is_cached = true;
+            }
+        }
+
+        if !ensemble.services.is_empty() {
+            list_state.select(Some(0));
+        }
+
         AppState {
-            ensemble: Ensemble::default(),
+            ensemble,
             list_state,
             playing_label: None,
-            status: "Waiting for signal…".into(),
+            status: if is_cached {
+                "Loaded from cache — waiting for live signal…".into()
+            } else {
+                "Waiting for signal…".into()
+            },
+            is_cached,
         }
     }
 
@@ -81,7 +115,10 @@ impl AppState {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Run the TUI until the user presses `q` or `Esc`.
-pub fn run(handle: PipelineHandle) -> io::Result<()> {
+///
+/// `channel` is the DAB channel name (e.g. `"11C"`) used for cache look-ups.
+/// Pass `None` for file-based sources.
+pub fn run(handle: PipelineHandle, channel: Option<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -89,7 +126,7 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, handle);
+    let result = run_loop(&mut terminal, handle, channel);
 
     // Always restore terminal.
     disable_raw_mode()?;
@@ -102,8 +139,9 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     handle: PipelineHandle,
+    channel: Option<String>,
 ) -> io::Result<()> {
-    let mut state = AppState::new();
+    let mut state = AppState::new(channel);
     let tick = Duration::from_millis(200);
     let mut last_tick = Instant::now();
 
@@ -115,6 +153,8 @@ fn run_loop(
                     // Preserve selection if possible.
                     let old_sid = state.selected_sid();
                     state.ensemble = ens;
+                    // Live data has arrived — no longer showing cached results.
+                    state.is_cached = false;
                     if state.ensemble.services.is_empty() {
                         state.list_state.select(None);
                     } else {
@@ -159,6 +199,14 @@ fn run_loop(
                         state.playing_label = None;
                         state.status = "Stopped".into();
                     }
+                    KeyCode::Char('X') => {
+                        cache::clear();
+                        state.is_cached = false;
+                        state.status = format!(
+                            "Cache cleared: {}",
+                            cache::cache_path().display()
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -197,6 +245,8 @@ fn render(f: &mut Frame, state: &mut AppState) {
 fn render_service_list(f: &mut Frame, state: &mut AppState, area: ratatui::layout::Rect) {
     let ens_title = if state.ensemble.label.is_empty() {
         " Services ".to_string()
+    } else if state.is_cached {
+        format!(" {} (cached) ", state.ensemble.label)
     } else {
         format!(" {} ", state.ensemble.label)
     };
@@ -271,7 +321,7 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: ratatui::layout::Re
 
 fn render_status_bar(f: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
     let help = Span::styled(
-        " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [q] Quit ",
+        " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [X] Clear cache  [q] Quit ",
         Style::default().fg(Color::DarkGray),
     );
     let status = Span::styled(

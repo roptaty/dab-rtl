@@ -1,3 +1,4 @@
+mod cache;
 mod countries;
 mod pipeline;
 mod tui;
@@ -64,6 +65,9 @@ enum Command {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
     },
+
+    /// Clear the cached channel scan results
+    ClearCache,
 
     /// Play a specific station (non-interactive)
     Play {
@@ -198,6 +202,10 @@ fn main() {
         Command::ListDevices => cmd_list_devices(),
         Command::ListAudio => cmd_list_audio(),
         Command::ListCountries => countries::print_countries(),
+        Command::ClearCache => {
+            let path = cache::clear();
+            println!("Cache cleared: {}", path.display());
+        }
         Command::Scan {
             channel,
             country,
@@ -274,12 +282,21 @@ fn cmd_scan(
             }
         };
         for ch in &channels {
-            scan_single(device_idx, ppm, gain, Some(ch.as_str()), None);
+            scan_single(device_idx, ppm, gain, Some(ch.as_str()), None, true);
         }
         return;
     }
 
-    scan_single(device_idx, ppm, gain, channel.as_deref(), file.as_ref());
+    // File-based scans are not cached (no stable channel name to key on).
+    let do_cache = file.is_none();
+    scan_single(
+        device_idx,
+        ppm,
+        gain,
+        channel.as_deref(),
+        file.as_ref(),
+        do_cache,
+    );
 }
 
 /// Scan a single IQ source for DAB services.
@@ -289,6 +306,7 @@ fn scan_single(
     gain: i32,
     channel: Option<&str>,
     file: Option<&PathBuf>,
+    do_cache: bool,
 ) {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
@@ -365,6 +383,13 @@ fn scan_single(
                 tag,
             );
         }
+
+        // Persist to cache if requested (not for file-based sources).
+        if do_cache {
+            if let Some(ch) = channel {
+                cache::put(ch, ens);
+            }
+        }
     }
 }
 
@@ -380,6 +405,8 @@ fn cmd_tune(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Tuning to {label}…");
 
+    // Keep the channel name for cache lookup inside the TUI.
+    let ch_name = channel.clone();
     let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
@@ -390,7 +417,7 @@ fn cmd_tune(
         }
     };
 
-    if let Err(e) = tui::run(handle) {
+    if let Err(e) = tui::run(handle, ch_name) {
         eprintln!("TUI error: {e}");
     }
 }
