@@ -517,7 +517,7 @@ fn cmd_play(
                     }
                 }
             }
-            PipelineUpdate::Playing { label } => {
+            PipelineUpdate::Playing { sid: _, label } => {
                 println!("Playing: {label}");
             }
             PipelineUpdate::Status(s) => {
