@@ -337,8 +337,17 @@ fn run_loop(
         // Drain pipeline updates.
         while let Ok(update) = handle.update_rx.try_recv() {
             match update {
-                PipelineUpdate::Ensemble(ens) => {
+                PipelineUpdate::Ensemble(mut ens) => {
                     let old_idx = state.list_state.selected().unwrap_or(0);
+                    // Preserve DLS text across ensemble refreshes: FIC snapshots
+                    // never carry dls_text (DLS arrives via packet-mode MSC), so
+                    // carry it forward from the previous ensemble by SId.
+                    for svc in &mut ens.services {
+                        if let Some(old) = state.ensemble.services.iter().find(|s| s.id == svc.id)
+                        {
+                            svc.dls_text = old.dls_text.clone();
+                        }
+                    }
                     state.ensemble = ens;
 
                     if state.scan_state.is_some() {
