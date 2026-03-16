@@ -39,7 +39,7 @@ pub enum PipelineUpdate {
     /// Ensemble info refreshed (new service labels etc.).
     Ensemble(Ensemble),
     /// Successfully started playing a service.
-    Playing { label: String },
+    Playing { sid: u32, label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
     /// DLS (Dynamic Label Segment) text updated for a service.
@@ -266,6 +266,7 @@ fn run_pipeline(
                 if let Some(sid) = playing_sid {
                     if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
                         let _ = update_tx.try_send(PipelineUpdate::Playing {
+                            sid,
                             label: svc.label.clone(),
                         });
                     }

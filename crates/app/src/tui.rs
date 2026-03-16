@@ -126,6 +126,8 @@ struct AppState {
     ensemble: Ensemble,
     /// Selection cursor for the service/discovered-service list.
     list_state: ListState,
+    /// SId of the currently playing service (if any).
+    playing_sid: Option<u32>,
     /// Label of the currently playing service (if any).
     playing_label: Option<String>,
     /// Status bar text.
@@ -156,6 +158,7 @@ impl AppState {
         AppState {
             ensemble: Ensemble::default(),
             list_state,
+            playing_sid: None,
             playing_label: None,
             status: "Waiting for signal…".into(),
             mode: UiMode::Normal,
@@ -349,7 +352,8 @@ fn run_loop(
                         }
                     }
                 }
-                PipelineUpdate::Playing { label } => {
+                PipelineUpdate::Playing { sid, label } => {
+                    state.playing_sid = Some(sid);
                     state.playing_label = Some(label.clone());
                     state.status = format!("Playing: {label}");
                 }
@@ -544,6 +548,7 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
             }
             KeyCode::Char('s') => {
                 let _ = handle.cmd_tx.try_send(PipelineCmd::Stop);
+                state.playing_sid = None;
                 state.playing_label = None;
                 state.status = "Stopped".into();
             }
@@ -649,19 +654,20 @@ fn render_service_list(f: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
-    // Find DLS text for the currently playing service.
-    let dls_text = state.playing_label.as_ref().and_then(|playing| {
+    // Look up DLS text for the currently playing service by SId.
+    // SId-based lookup is reliable because the Dls pipeline update also uses SId.
+    let dls_text = state.playing_sid.and_then(|sid| {
         state
             .discovered
             .iter()
-            .find(|s| &s.label == playing)
+            .find(|s| s.sid == sid)
             .and_then(|s| s.dls_text.clone())
             .or_else(|| {
                 state
                     .ensemble
                     .services
                     .iter()
-                    .find(|s| &s.label == playing)
+                    .find(|s| s.id == sid)
                     .and_then(|s| s.dls_text.clone())
             })
     });
