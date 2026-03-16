@@ -523,6 +523,9 @@ fn cmd_play(
             PipelineUpdate::Status(s) => {
                 log::info!("Pipeline: {s}");
             }
+            PipelineUpdate::Dls { sid, text } => {
+                log::info!("DLS SId={:04X}: {}", sid, text);
+            }
         }
     }
 }

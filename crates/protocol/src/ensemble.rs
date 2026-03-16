@@ -57,6 +57,9 @@ pub struct Component {
     /// Size of the subchannel in Capacity Units (1 CU = 64 bits).
     pub size: u16,
     pub protection: ProtectionLevel,
+    /// 10-bit packet address for packet-mode components (FIG 0/3).
+    /// `None` for stream-mode (audio) components.
+    pub packet_address: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

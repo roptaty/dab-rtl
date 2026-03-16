@@ -42,6 +42,8 @@ pub enum PipelineUpdate {
     Playing { label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
+    /// DLS (Dynamic Label Segment) text updated for a service.
+    Dls { sid: u32, text: String },
 }
 
 /// Commands sent to the pipeline background thread.
@@ -158,12 +160,16 @@ fn run_pipeline(
         let mut last_svc_labels = String::new();
         let mut frame_count = 0u64;
         let mut pending_retune: Option<u32> = None;
+        // DLS decoder: decodes the packet-mode DLS subchannel for the playing service.
+        let mut dls_msc = MscDecoder::new();
+        let mut last_dls_text = String::new();
 
         let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
         // Restore playing state if we re-tuned to the same channel.
         if let Some(sid) = playing_sid {
             msc.set_target_sid(sid);
+            dls_msc.set_target_sid(sid);
         }
 
         'stream: for iq_buf in stream.rx.iter() {
@@ -174,10 +180,14 @@ fn run_pipeline(
                         PipelineCmd::Play(sid) => {
                             playing_sid = Some(sid);
                             msc.set_target_sid(sid);
+                            dls_msc.set_target_sid(sid);
+                            last_dls_text.clear();
                         }
                         PipelineCmd::Stop => {
                             playing_sid = None;
                             msc.clear_target();
+                            dls_msc.clear_target();
+                            last_dls_text.clear();
                         }
                         PipelineCmd::Retune(freq_hz) => {
                             pending_retune = Some(freq_hz);
@@ -336,6 +346,27 @@ fn run_pipeline(
                                             "MSC: {} PCM samples ready but no audio device",
                                             pcm.len()
                                         );
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── DLS packet-mode subchannel ────────────────── //
+                        if let Some(sid) = playing_sid {
+                            if let Some(dls_comp) = find_dls_component(&ens_snap, sid) {
+                                if let Some(frame) =
+                                    dls_msc.process_cif(&cif_soft, dls_comp, cif_idx)
+                                {
+                                    if let Some(text) = parse_dls_packets(
+                                        &frame.data,
+                                        dls_comp.packet_address.unwrap_or(0),
+                                    ) {
+                                        if text != last_dls_text {
+                                            log::info!("DLS: SId={:04X} text={:?}", sid, text);
+                                            last_dls_text = text.clone();
+                                            let _ = update_tx
+                                                .try_send(PipelineUpdate::Dls { sid, text });
+                                        }
                                     }
                                 }
                             }
@@ -712,6 +743,78 @@ fn find_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
         .first()
 }
 
+/// Find the DLS packet-mode component for a service (has a packet address).
+fn find_dls_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
+    ens.services
+        .iter()
+        .find(|s| s.id == sid)?
+        .components
+        .iter()
+        .find(|c| c.packet_address.is_some())
+}
+
+/// Parse MSC packets from decoded subchannel bytes and extract DLS text.
+///
+/// MSC packet header (ETSI EN 300 401 §5.3.2.1, 3 bytes):
+///   Byte 0: Packet_length[7:6] | Continuity_index[5:4] | First_last[3:2] | Address[9:8]
+///   Byte 1: Address[7:0]
+///   Byte 2: Command_flag[7] | Useful_data_length[6:0]
+///
+/// DLS command (ETSI TS 102 980):
+///   Byte 0 of useful data: command tag (0x01 = Set DL)
+///   Byte 1: Charset[7:4] | Toggle[3] | Item_Running[2] | rfa[1:0]
+///   Bytes 2+: label text (EBU Latin or UTF-8 per charset)
+fn parse_dls_packets(data: &[u8], target_address: u16) -> Option<String> {
+    let mut pos = 0usize;
+    while pos + 3 <= data.len() {
+        let packet_length = (data[pos] >> 6) & 0x03;
+        let packet_size = 24 * (packet_length as usize + 1);
+        let address = (((data[pos] & 0x03) as u16) << 8) | data[pos + 1] as u16;
+        let useful_data_len = (data[pos + 2] & 0x7F) as usize;
+
+        if pos + packet_size > data.len() {
+            break;
+        }
+
+        if address == target_address && useful_data_len >= 2 {
+            // Useful data lives between the 3-byte header and the 2-byte CRC.
+            let data_start = pos + 3;
+            let data_end = (pos + packet_size - 2).min(data_start + useful_data_len);
+            if data_end > data_start {
+                let useful = &data[data_start..data_end];
+                if useful.first() == Some(&0x01) && useful.len() >= 2 {
+                    // Set DL command
+                    let charset = (useful[1] >> 4) & 0x0F;
+                    let text_bytes = &useful[2..];
+                    // Strip trailing null padding.
+                    let trimmed: Vec<u8> =
+                        text_bytes.iter().copied().take_while(|&b| b != 0).collect();
+                    if !trimmed.is_empty() {
+                        let text = if charset == 0x06 {
+                            // UTF-8
+                            String::from_utf8_lossy(&trimmed).trim().to_string()
+                        } else {
+                            // EBU Latin (treat non-ASCII as '?')
+                            trimmed
+                                .iter()
+                                .map(|&b| if b < 0x80 { b as char } else { '?' })
+                                .collect::<String>()
+                                .trim()
+                                .to_string()
+                        };
+                        if !text.is_empty() {
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+        }
+
+        pos += packet_size;
+    }
+    None
+}
+
 /// Quick FIB CRC-16/CCITT check for debug logging.
 fn fib_crc_check(fib: &[u8]) -> bool {
     if fib.len() < 32 {
@@ -816,6 +919,7 @@ mod tests {
             start_address: 0,
             size: 60,
             protection: ProtectionLevel::EepA(3),
+            packet_address: None,
         };
 
         // Encode known data through rate-1/4 convolutional encoder
@@ -922,6 +1026,7 @@ mod tests {
             start_address: 0,
             size: 4,
             protection: ProtectionLevel::EepA(2),
+            packet_address: None,
         };
         let cif = vec![1.0f32; 55296];
         assert!(dec.process_cif(&cif, &comp, 0).is_none());
@@ -1894,6 +1999,7 @@ mod tests {
                             start_address: comp.start_address,
                             size: comp.size,
                             protection: ProtectionLevel::EepA(eep_level),
+                            packet_address: None,
                         };
                         let depunct = eep_depuncture(&normalized, &test_comp);
                         let bits = vit.decode(&depunct);
@@ -1969,6 +2075,7 @@ mod tests {
                         start_address: comp.start_address,
                         size: comp.size,
                         protection: ProtectionLevel::EepA(eep_level),
+                        packet_address: None,
                     };
                     let depunct = eep_depuncture(&normalized, &test_comp);
                     let (_, metric) = vit.decode_with_metric(&depunct);

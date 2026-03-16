@@ -360,6 +360,16 @@ fn run_loop(
                         log::debug!("pipeline status (suppressed during scan): {s}");
                     }
                 }
+                PipelineUpdate::Dls { sid, text } => {
+                    // Update dls_text in the live ensemble snapshot.
+                    if let Some(svc) = state.ensemble.services.iter_mut().find(|s| s.id == sid) {
+                        svc.dls_text = Some(text.clone());
+                    }
+                    // Also update any discovered service entry for cross-channel scans.
+                    if let Some(entry) = state.discovered.iter_mut().find(|s| s.sid == sid) {
+                        entry.dls_text = Some(text.clone());
+                    }
+                }
             }
         }
 

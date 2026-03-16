@@ -98,6 +98,7 @@ mod tests {
             start_address: start,
             size,
             protection: ProtectionLevel::EepA(2),
+            packet_address: None,
         }
     }
 
