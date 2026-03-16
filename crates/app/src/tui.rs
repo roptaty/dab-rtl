@@ -34,22 +34,36 @@ use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 //  App state                                                                   //
 // ─────────────────────────────────────────────────────────────────────────── //
 
+/// How long to wait after sending a Play command before reporting a sync error.
+const PLAY_SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+
 struct AppState {
     ensemble: Ensemble,
+    /// `true` while the ensemble is sourced from the cache (not yet confirmed
+    /// by a live FIC decode).
+    is_cached: bool,
     list_state: ListState,
     playing_label: Option<String>,
     status: String,
+    /// When a Play command was last issued; used to detect sync failures.
+    play_requested_at: Option<Instant>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(cached_ensemble: Option<Ensemble>) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        let (ensemble, is_cached) = match cached_ensemble {
+            Some(e) => (e, true),
+            None => (Ensemble::default(), false),
+        };
         AppState {
-            ensemble: Ensemble::default(),
+            ensemble,
+            is_cached,
             list_state,
             playing_label: None,
             status: "Waiting for signal…".into(),
+            play_requested_at: None,
         }
     }
 
@@ -81,7 +95,10 @@ impl AppState {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Run the TUI until the user presses `q` or `Esc`.
-pub fn run(handle: PipelineHandle) -> io::Result<()> {
+///
+/// `cached_ensemble` is an optional pre-loaded ensemble from the channel
+/// cache, shown immediately before live FIC data arrives.
+pub fn run(handle: PipelineHandle, cached_ensemble: Option<Ensemble>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -89,7 +106,7 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, handle);
+    let result = run_loop(&mut terminal, handle, cached_ensemble);
 
     // Always restore terminal.
     disable_raw_mode()?;
@@ -102,8 +119,9 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     handle: PipelineHandle,
+    cached_ensemble: Option<Ensemble>,
 ) -> io::Result<()> {
-    let mut state = AppState::new();
+    let mut state = AppState::new(cached_ensemble);
     let tick = Duration::from_millis(200);
     let mut last_tick = Instant::now();
 
@@ -112,6 +130,8 @@ fn run_loop(
         while let Ok(update) = handle.update_rx.try_recv() {
             match update {
                 PipelineUpdate::Ensemble(ens) => {
+                    // Live FIC data received — no longer showing cached data.
+                    state.is_cached = false;
                     // Preserve selection if possible.
                     let old_sid = state.selected_sid();
                     state.ensemble = ens;
@@ -127,12 +147,22 @@ fn run_loop(
                     }
                 }
                 PipelineUpdate::Playing { label } => {
+                    state.play_requested_at = None; // sync succeeded
                     state.playing_label = Some(label.clone());
                     state.status = format!("Playing: {label}");
                 }
                 PipelineUpdate::Status(s) => {
                     state.status = s;
                 }
+            }
+        }
+
+        // Fail-fast: if a Play was requested but no audio has started within
+        // the timeout, show a sync error in the status bar.
+        if let Some(t) = state.play_requested_at {
+            if t.elapsed() > PLAY_SYNC_TIMEOUT {
+                state.status = "Sync error: no signal — try scanning again".into();
+                state.play_requested_at = None;
             }
         }
 
@@ -152,11 +182,14 @@ fn run_loop(
                     KeyCode::Enter => {
                         if let Some(sid) = state.selected_sid() {
                             let _ = handle.cmd_tx.try_send(PipelineCmd::Play(sid));
+                            state.play_requested_at = Some(Instant::now());
+                            state.status = "Waiting for sync…".into();
                         }
                     }
                     KeyCode::Char('s') => {
                         let _ = handle.cmd_tx.try_send(PipelineCmd::Stop);
                         state.playing_label = None;
+                        state.play_requested_at = None;
                         state.status = "Stopped".into();
                     }
                     _ => {}
@@ -197,6 +230,8 @@ fn render(f: &mut Frame, state: &mut AppState) {
 fn render_service_list(f: &mut Frame, state: &mut AppState, area: ratatui::layout::Rect) {
     let ens_title = if state.ensemble.label.is_empty() {
         " Services ".to_string()
+    } else if state.is_cached {
+        format!(" {} (cached) ", state.ensemble.label)
     } else {
         format!(" {} ", state.ensemble.label)
     };

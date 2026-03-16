@@ -1,3 +1,4 @@
+mod cache;
 mod countries;
 mod pipeline;
 mod tui;
@@ -83,6 +84,9 @@ enum Command {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
     },
+
+    /// Clear the cached scan results
+    ClearCache,
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -222,6 +226,7 @@ fn main() {
             audio_device,
             file,
         ),
+        Command::ClearCache => cmd_clear_cache(),
     }
 }
 
@@ -256,6 +261,8 @@ fn cmd_list_audio() {
 /// Stops when either:
 /// - No ensemble is detected within `NO_LOCK_SECS` seconds, or
 /// - `SETTLE_SECS` seconds pass with no new service appearing.
+///
+/// Results are saved to the persistent channel cache.
 fn cmd_scan(
     device_idx: u32,
     ppm: i32,
@@ -264,6 +271,8 @@ fn cmd_scan(
     country: Option<String>,
     file: Option<PathBuf>,
 ) {
+    let mut ch_cache = cache::ChannelCache::load();
+
     // Country mode: scan all channels for that country (file not supported).
     if let Some(code) = country {
         let channels = match countries::channels_for_country(&code) {
@@ -274,22 +283,38 @@ fn cmd_scan(
             }
         };
         for ch in &channels {
-            scan_single(device_idx, ppm, gain, Some(ch.as_str()), None);
+            if let Some(ens) = scan_single(device_idx, ppm, gain, Some(ch.as_str()), None) {
+                ch_cache.put(ch, &ens);
+            }
         }
-        return;
+    } else if let Some(ens) =
+        scan_single(device_idx, ppm, gain, channel.as_deref(), file.as_ref())
+    {
+        // Only cache live SDR scans (not file-based), since file paths may not
+        // correspond to real channels.
+        if file.is_none() {
+            if let Some(ch) = &channel {
+                ch_cache.put(ch, &ens);
+            }
+        }
     }
 
-    scan_single(device_idx, ppm, gain, channel.as_deref(), file.as_ref());
+    if let Err(e) = ch_cache.save() {
+        log::warn!("Failed to save channel cache: {e}");
+    }
 }
 
 /// Scan a single IQ source for DAB services.
+///
+/// Returns the discovered `Ensemble` on success, or `None` when no DAB signal
+/// was found within the timeout.
 fn scan_single(
     device_idx: u32,
     ppm: i32,
     gain: i32,
     channel: Option<&str>,
     file: Option<&PathBuf>,
-) {
+) -> Option<protocol::Ensemble> {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
     use std::time::{Duration, Instant};
@@ -365,6 +390,9 @@ fn scan_single(
                 tag,
             );
         }
+        Some(ens.clone())
+    } else {
+        None
     }
 }
 
@@ -380,6 +408,13 @@ fn cmd_tune(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Tuning to {label}…");
 
+    // Pre-load cached services for this channel so the TUI can show them
+    // immediately while waiting for the live FIC decode.
+    let cached_ensemble = channel.as_deref().and_then(|ch| {
+        let cache = cache::ChannelCache::load();
+        cache.get(ch).map(|e| e.to_ensemble())
+    });
+
     let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
@@ -390,12 +425,15 @@ fn cmd_tune(
         }
     };
 
-    if let Err(e) = tui::run(handle) {
+    if let Err(e) = tui::run(handle, cached_ensemble) {
         eprintln!("TUI error: {e}");
     }
 }
 
 /// Non-interactive play: find the named station and start audio immediately.
+///
+/// If the station is in the channel cache the Play command is sent as soon
+/// as the pipeline starts, without waiting for a full FIC decode cycle.
 fn cmd_play(
     device_idx: u32,
     ppm: i32,
@@ -410,6 +448,20 @@ fn cmd_play(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Searching for '{station}' on {label}…  Press Ctrl-C to stop.");
 
+    // Fast path: look up the station SId from the cache before starting the
+    // pipeline.  This avoids waiting for a complete FIC decode before the
+    // Play command can be sent.
+    let cached_sid = channel.as_deref().and_then(|ch| {
+        let ch_cache = cache::ChannelCache::load();
+        let needle = station.to_lowercase();
+        ch_cache.get(ch).and_then(|ens| {
+            ens.services
+                .iter()
+                .find(|s| s.label.to_lowercase().contains(&needle))
+                .map(|s| s.id)
+        })
+    });
+
     let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
@@ -420,7 +472,14 @@ fn cmd_play(
         }
     };
 
-    let mut started = false;
+    // If we already know the SId from cache, send Play immediately.
+    let mut started = if let Some(sid) = cached_sid {
+        println!("Found in cache — queuing playback (waiting for signal sync)…");
+        let _ = handle.cmd_tx.try_send(PipelineCmd::Play(sid));
+        true
+    } else {
+        false
+    };
 
     for update in handle.update_rx.iter() {
         match update {
@@ -443,6 +502,17 @@ fn cmd_play(
                 log::info!("Pipeline: {s}");
             }
         }
+    }
+}
+
+/// Remove all cached scan results.
+fn cmd_clear_cache() {
+    let path = cache::ChannelCache::cache_path();
+    let mut ch_cache = cache::ChannelCache::load();
+    ch_cache.clear();
+    match ch_cache.save() {
+        Ok(()) => println!("Cache cleared ({})", path.display()),
+        Err(e) => eprintln!("error: failed to clear cache: {e}"),
     }
 }
 
