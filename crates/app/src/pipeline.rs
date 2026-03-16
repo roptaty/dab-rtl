@@ -42,7 +42,16 @@ pub enum PipelineUpdate {
     Playing { label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
+    /// Attempting to reconnect to the SDR device.
+    Reconnecting { attempt: u32, max_attempts: u32 },
 }
+
+/// Maximum number of times the pipeline will attempt to reopen a live SDR
+/// device after it disappears (e.g. USB unplug).
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 15;
+
+/// How long to wait between reconnection attempts.
+pub const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Commands sent to the pipeline background thread.
 pub enum PipelineCmd {
@@ -63,19 +72,17 @@ pub struct PipelineHandle {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Start the receive pipeline from a pre-opened IQ stream.
+///
+/// Use this for file-based IQ streams.  No reconnection is attempted when
+/// the stream ends.
 pub fn start_with_stream(
     stream: sdr::SdrStream,
     audio_device: Option<String>,
 ) -> Result<PipelineHandle, String> {
-    // Channel: background → TUI updates
     let (update_tx, update_rx) = mpsc::sync_channel::<PipelineUpdate>(32);
-    // Channel: TUI → background commands
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipelineCmd>(8);
-    // Shared command state so the inner SDR loop can check it.
     let cmd_rx = Arc::new(Mutex::new(cmd_rx));
 
-    // AudioOutput contains cpal::Stream which is !Send, so it must be
-    // constructed inside the pipeline thread rather than passed across threads.
     thread::Builder::new()
         .name("pipeline".into())
         .spawn(move || {
@@ -85,7 +92,48 @@ pub fn start_with_stream(
             if let Some(ref ao) = audio_out {
                 ao.play();
             }
-            run_pipeline(stream, audio_out, update_tx, cmd_rx);
+            run_pipeline(stream, audio_out, update_tx, cmd_rx, None);
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(PipelineHandle { update_rx, cmd_tx })
+}
+
+/// Start the receive pipeline for a live RTL-SDR device with automatic
+/// reconnection.
+///
+/// If the device disappears (USB unplug, etc.) the pipeline waits
+/// [`RECONNECT_DELAY`] and tries to reopen it, up to
+/// [`MAX_RECONNECT_ATTEMPTS`] times.  The selected station is preserved
+/// across reconnects so playback resumes automatically.
+pub fn start(
+    config: sdr::DeviceConfig,
+    buf_size: u32,
+    audio_device: Option<String>,
+) -> Result<PipelineHandle, String> {
+    let stream =
+        sdr::open_stream(config.clone(), buf_size).map_err(|e| e.to_string())?;
+
+    let (update_tx, update_rx) = mpsc::sync_channel::<PipelineUpdate>(32);
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipelineCmd>(8);
+    let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+
+    thread::Builder::new()
+        .name("pipeline".into())
+        .spawn(move || {
+            let audio_out = audio::AudioOutput::open(audio_device.as_deref(), 48_000, 2)
+                .map_err(|e| log::warn!("audio open failed: {e}"))
+                .ok();
+            if let Some(ref ao) = audio_out {
+                ao.play();
+            }
+            run_pipeline(
+                stream,
+                audio_out,
+                update_tx,
+                cmd_rx,
+                Some((config, buf_size)),
+            );
         })
         .map_err(|e| e.to_string())?;
 
@@ -96,186 +144,203 @@ pub fn start_with_stream(
 //  Pipeline main loop                                                          //
 // ─────────────────────────────────────────────────────────────────────────── //
 
+// `reconnect` = `Some((config, buf_size))` enables automatic reconnection for live SDR
+// streams; `None` means exit when the stream ends (file streams).
 fn run_pipeline(
-    stream: sdr::SdrStream,
+    initial_stream: sdr::SdrStream,
     audio_out: Option<audio::AudioOutput>,
     update_tx: mpsc::SyncSender<PipelineUpdate>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<PipelineCmd>>>,
+    reconnect: Option<(sdr::DeviceConfig, u32)>,
 ) {
-    let mut ofdm = OfdmProcessor::new();
-    let mut fic = FicDecoder::new();
-    let mut msc = MscDecoder::new();
-    let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
-    let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
-
-    // Currently selected SId (None = scan-only).
+    // The selected SId persists across reconnects so playback resumes.
     let mut playing_sid: Option<u32> = None;
-    let mut last_ens_label = String::new();
-    let mut last_svc_count = 0usize;
-    let mut last_svc_labels = String::new();
-    let mut frame_count = 0u64;
+    let mut reconnect_attempt = 0u32;
+    let mut stream = initial_stream;
 
-    let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
+    'reconnect: loop {
+        // Reset all signal-processing state for each (re)connection.
+        let mut ofdm = OfdmProcessor::new();
+        let mut fic = FicDecoder::new();
+        let mut msc = MscDecoder::new();
+        let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
+        let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
 
-    for iq_buf in stream.rx.iter() {
-        // Drain any pending commands.
-        if let Ok(guard) = cmd_rx.try_lock() {
-            while let Ok(cmd) = guard.try_recv() {
-                match cmd {
-                    PipelineCmd::Play(sid) => {
-                        playing_sid = Some(sid);
-                        msc.set_target_sid(sid);
-                    }
-                    PipelineCmd::Stop => {
-                        playing_sid = None;
-                        msc.clear_target();
-                    }
-                }
-            }
+        let mut last_ens_label = String::new();
+        let mut last_svc_count = 0usize;
+        let mut last_svc_labels = String::new();
+        let mut frame_count = 0u64;
+
+        // Restore target service after reconnect.
+        if let Some(sid) = playing_sid {
+            msc.set_target_sid(sid);
         }
 
-        // OFDM demodulation.
-        for frame in ofdm.push_samples(&iq_buf) {
-            frame_count += 1;
-            log::debug!("Pipeline: OFDM frame #{}", frame_count);
+        let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
-            // ── FIC (symbols 0-2) ────────────────────────────────────────── //
-            fic.begin_frame();
-            let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
-            for sym in fic_symbols {
-                fic.process_symbol(sym);
+        for iq_buf in stream.rx.iter() {
+            // Drain any pending commands.
+            if let Ok(guard) = cmd_rx.try_lock() {
+                while let Ok(cmd) = guard.try_recv() {
+                    match cmd {
+                        PipelineCmd::Play(sid) => {
+                            playing_sid = Some(sid);
+                            msc.set_target_sid(sid);
+                        }
+                        PipelineCmd::Stop => {
+                            playing_sid = None;
+                            msc.clear_target();
+                        }
+                    }
+                }
             }
 
-            // Propagate ensemble changes to the TUI.
-            let ens = fic.handler.ensemble();
-            // Build a fingerprint of service labels so we detect when labels
-            // arrive (they come in separate FIG messages after services appear).
-            let svc_labels: String = ens
-                .services
-                .iter()
-                .map(|s| format!("{:04X}:{}", s.id, s.label))
-                .collect::<Vec<_>>()
-                .join(",");
-            if ens.label != last_ens_label
-                || ens.services.len() != last_svc_count
-                || svc_labels != last_svc_labels
-            {
-                last_ens_label = ens.label.clone();
-                last_svc_count = ens.services.len();
-                last_svc_labels = svc_labels;
-                log::info!(
-                    "Ensemble: id={:04X} label={:?} services={}",
-                    ens.id,
-                    ens.label,
-                    ens.services.len()
-                );
-                for svc in &ens.services {
+            // OFDM demodulation.
+            for frame in ofdm.push_samples(&iq_buf) {
+                frame_count += 1;
+                log::debug!("Pipeline: OFDM frame #{}", frame_count);
+
+                // ── FIC (symbols 0-2) ─────────────────────────────────────── //
+                fic.begin_frame();
+                let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
+                for sym in fic_symbols {
+                    fic.process_symbol(sym);
+                }
+
+                // Propagate ensemble changes to the TUI.
+                let ens = fic.handler.ensemble();
+                // Build a fingerprint of service labels so we detect when labels
+                // arrive (they come in separate FIG messages after services appear).
+                let svc_labels: String = ens
+                    .services
+                    .iter()
+                    .map(|s| format!("{:04X}:{}", s.id, s.label))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if ens.label != last_ens_label
+                    || ens.services.len() != last_svc_count
+                    || svc_labels != last_svc_labels
+                {
+                    last_ens_label = ens.label.clone();
+                    last_svc_count = ens.services.len();
+                    last_svc_labels = svc_labels;
                     log::info!(
-                        "  Service: id={:04X} label={:?} dab+={} components={}",
-                        svc.id,
-                        svc.label,
-                        svc.is_dab_plus,
-                        svc.components.len()
+                        "Ensemble: id={:04X} label={:?} services={}",
+                        ens.id,
+                        ens.label,
+                        ens.services.len()
                     );
-                    for comp in &svc.components {
+                    for svc in &ens.services {
                         log::info!(
-                            "    Component: subch={} start={} size={} prot={:?}",
-                            comp.subchannel_id,
-                            comp.start_address,
-                            comp.size,
-                            comp.protection
+                            "  Service: id={:04X} label={:?} dab+={} components={}",
+                            svc.id,
+                            svc.label,
+                            svc.is_dab_plus,
+                            svc.components.len()
                         );
-                    }
-                }
-                let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens.clone()));
-                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
-                    "Locked — {} services",
-                    ens.services.len()
-                )));
-            }
-
-            // Announce when we start playing.
-            if let Some(sid) = playing_sid {
-                if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
-                    let _ = update_tx.try_send(PipelineUpdate::Playing {
-                        label: svc.label.clone(),
-                    });
-                }
-            }
-
-            // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
-            if playing_sid.is_some() {
-                let ens_snap = ens.clone();
-                let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
-
-                for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
-                    if cif_syms.len() < 18 {
-                        continue;
-                    }
-                    // Flatten CIF symbols → 55296 soft bits.
-                    let cif_soft: Vec<f32> =
-                        cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
-
-                    if let Some(sid) = playing_sid {
-                        let component = find_component(&ens_snap, sid);
-                        if component.is_none() && cif_idx == 0 {
-                            log::debug!(
-                                "MSC: no component found for SId {:04X} (service has {} components)",
-                                sid,
-                                ens_snap
-                                    .services
-                                    .iter()
-                                    .find(|s| s.id == sid)
-                                    .map_or(0, |s| s.components.len())
+                        for comp in &svc.components {
+                            log::info!(
+                                "    Component: subch={} start={} size={} prot={:?}",
+                                comp.subchannel_id,
+                                comp.start_address,
+                                comp.size,
+                                comp.protection
                             );
                         }
-                        if let Some(component) = component {
-                            if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx) {
+                    }
+                    let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens.clone()));
+                    let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                        "Locked — {} services",
+                        ens.services.len()
+                    )));
+                }
+
+                // Announce when we start playing.
+                if let Some(sid) = playing_sid {
+                    if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
+                        let _ = update_tx.try_send(PipelineUpdate::Playing {
+                            label: svc.label.clone(),
+                        });
+                    }
+                }
+
+                // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ──────────────── //
+                if playing_sid.is_some() {
+                    let ens_snap = ens.clone();
+                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+
+                    for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
+                        if cif_syms.len() < 18 {
+                            continue;
+                        }
+                        // Flatten CIF symbols → 55296 soft bits.
+                        let cif_soft: Vec<f32> =
+                            cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
+
+                        if let Some(sid) = playing_sid {
+                            let component = find_component(&ens_snap, sid);
+                            if component.is_none() && cif_idx == 0 {
                                 log::debug!(
-                                    "MSC: CIF {} subchannel {} → {} bytes ({})",
-                                    cif_idx,
-                                    frame.subchannel_id,
-                                    frame.data.len(),
-                                    if frame.is_dab_plus { "DAB+" } else { "DAB" }
+                                    "MSC: no component found for SId {:04X} (service has {} components)",
+                                    sid,
+                                    ens_snap
+                                        .services
+                                        .iter()
+                                        .find(|s| s.id == sid)
+                                        .map_or(0, |s| s.components.len())
                                 );
-                                // Set DAB+ superframe size from actual Viterbi output.
-                                if frame.is_dab_plus
-                                    && !frame.data.is_empty()
-                                    && dab_plus.superframe_size != frame.data.len()
+                            }
+                            if let Some(component) = component {
+                                if let Some(frame) =
+                                    msc.process_cif(&cif_soft, component, cif_idx)
                                 {
-                                    log::info!(
-                                        "DAB+: setting per-CIF size to {} bytes (was {})",
+                                    log::debug!(
+                                        "MSC: CIF {} subchannel {} → {} bytes ({})",
+                                        cif_idx,
+                                        frame.subchannel_id,
                                         frame.data.len(),
-                                        dab_plus.superframe_size
+                                        if frame.is_dab_plus { "DAB+" } else { "DAB" }
                                     );
-                                    dab_plus.set_superframe_size(frame.data.len());
-                                }
-                                let pcm = if frame.is_dab_plus {
-                                    dab_plus.push(&frame.data)
-                                } else {
-                                    mp2.push(&frame.data)
-                                };
-                                if pcm.is_empty() {
-                                    log::debug!(
-                                        "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
-                                    );
-                                } else if let Some(ao) = &audio_out {
-                                    let (min, max) =
-                                        pcm.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
-                                            (lo.min(s), hi.max(s))
-                                        });
-                                    log::debug!(
-                                        "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
-                                        pcm.len(),
-                                        min,
-                                        max
-                                    );
-                                    ao.write_samples(&pcm);
-                                } else {
-                                    log::debug!(
-                                        "MSC: {} PCM samples ready but no audio device",
-                                        pcm.len()
-                                    );
+                                    // Set DAB+ superframe size from actual Viterbi output.
+                                    if frame.is_dab_plus
+                                        && !frame.data.is_empty()
+                                        && dab_plus.superframe_size != frame.data.len()
+                                    {
+                                        log::info!(
+                                            "DAB+: setting per-CIF size to {} bytes (was {})",
+                                            frame.data.len(),
+                                            dab_plus.superframe_size
+                                        );
+                                        dab_plus.set_superframe_size(frame.data.len());
+                                    }
+                                    let pcm = if frame.is_dab_plus {
+                                        dab_plus.push(&frame.data)
+                                    } else {
+                                        mp2.push(&frame.data)
+                                    };
+                                    if pcm.is_empty() {
+                                        log::debug!(
+                                            "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
+                                        );
+                                    } else if let Some(ao) = &audio_out {
+                                        let (min, max) = pcm
+                                            .iter()
+                                            .fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
+                                                (lo.min(s), hi.max(s))
+                                            });
+                                        log::debug!(
+                                            "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
+                                            pcm.len(),
+                                            min,
+                                            max
+                                        );
+                                        ao.write_samples(&pcm);
+                                    } else {
+                                        log::debug!(
+                                            "MSC: {} PCM samples ready but no audio device",
+                                            pcm.len()
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -283,9 +348,62 @@ fn run_pipeline(
                 }
             }
         }
-    }
 
-    log::info!("pipeline: IQ stream ended, thread exiting");
+        log::info!("pipeline: IQ stream ended");
+
+        // ── Reconnection logic ─────────────────────────────────────────── //
+        let Some(ref cfg) = reconnect else {
+            // File stream or caller opted out — just exit.
+            break 'reconnect;
+        };
+
+        let device_config = &cfg.0;
+        let buf_size = cfg.1;
+
+        reconnect_attempt += 1;
+        if reconnect_attempt > MAX_RECONNECT_ATTEMPTS {
+            log::error!(
+                "pipeline: giving up after {} reconnect attempts",
+                MAX_RECONNECT_ATTEMPTS
+            );
+            let _ = update_tx.try_send(PipelineUpdate::Status(
+                "Device disconnected — giving up".into(),
+            ));
+            break 'reconnect;
+        }
+
+        let _ = update_tx.try_send(PipelineUpdate::Reconnecting {
+            attempt: reconnect_attempt,
+            max_attempts: MAX_RECONNECT_ATTEMPTS,
+        });
+        log::info!(
+            "pipeline: waiting {:?} before reconnect attempt {}/{}",
+            RECONNECT_DELAY,
+            reconnect_attempt,
+            MAX_RECONNECT_ATTEMPTS
+        );
+        thread::sleep(RECONNECT_DELAY);
+
+        match sdr::open_stream(device_config.clone(), buf_size) {
+            Ok(new_stream) => {
+                log::info!("pipeline: reconnected successfully");
+                stream = new_stream;
+                reconnect_attempt = 0; // Reset counter on successful open.
+            }
+            Err(e) => {
+                log::warn!(
+                    "pipeline: reconnect attempt {}/{} failed: {e}",
+                    reconnect_attempt,
+                    MAX_RECONNECT_ATTEMPTS
+                );
+                // stream stays exhausted; the next loop iteration's
+                // `for iq_buf in stream.rx.iter()` returns immediately,
+                // so we reach the reconnect logic again for the next try.
+            }
+        }
+    } // end 'reconnect loop
+
+    log::info!("pipeline: thread exiting");
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -2347,5 +2465,57 @@ mod tests {
             "should produce substantial PCM output (got {})",
             total_pcm_samples
         );
+    }
+
+    #[test]
+    fn reconnect_constants_are_sensible() {
+        assert_eq!(MAX_RECONNECT_ATTEMPTS, 15);
+        assert_eq!(RECONNECT_DELAY, std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn pipeline_update_reconnecting_can_be_constructed() {
+        let update = PipelineUpdate::Reconnecting {
+            attempt: 3,
+            max_attempts: MAX_RECONNECT_ATTEMPTS,
+        };
+        // Verify the variant is correctly pattern-matched.
+        match update {
+            PipelineUpdate::Reconnecting { attempt, max_attempts } => {
+                assert_eq!(attempt, 3);
+                assert_eq!(max_attempts, 15);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    /// Verify that `start_with_stream` exits cleanly when the IQ file is empty
+    /// (the stream ends immediately, simulating a device disconnect with no retry).
+    #[test]
+    fn start_with_stream_exits_on_empty_file() {
+        use std::time::Duration;
+
+        // Write a minimal (but valid) even-length IQ file.
+        let dir = std::env::temp_dir();
+        let path = dir.join("dab_rtl_test_empty.raw");
+        std::fs::write(&path, [127u8, 127u8]).unwrap(); // one I/Q pair
+
+        let stream = sdr::open_file_stream(&path, 32_768).expect("open_file_stream should succeed");
+        let handle = start_with_stream(stream, None).expect("start_with_stream should succeed");
+
+        // The pipeline thread should exit quickly since the file is tiny.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match handle.update_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(_) => {} // drain any status updates
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break, // pipeline exited
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("pipeline thread did not exit within 5 seconds");
+            }
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 }

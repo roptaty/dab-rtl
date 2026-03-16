@@ -380,13 +380,29 @@ fn cmd_tune(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Tuning to {label}…");
 
-    let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
-
-    let handle = match pipeline::start_with_stream(stream, audio_device) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+    let handle = if let Some(ref path) = file {
+        let stream = open_iq_source(Some(path), None, device_idx, ppm, gain);
+        match pipeline::start_with_stream(stream, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let ch = channel.as_deref().expect("channel or file required");
+        let config = sdr::DeviceConfig {
+            index: device_idx,
+            center_freq_hz: resolve_channel(ch),
+            gain,
+            ppm_correction: ppm,
+        };
+        match pipeline::start(config, 32_768, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -410,13 +426,29 @@ fn cmd_play(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Searching for '{station}' on {label}…  Press Ctrl-C to stop.");
 
-    let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
-
-    let handle = match pipeline::start_with_stream(stream, audio_device) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+    let handle = if let Some(ref path) = file {
+        let stream = open_iq_source(Some(path), None, device_idx, ppm, gain);
+        match pipeline::start_with_stream(stream, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        let ch = channel.as_deref().expect("channel or file required");
+        let config = sdr::DeviceConfig {
+            index: device_idx,
+            center_freq_hz: resolve_channel(ch),
+            gain,
+            ppm_correction: ppm,
+        };
+        match pipeline::start(config, 32_768, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
         }
     };
 
@@ -441,6 +473,9 @@ fn cmd_play(
             }
             PipelineUpdate::Status(s) => {
                 log::info!("Pipeline: {s}");
+            }
+            PipelineUpdate::Reconnecting { attempt, max_attempts } => {
+                println!("Device disconnected — reconnecting ({attempt}/{max_attempts})…");
             }
         }
     }
