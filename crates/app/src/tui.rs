@@ -133,6 +133,10 @@ fn run_loop(
                 PipelineUpdate::Status(s) => {
                     state.status = s;
                 }
+                PipelineUpdate::Reconnecting { attempt, max_attempts } => {
+                    state.status =
+                        format!("Device disconnected — reconnecting ({attempt}/{max_attempts})…");
+                }
             }
         }
 
