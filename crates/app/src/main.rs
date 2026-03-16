@@ -1,3 +1,4 @@
+mod cache;
 mod countries;
 mod pipeline;
 mod tui;
@@ -83,6 +84,9 @@ enum Command {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
     },
+
+    /// Clear the cached scan results (~/.config/dab-rtl/cache.json)
+    ClearCache,
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -222,6 +226,7 @@ fn main() {
             audio_device,
             file,
         ),
+        Command::ClearCache => cmd_clear_cache(),
     }
 }
 
@@ -273,23 +278,41 @@ fn cmd_scan(
                 std::process::exit(1);
             }
         };
+        let cache_path = cache::Cache::default_path();
+        let mut cache = cache::Cache::load(&cache_path);
         for ch in &channels {
-            scan_single(device_idx, ppm, gain, Some(ch.as_str()), None);
+            if let Some(result) = scan_single(device_idx, ppm, gain, Some(ch.as_str()), None) {
+                cache.put(ch, result);
+                if let Err(e) = cache.save(&cache_path) {
+                    eprintln!("warning: could not save cache: {e}");
+                }
+            }
         }
         return;
     }
 
-    scan_single(device_idx, ppm, gain, channel.as_deref(), file.as_ref());
+    let result = scan_single(device_idx, ppm, gain, channel.as_deref(), file.as_ref());
+
+    // Cache the result when scanning a named channel (not a raw file).
+    if let (Some(ch), Some(ens)) = (channel.as_deref(), result) {
+        let cache_path = cache::Cache::default_path();
+        let mut cache = cache::Cache::load(&cache_path);
+        cache.put(ch, ens);
+        if let Err(e) = cache.save(&cache_path) {
+            eprintln!("warning: could not save cache: {e}");
+        }
+    }
 }
 
-/// Scan a single IQ source for DAB services.
+/// Scan a single IQ source for DAB services.  Returns the discovered ensemble
+/// (if any) so the caller can cache it.
 fn scan_single(
     device_idx: u32,
     ppm: i32,
     gain: i32,
     channel: Option<&str>,
     file: Option<&PathBuf>,
-) {
+) -> Option<cache::CachedEnsemble> {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
     use std::time::{Duration, Instant};
@@ -365,6 +388,22 @@ fn scan_single(
                 tag,
             );
         }
+
+        Some(cache::CachedEnsemble {
+            id: ens.id,
+            label: ens.label.clone(),
+            services: ens
+                .services
+                .iter()
+                .map(|s| cache::CachedService {
+                    id: s.id,
+                    label: s.label.clone(),
+                    is_dab_plus: s.is_dab_plus,
+                })
+                .collect(),
+        })
+    } else {
+        None
     }
 }
 
@@ -380,6 +419,29 @@ fn cmd_tune(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Tuning to {label}…");
 
+    // Pre-populate the TUI with any previously cached services so the list
+    // appears immediately before the FIC stream re-decodes.
+    let cache_path = cache::Cache::default_path();
+    let initial_ensemble = channel.as_deref().and_then(|ch| {
+        let cached = cache::Cache::load(&cache_path);
+        cached.get(ch).map(|e| {
+            let mut ens = protocol::Ensemble {
+                id: e.id,
+                label: e.label.clone(),
+                ..Default::default()
+            };
+            for s in &e.services {
+                ens.services.push(protocol::Service {
+                    id: s.id,
+                    label: s.label.clone(),
+                    is_dab_plus: s.is_dab_plus,
+                    ..Default::default()
+                });
+            }
+            ens
+        })
+    });
+
     let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
@@ -390,7 +452,7 @@ fn cmd_tune(
         }
     };
 
-    if let Err(e) = tui::run(handle) {
+    if let Err(e) = tui::run(handle, cache_path, initial_ensemble) {
         eprintln!("TUI error: {e}");
     }
 }
@@ -410,6 +472,18 @@ fn cmd_play(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Searching for '{station}' on {label}…  Press Ctrl-C to stop.");
 
+    // Fast path: look up the SId from cache before waiting for FIC decode.
+    let cache_path = cache::Cache::default_path();
+    let cached_sid = channel.as_deref().and_then(|ch| {
+        let cached = cache::Cache::load(&cache_path);
+        cached.get(ch).and_then(|e| {
+            e.services
+                .iter()
+                .find(|s| s.label.to_lowercase().contains(&station.to_lowercase()))
+                .map(|s| s.id)
+        })
+    });
+
     let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
@@ -420,7 +494,14 @@ fn cmd_play(
         }
     };
 
-    let mut started = false;
+    // If we already know the SId from cache, request playback immediately.
+    let mut started = if let Some(sid) = cached_sid {
+        println!("Found in cache — requesting playback");
+        let _ = handle.cmd_tx.try_send(PipelineCmd::Play(sid));
+        true
+    } else {
+        false
+    };
 
     for update in handle.update_rx.iter() {
         match update {
@@ -442,6 +523,20 @@ fn cmd_play(
             PipelineUpdate::Status(s) => {
                 log::info!("Pipeline: {s}");
             }
+        }
+    }
+}
+
+/// Clear the persistent scan cache.
+fn cmd_clear_cache() {
+    let path = cache::Cache::default_path();
+    let mut c = cache::Cache::load(&path);
+    c.clear();
+    match c.save(&path) {
+        Ok(()) => println!("Cache cleared: {}", path.display()),
+        Err(e) => {
+            eprintln!("error: could not write cache: {e}");
+            std::process::exit(1);
         }
     }
 }

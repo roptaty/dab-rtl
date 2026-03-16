@@ -7,9 +7,10 @@
 /// │    BBC Radio 2           │  Ensemble: BBC National DAB   │
 /// │    BBC Radio 3           │                               │
 /// ├──────────────────────────────────────────────────────────┤
-/// │ [↑↓] Navigate  [Enter] Play  [s] Stop  [q] Quit  Status │
+/// │ [↑↓] Navigate  [Enter] Play  [s] Stop  [X] Clear cache  │
 /// └──────────────────────────────────────────────────────────┘
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -28,6 +29,7 @@ use ratatui::{
 
 use protocol::Ensemble;
 
+use crate::cache;
 use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -39,17 +41,31 @@ struct AppState {
     list_state: ListState,
     playing_label: Option<String>,
     status: String,
+    /// True while the service list is showing data loaded from the cache
+    /// (before the first live FIC update arrives).
+    from_cache: bool,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(initial_ensemble: Option<Ensemble>) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+
+        let (ensemble, from_cache, status) = match initial_ensemble {
+            Some(ens) => (
+                ens,
+                true,
+                "Loaded from cache — waiting for signal…".into(),
+            ),
+            None => (Ensemble::default(), false, "Waiting for signal…".into()),
+        };
+
         AppState {
-            ensemble: Ensemble::default(),
+            ensemble,
             list_state,
             playing_label: None,
-            status: "Waiting for signal…".into(),
+            status,
+            from_cache,
         }
     }
 
@@ -81,7 +97,14 @@ impl AppState {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Run the TUI until the user presses `q` or `Esc`.
-pub fn run(handle: PipelineHandle) -> io::Result<()> {
+///
+/// `cache_path` is used by the `X` key to clear the persistent scan cache.
+/// `initial_ensemble` pre-populates the service list before FIC data arrives.
+pub fn run(
+    handle: PipelineHandle,
+    cache_path: PathBuf,
+    initial_ensemble: Option<Ensemble>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -89,7 +112,7 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, handle);
+    let result = run_loop(&mut terminal, handle, cache_path, initial_ensemble);
 
     // Always restore terminal.
     disable_raw_mode()?;
@@ -102,8 +125,10 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     handle: PipelineHandle,
+    cache_path: PathBuf,
+    initial_ensemble: Option<Ensemble>,
 ) -> io::Result<()> {
-    let mut state = AppState::new();
+    let mut state = AppState::new(initial_ensemble);
     let tick = Duration::from_millis(200);
     let mut last_tick = Instant::now();
 
@@ -115,6 +140,7 @@ fn run_loop(
                     // Preserve selection if possible.
                     let old_sid = state.selected_sid();
                     state.ensemble = ens;
+                    state.from_cache = false;
                     if state.ensemble.services.is_empty() {
                         state.list_state.select(None);
                     } else {
@@ -159,6 +185,14 @@ fn run_loop(
                         state.playing_label = None;
                         state.status = "Stopped".into();
                     }
+                    KeyCode::Char('X') | KeyCode::Char('x') => {
+                        let mut c = cache::Cache::load(&cache_path);
+                        c.clear();
+                        match c.save(&cache_path) {
+                            Ok(()) => state.status = "Cache cleared".into(),
+                            Err(e) => state.status = format!("Cache clear failed: {e}"),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -197,6 +231,8 @@ fn render(f: &mut Frame, state: &mut AppState) {
 fn render_service_list(f: &mut Frame, state: &mut AppState, area: ratatui::layout::Rect) {
     let ens_title = if state.ensemble.label.is_empty() {
         " Services ".to_string()
+    } else if state.from_cache {
+        format!(" {} (cached) ", state.ensemble.label)
     } else {
         format!(" {} ", state.ensemble.label)
     };
@@ -271,7 +307,7 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: ratatui::layout::Re
 
 fn render_status_bar(f: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
     let help = Span::styled(
-        " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [q] Quit ",
+        " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [X] Clear cache  [q] Quit ",
         Style::default().fg(Color::DarkGray),
     );
     let status = Span::styled(

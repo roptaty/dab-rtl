@@ -21,6 +21,8 @@ introduce a new crate or upgrade an existing one.
 | `crossterm` | 0.27 | `app` | Cross-platform terminal control | MIT |
 | `cpal` | 0.15 | `audio` | Cross-platform audio output (ALSA) | Apache-2.0 |
 | `symphonia` | 0.5 | `audio` | MP2 / AAC audio decoding | MPL-2.0 |
+| `serde` | 1 | `app` | Serialization framework (Serialize/Deserialize derives) | MIT / Apache-2.0 |
+| `serde_json` | 1 | `app` | JSON serialization for persistent cache file | MIT / Apache-2.0 |
 
 ---
 
