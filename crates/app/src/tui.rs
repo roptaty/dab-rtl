@@ -39,17 +39,32 @@ struct AppState {
     list_state: ListState,
     playing_label: Option<String>,
     status: String,
+    /// `true` while the service list comes from the cache rather than live FIC.
+    cached: bool,
+    /// The channel name — used as the cache key when the user clears the cache.
+    channel: Option<String>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(channel: Option<String>, initial_ensemble: Option<Ensemble>) -> Self {
+        let cached = initial_ensemble.is_some();
+        let ensemble = initial_ensemble.unwrap_or_default();
         let mut list_state = ListState::default();
-        list_state.select(Some(0));
+        if !ensemble.services.is_empty() {
+            list_state.select(Some(0));
+        }
+        let status = if cached {
+            "Loaded from cache — waiting for live signal…".into()
+        } else {
+            "Waiting for signal…".into()
+        };
         AppState {
-            ensemble: Ensemble::default(),
+            ensemble,
             list_state,
             playing_label: None,
-            status: "Waiting for signal…".into(),
+            status,
+            cached,
+            channel,
         }
     }
 
@@ -81,7 +96,15 @@ impl AppState {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Run the TUI until the user presses `q` or `Esc`.
-pub fn run(handle: PipelineHandle) -> io::Result<()> {
+///
+/// `channel` is the Band III channel name used as the cache key.
+/// `initial_ensemble` pre-populates the service list from the cache so it is
+/// visible immediately, before the first live FIC frame is decoded.
+pub fn run(
+    handle: PipelineHandle,
+    channel: Option<String>,
+    initial_ensemble: Option<Ensemble>,
+) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -89,7 +112,7 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, handle);
+    let result = run_loop(&mut terminal, handle, channel, initial_ensemble);
 
     // Always restore terminal.
     disable_raw_mode()?;
@@ -102,8 +125,10 @@ pub fn run(handle: PipelineHandle) -> io::Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     handle: PipelineHandle,
+    channel: Option<String>,
+    initial_ensemble: Option<Ensemble>,
 ) -> io::Result<()> {
-    let mut state = AppState::new();
+    let mut state = AppState::new(channel, initial_ensemble);
     let tick = Duration::from_millis(200);
     let mut last_tick = Instant::now();
 
@@ -115,6 +140,7 @@ fn run_loop(
                     // Preserve selection if possible.
                     let old_sid = state.selected_sid();
                     state.ensemble = ens;
+                    state.cached = false; // live data supersedes cache
                     if state.ensemble.services.is_empty() {
                         state.list_state.select(None);
                     } else {
@@ -159,6 +185,14 @@ fn run_loop(
                         state.playing_label = None;
                         state.status = "Stopped".into();
                     }
+                    KeyCode::Char('X') => {
+                        let mut c = crate::cache::Cache::load();
+                        let path = c.path().to_path_buf();
+                        c.clear();
+                        state.cached = false;
+                        state.status =
+                            format!("Cache cleared ({})", path.display());
+                    }
                     _ => {}
                 }
             }
@@ -197,6 +231,8 @@ fn render(f: &mut Frame, state: &mut AppState) {
 fn render_service_list(f: &mut Frame, state: &mut AppState, area: ratatui::layout::Rect) {
     let ens_title = if state.ensemble.label.is_empty() {
         " Services ".to_string()
+    } else if state.cached {
+        format!(" {} (cached) ", state.ensemble.label)
     } else {
         format!(" {} ", state.ensemble.label)
     };
@@ -271,7 +307,7 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: ratatui::layout::Re
 
 fn render_status_bar(f: &mut Frame, state: &AppState, area: ratatui::layout::Rect) {
     let help = Span::styled(
-        " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [q] Quit ",
+        " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [X] Clear cache  [q] Quit ",
         Style::default().fg(Color::DarkGray),
     );
     let status = Span::styled(

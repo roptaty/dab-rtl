@@ -1,3 +1,4 @@
+mod cache;
 mod countries;
 mod pipeline;
 mod tui;
@@ -64,6 +65,9 @@ enum Command {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
     },
+
+    /// Clear the cached channel/service list
+    ClearCache,
 
     /// Play a specific station (non-interactive)
     Play {
@@ -198,6 +202,7 @@ fn main() {
         Command::ListDevices => cmd_list_devices(),
         Command::ListAudio => cmd_list_audio(),
         Command::ListCountries => countries::print_countries(),
+        Command::ClearCache => cmd_clear_cache(),
         Command::Scan {
             channel,
             country,
@@ -365,6 +370,28 @@ fn scan_single(
                 tag,
             );
         }
+
+        // Save to cache when scanning a real channel (not a file source).
+        // cmd_scan never reads pre-existing cache — it always performs a
+        // fresh scan and then overwrites any stale entry.
+        if let (Some(ch), None) = (channel, file) {
+            let cached = cache::CachedEnsemble {
+                channel: ch.to_uppercase(),
+                ensemble_id: ens.id,
+                ensemble_label: ens.label.clone(),
+                services: ens
+                    .services
+                    .iter()
+                    .map(|s| cache::CachedService {
+                        id: s.id,
+                        label: s.label.clone(),
+                        is_dab_plus: s.is_dab_plus,
+                    })
+                    .collect(),
+            };
+            let mut c = cache::Cache::load();
+            c.put(ch.to_uppercase(), cached);
+        }
     }
 }
 
@@ -380,6 +407,14 @@ fn cmd_tune(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Tuning to {label}…");
 
+    // Pre-populate the TUI from cache so services appear immediately.
+    // This is read-only here — cmd_scan is the only writer.
+    let channel_key = channel.as_deref().map(|c| c.to_uppercase());
+    let initial_ensemble = channel_key.as_deref().and_then(|ch| {
+        let c = cache::Cache::load();
+        c.get(ch).map(|e| e.to_ensemble())
+    });
+
     let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
@@ -390,7 +425,7 @@ fn cmd_tune(
         }
     };
 
-    if let Err(e) = tui::run(handle) {
+    if let Err(e) = tui::run(handle, channel_key, initial_ensemble) {
         eprintln!("TUI error: {e}");
     }
 }
@@ -410,6 +445,19 @@ fn cmd_play(
     let label = source_label(file.as_ref(), channel.as_deref());
     println!("Searching for '{station}' on {label}…  Press Ctrl-C to stop.");
 
+    // Fast path: look the station up in the cache so we can send the Play
+    // command before the FIC decoder has decoded the first ensemble frame.
+    let channel_key = channel.as_deref().map(|c| c.to_uppercase());
+    let cached_sid = channel_key.as_deref().and_then(|ch| {
+        let c = cache::Cache::load();
+        c.get(ch).and_then(|ens| {
+            ens.services
+                .iter()
+                .find(|s| s.label.to_lowercase().contains(&station.to_lowercase()))
+                .map(|s| s.id)
+        })
+    });
+
     let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
@@ -420,7 +468,14 @@ fn cmd_play(
         }
     };
 
-    let mut started = false;
+    // If we found the station in cache, request playback immediately.
+    let mut started = if let Some(sid) = cached_sid {
+        println!("Found in cache — requesting playback immediately");
+        let _ = handle.cmd_tx.try_send(PipelineCmd::Play(sid));
+        true
+    } else {
+        false
+    };
 
     for update in handle.update_rx.iter() {
         match update {
@@ -444,6 +499,14 @@ fn cmd_play(
             }
         }
     }
+}
+
+/// Clear the on-disk service cache.
+fn cmd_clear_cache() {
+    let mut c = cache::Cache::load();
+    let path = c.path().to_path_buf();
+    c.clear();
+    println!("Cache cleared: {}", path.display());
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
