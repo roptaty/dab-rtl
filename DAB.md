@@ -98,7 +98,7 @@ Carriers are transmitted in a scrambled order defined by an LCG (Linear Congruen
 π(j) = (13 × π(j−1) + 511) mod 2048     for j = 1..2047
 ```
 
-The de-interleaver restores logical (coded-bit) order by applying the forward permutation to the soft-bit pairs.
+For Mode I, frequency interleaving is defined by generating the permutation Π over 0…2047, retaining only entries in the range 256…1792 (excluding 1024), preserving order to form dₙ, and then mapping logical index n to carrier index k = dₙ − 1024. The de-interleaver restores logical (coded-bit) order by applying this mapping.
 
 ## 5. Channel Decoding (FEC)
 
@@ -167,7 +167,7 @@ Bit  7   6   5   4   3   2   1   0
     └───────────┴───────────────────┘
 ```
 
-- **type** (bits 7–5): FIG type (0 = MCI/SI, 1 = labels, 5 = FIDC, 6 = CA, 7 = end marker)
+- **type** (bits 7–5): FIG type (0 = MCI/SI, 1 = labels, 5 = FIDC, 6 = CA; other values reserved). End-of-FIB padding is indicated by 0xFF bytes, not a FIG type field.
 - **length** (bits 4–0): number of data bytes that follow this header byte (0–30)
 
 **FIG type 0** — Multiplex Configuration Information (MCI) and Service Information (SI)
@@ -203,7 +203,7 @@ Bit  7   6   5   4   3   2   1   0
 - **OE** (bit 3): other ensemble flag
 - **extension** (bits 2–0): selects the label target (0 = ensemble, 1 = programme service, 4 = service component, …)
 
-Following bytes: identifier for the labelled entity, then 16 bytes of label text (space-padded), then a 2-byte character flag field indicating which of the 16 characters are significant.
+Following bytes: identifier for the labelled entity, then 16 bytes of label text (unused character bytes set to 0x00), then a 2-byte character flag field indicating which of the 16 characters are significant.
 
 Scanning a frequency means:
 1. Tune to the channel
@@ -313,7 +313,7 @@ Programme audio
     │
     ▼  Audio codec
 MP2 encoder (DAB)  or  HE-AAC encoder (DAB+)
-    │  e.g. 128 kbps MP2 = 384 bytes per 96 ms frame
+    │  e.g. 128 kbps MP2 → 1,536 bytes per 96 ms DAB frame (four 384-byte MP2 frames)
     │
     ▼  Channel coding
 Convolutional encoder (K=7, rate 1/4) + puncturing to agreed protection level
@@ -477,10 +477,10 @@ Differential product against PRS reference:
 z[k] = X₁[k] · conj(X_PRS[k])
 
 Example carriers (after de-interleaving, first 4 logical positions):
-  k=0 (logical):  z = (+0.72 + j·0.71)  → phase ≈ +π/4  → bits (0,0)
-  k=1 (logical):  z = (−0.68 + j·0.73)  → phase ≈ +3π/4 → bits (0,1)
-  k=2 (logical):  z = (−0.70 − j·0.69)  → phase ≈ −3π/4 → bits (1,1)
-  k=3 (logical):  z = (+0.71 − j·0.70)  → phase ≈ −π/4  → bits (1,0)
+  n=0 (logical position):  z = (+0.72 + j·0.71)  → phase ≈ +π/4  → bits (0,0)
+  n=1 (logical position):  z = (−0.68 + j·0.73)  → phase ≈ +3π/4 → bits (0,1)
+  n=2 (logical position):  z = (−0.70 − j·0.69)  → phase ≈ −3π/4 → bits (1,1)
+  n=3 (logical position):  z = (+0.71 − j·0.70)  → phase ≈ −π/4  → bits (1,0)
 ```
 
 Soft bits for these 4 carriers: `[+0.71, +0.72, +0.73, −0.68, −0.69, −0.70, −0.70, +0.71, …]`
@@ -532,7 +532,7 @@ Viterbi decoder:  ~21,504 inputs → 1,344 decoded bits = 168 bytes per CIF
 4 CIFs × 168 bytes = 672 bytes per frame
 ```
 
-After energy de-dispersal (PRBS reset each CIF), the 672 bytes form a partial **MPEG-1 Layer II audio frame** (MP2). At 128 kbit/s the full MP2 frame is 768 bytes (48 kHz, 1152 PCM samples), spanning slightly more than one DAB frame — the audio decoder handles the frame boundary.
+After energy de-dispersal (PRBS reset each CIF), the 672 bytes carry the encoded MP2 audio payload. For MPEG-1 Layer II at 48 kHz, one audio frame contains 1,152 samples (24 ms of audio); at 128 kbps that corresponds to 384 bytes per MP2 frame. The 672 bytes per DAB frame carry approximately four complete MP2 frames.
 
 ### Frame Summary
 
@@ -540,11 +540,10 @@ After energy de-dispersal (PRBS reset each CIF), the 672 bytes form a partial **
 One 96 ms DAB frame:
   ├─ 9 FIBs decoded  → ensemble + service metadata refreshed
   └─ 4 CIFs decoded  → 672 bytes MP2 audio data
-                        → ~1,152 PCM stereo samples @ 48 kHz after MP2 decode
-                        → ~24 ms of audio output
+                        → ~4,608 PCM stereo samples @ 48 kHz after MP2 decode
+                          (≈ four 1,152-sample MP2 audio frames of 24 ms each)
+                        → ~96 ms of audio output
 ```
-
-Four frames (384 ms) fill one complete MP2 audio frame, maintaining continuous playback.
 
 ## Example — DAB+
 
@@ -631,15 +630,13 @@ Super-frame (1,920 bytes):
   ├─ 3 bytes:  Fire code header
   ├─ n × 2 bytes:  AU length table  (one 16-bit entry per AU, minus the last)
   └─ AUs packed back-to-back:
-       AU 0:  248 bytes  (HE-AAC frame, 1,024 PCM samples)
-       AU 1:  251 bytes
-       AU 2:  249 bytes
-       AU 3:  250 bytes
-       AU 4:  248 bytes  ← last AU length inferred from super-frame size
+       AU 0:  637 bytes  (HE-AAC frame, 960 samples per channel @ 24 kHz core)
+       AU 1:  641 bytes
+       AU 2:  637 bytes  ← last AU length inferred from super-frame size
        (each AU ends with a 2-byte AU CRC)
 ```
 
-5 AUs × 1,024 PCM samples = **5,120 samples** per super-frame. At 48 kHz: 5,120 / 48,000 ≈ **106.7 ms** of audio per super-frame (5 DAB frames × 96 ms / 4.5 ≈ matches closely when SBR doubles the 24 kHz core rate).
+With a 24 kHz AAC core rate and SBR enabled for 48 kHz output, a DAB+ superframe contains **3 AUs**. Each AU encodes **960 samples per channel** at the 24 kHz core rate (40 ms per AU). SBR replication brings the output to 1,920 samples per channel at 48 kHz per AU. 3 AUs × 40 ms = **120 ms** of audio per super-frame.
 
 ### Step 6 — HE-AAC Decoding
 
@@ -647,25 +644,25 @@ Each AU is passed to the HE-AAC v2 decoder (fdk-aac):
 
 ```
 AU bytes → HE-AAC v2 decoder (core AAC-LC + SBR + PS):
-  Core AAC-LC:  decodes 512 samples @ 24 kHz core rate
-  SBR:          spectral band replication → 1,024 samples @ 48 kHz
+  Core AAC-LC:  decodes 960 samples per channel @ 24 kHz core rate (40 ms)
+  SBR:          spectral band replication → 1,920 samples per channel @ 48 kHz
   PS:           parametric stereo → 2 channels
-Output per AU:  1,024 × 2 ch = 2,048 PCM samples @ 48 kHz
+Output per AU:  1,920 × 2 ch = 3,840 PCM samples @ 48 kHz
 ```
 
 ### Super-frame Summary
 
 ```
-Five 96 ms DAB frames (480 ms total) → one DAB+ audio super-frame:
+Five consecutive logical DAB frames → one DAB+ audio super-frame (120 ms of audio):
   ├─ FIC decoded each frame → ensemble metadata (same as DAB)
   └─ 5 logical frames assembled
        → RS(120,110) outer FEC corrects burst errors
        → Fire code sync confirmed
-       → 5 HE-AAC AUs decoded
-       → 5,120 stereo samples @ 48 kHz  ≈ 106.7 ms audio output
+       → 3 HE-AAC AUs decoded  (24 kHz core + SBR → 48 kHz output)
+       → 5,760 samples per channel @ 48 kHz  = 120 ms audio output
 ```
 
-Compared to DAB, the RS outer code provides an additional error-correction layer on top of Viterbi, making DAB+ significantly more robust at the same transmit power. The tradeoff is a 480 ms minimum latency before the first audio (one full super-frame must be received before HE-AAC decoding can begin).
+Compared to DAB, the RS outer code provides an additional error-correction layer on top of Viterbi, making DAB+ significantly more robust at the same transmit power. The tradeoff is that five consecutive DAB frames (≈ 480 ms of radio time) must be received before the first super-frame can be decoded, though each super-frame then delivers 120 ms of audio.
 
 
 
