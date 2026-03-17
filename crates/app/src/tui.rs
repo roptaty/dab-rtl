@@ -343,8 +343,7 @@ fn run_loop(
                     // never carry dls_text (DLS arrives via packet-mode MSC), so
                     // carry it forward from the previous ensemble by SId.
                     for svc in &mut ens.services {
-                        if let Some(old) = state.ensemble.services.iter().find(|s| s.id == svc.id)
-                        {
+                        if let Some(old) = state.ensemble.services.iter().find(|s| s.id == svc.id) {
                             svc.dls_text = old.dls_text.clone();
                         }
                     }
