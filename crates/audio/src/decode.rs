@@ -270,6 +270,9 @@ pub struct DabPlusDecoder {
     synced: bool,
     /// Persistent fdk-aac decoder (SBR/PS/window state survives across superframes).
     aac: Option<AacState>,
+    /// AU data (without CRC) from the most recently decoded superframe, for PAD
+    /// extraction.  Populated by [`decode_superframe`] and drained by the caller.
+    pub pad_aus: Vec<Vec<u8>>,
 }
 
 impl DabPlusDecoder {
@@ -284,6 +287,7 @@ impl DabPlusDecoder {
             superframe_size,
             synced: false,
             aac: None,
+            pad_aus: Vec::new(),
         }
     }
 
@@ -372,7 +376,11 @@ impl DabPlusDecoder {
     /// - RS parity is stripped (110 data bytes per 120-byte RS codeword)
     /// - AU CRCs are the last 2 bytes within each AU boundary
     /// - Raw AAC AUs are fed via RAW transport (960-sample DAB+ frames)
+    ///
+    /// Populates [`pad_aus`] with the AU bytes (without CRC) from each AU that
+    /// passes its CRC check.  The caller can drain this field for PAD extraction.
     fn decode_superframe(&mut self, data: &[u8]) -> Vec<f32> {
+        self.pad_aus.clear();
         if data.len() < 6 {
             return Vec::new();
         }
@@ -518,6 +526,9 @@ impl DabPlusDecoder {
                 );
                 continue;
             }
+
+            // Collect AU data (without CRC) for PAD extraction by the caller.
+            self.pad_aus.push(au_data.to_vec());
 
             // Feed raw AU data (no ADTS header) to the RAW transport decoder.
             if let Err(e) = aac.decoder.fill(au_data) {

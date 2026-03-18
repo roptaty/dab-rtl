@@ -26,7 +26,7 @@ use fec::ViterbiDecoder;
 use ofdm::OfdmProcessor;
 use protocol::{
     ensemble::{Component, ProtectionLevel},
-    Ensemble, FicHandler,
+    Ensemble, FicHandler, XPadAssembler,
 };
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -162,6 +162,8 @@ fn run_pipeline(
         let mut pending_retune: Option<u32> = None;
         // DLS decoder: decodes the packet-mode DLS subchannel for the playing service.
         let mut dls_msc = MscDecoder::new();
+        // X-PAD DLS assembler: extracts DLS from the audio subchannel itself.
+        let mut xpad = XPadAssembler::new();
         let mut last_dls_text = String::new();
 
         let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
@@ -181,12 +183,14 @@ fn run_pipeline(
                             playing_sid = Some(sid);
                             msc.set_target_sid(sid);
                             dls_msc.set_target_sid(sid);
+                            xpad.reset();
                             last_dls_text.clear();
                         }
                         PipelineCmd::Stop => {
                             playing_sid = None;
                             msc.clear_target();
                             dls_msc.clear_target();
+                            xpad.reset();
                             last_dls_text.clear();
                         }
                         PipelineCmd::Retune(freq_hz) => {
@@ -321,9 +325,61 @@ fn run_pipeline(
                                         dab_plus.set_superframe_size(frame.data.len());
                                     }
                                     let pcm = if frame.is_dab_plus {
-                                        dab_plus.push(&frame.data)
+                                        let pcm = dab_plus.push(&frame.data);
+                                        // Extract X-PAD DLS from each validated AU.
+                                        let n_aus = dab_plus.pad_aus.len();
+                                        if cif_idx == 0 || n_aus > 0 {
+                                            log::debug!(
+                                                "X-PAD DAB+: CIF={} pad_aus={} (pcm_samples={})",
+                                                cif_idx,
+                                                n_aus,
+                                                pcm.len()
+                                            );
+                                        }
+                                        for au_data in dab_plus.pad_aus.drain(..) {
+                                            if let Some(text) = xpad.push_dabplus_au(&au_data) {
+                                                if text != last_dls_text {
+                                                    log::info!(
+                                                        "X-PAD DLS (DAB+): SId={:04X} text={:?}",
+                                                        sid,
+                                                        text
+                                                    );
+                                                    last_dls_text = text.clone();
+                                                    let _ =
+                                                        update_tx.try_send(PipelineUpdate::Dls {
+                                                            sid,
+                                                            text,
+                                                        });
+                                                }
+                                            }
+                                        }
+                                        pcm
                                     } else {
-                                        mp2.push(&frame.data)
+                                        let pcm = mp2.push(&frame.data);
+                                        // Extract X-PAD DLS from the MPEG Layer 2 frames.
+                                        log::debug!(
+                                            "X-PAD DAB (MP2): CIF={} passing {} bytes to X-PAD scanner \
+                                             (first {:02X} {:02X} {:02X} {:02X})",
+                                            cif_idx,
+                                            frame.data.len(),
+                                            frame.data.first().copied().unwrap_or(0),
+                                            frame.data.get(1).copied().unwrap_or(0),
+                                            frame.data.get(2).copied().unwrap_or(0),
+                                            frame.data.get(3).copied().unwrap_or(0),
+                                        );
+                                        if let Some(text) = xpad.push_mp2_bytes(&frame.data) {
+                                            if text != last_dls_text {
+                                                log::info!(
+                                                    "X-PAD DLS (DAB): SId={:04X} text={:?}",
+                                                    sid,
+                                                    text
+                                                );
+                                                last_dls_text = text.clone();
+                                                let _ = update_tx
+                                                    .try_send(PipelineUpdate::Dls { sid, text });
+                                            }
+                                        }
+                                        pcm
                                     };
                                     if pcm.is_empty() {
                                         log::debug!(
@@ -354,19 +410,67 @@ fn run_pipeline(
 
                         // ── DLS packet-mode subchannel ────────────────── //
                         if let Some(sid) = playing_sid {
-                            if let Some(dls_comp) = find_dls_component(&ens_snap, sid) {
-                                if let Some(frame) =
-                                    dls_msc.process_cif(&cif_soft, dls_comp, cif_idx)
-                                {
-                                    if let Some(text) = parse_dls_packets(
-                                        &frame.data,
-                                        dls_comp.packet_address.unwrap_or(0),
-                                    ) {
-                                        if text != last_dls_text {
-                                            log::info!("DLS: SId={:04X} text={:?}", sid, text);
-                                            last_dls_text = text.clone();
-                                            let _ = update_tx
-                                                .try_send(PipelineUpdate::Dls { sid, text });
+                            match find_dls_component(&ens_snap, sid) {
+                                None => {
+                                    if frame_count.is_multiple_of(100) {
+                                        let svc = ens_snap.services.iter().find(|s| s.id == sid);
+                                        log::debug!(
+                                            "DLS: no packet component for SId={:04X} (service found={}, components={:?})",
+                                            sid,
+                                            svc.is_some(),
+                                            svc.map(|s| s.components.iter().map(|c| format!("subchan={} pkt_addr={:?}", c.subchannel_id, c.packet_address)).collect::<Vec<_>>()),
+                                        );
+                                    }
+                                }
+                                Some(dls_comp) => {
+                                    log::debug!(
+                                        "DLS: processing CIF {cif_idx} for SId={:04X} subchan={} pkt_addr={:?}",
+                                        sid,
+                                        dls_comp.subchannel_id,
+                                        dls_comp.packet_address,
+                                    );
+                                    match dls_msc.process_cif(&cif_soft, dls_comp, cif_idx) {
+                                        None => {
+                                            log::debug!("DLS: process_cif returned None (still accumulating)");
+                                        }
+                                        Some(frame) => {
+                                            log::debug!(
+                                                "DLS: decoded frame {} bytes, target_addr={}",
+                                                frame.data.len(),
+                                                dls_comp.packet_address.unwrap_or(0),
+                                            );
+                                            if log::log_enabled!(log::Level::Debug) {
+                                                log::debug!(
+                                                    "DLS: frame hex={}",
+                                                    frame
+                                                        .data
+                                                        .iter()
+                                                        .map(|b| format!("{b:02X}"))
+                                                        .collect::<Vec<_>>()
+                                                        .join(" ")
+                                                );
+                                            }
+                                            match parse_dls_packets(
+                                                &frame.data,
+                                                dls_comp.packet_address.unwrap_or(0),
+                                            ) {
+                                                None => {
+                                                    log::debug!("DLS: parse_dls_packets returned None (no matching packet / bad command)");
+                                                }
+                                                Some(text) => {
+                                                    if text != last_dls_text {
+                                                        log::info!(
+                                                            "DLS: SId={:04X} text={:?}",
+                                                            sid,
+                                                            text
+                                                        );
+                                                        last_dls_text = text.clone();
+                                                        let _ = update_tx.try_send(
+                                                            PipelineUpdate::Dls { sid, text },
+                                                        );
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
