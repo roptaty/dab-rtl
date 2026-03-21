@@ -26,7 +26,7 @@ use fec::ViterbiDecoder;
 use ofdm::OfdmProcessor;
 use protocol::{
     ensemble::{Component, ProtectionLevel},
-    Ensemble, FicHandler,
+    Ensemble, FicHandler, XPadAssembler,
 };
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -39,9 +39,11 @@ pub enum PipelineUpdate {
     /// Ensemble info refreshed (new service labels etc.).
     Ensemble(Ensemble),
     /// Successfully started playing a service.
-    Playing { label: String },
+    Playing { sid: u32, label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
+    /// DLS (Dynamic Label Segment) text updated for a service.
+    Dls { sid: u32, text: String },
 }
 
 /// Commands sent to the pipeline background thread.
@@ -50,6 +52,9 @@ pub enum PipelineCmd {
     Play(u32),
     /// Stop playback (keep scanning FIC).
     Stop,
+    /// Retune to a new centre frequency (Hz). Resets OFDM/FIC state.
+    /// Only effective when the pipeline was started via `start_for_device`.
+    Retune(u32),
 }
 
 /// Handle to the running pipeline.  Drop to stop all background threads.
@@ -63,6 +68,9 @@ pub struct PipelineHandle {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Start the receive pipeline from a pre-opened IQ stream.
+///
+/// This variant does not support `PipelineCmd::Retune`; retune commands are
+/// silently ignored.  Use `start_for_device` for retune support.
 pub fn start_with_stream(
     stream: sdr::SdrStream,
     audio_device: Option<String>,
@@ -85,7 +93,38 @@ pub fn start_with_stream(
             if let Some(ref ao) = audio_out {
                 ao.play();
             }
-            run_pipeline(stream, audio_out, update_tx, cmd_rx);
+            run_pipeline(stream, None, audio_out, update_tx, cmd_rx);
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(PipelineHandle { update_rx, cmd_tx })
+}
+
+/// Start the receive pipeline from a live RTL-SDR device.
+///
+/// Unlike `start_with_stream`, this variant supports `PipelineCmd::Retune`:
+/// the pipeline will close the current stream and re-open the device at the
+/// new frequency, resetting all OFDM / FIC state.
+pub fn start_for_device(
+    config: sdr::DeviceConfig,
+    audio_device: Option<String>,
+) -> Result<PipelineHandle, String> {
+    let stream = sdr::open_stream(config.clone(), 32_768).map_err(|e| e.to_string())?;
+
+    let (update_tx, update_rx) = mpsc::sync_channel::<PipelineUpdate>(32);
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipelineCmd>(8);
+    let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+
+    thread::Builder::new()
+        .name("pipeline".into())
+        .spawn(move || {
+            let audio_out = audio::AudioOutput::open(audio_device.as_deref(), 48_000, 2)
+                .map_err(|e| log::warn!("audio open failed: {e}"))
+                .ok();
+            if let Some(ref ao) = audio_out {
+                ao.play();
+            }
+            run_pipeline(stream, Some(config), audio_out, update_tx, cmd_rx);
         })
         .map_err(|e| e.to_string())?;
 
@@ -97,195 +136,387 @@ pub fn start_with_stream(
 // ─────────────────────────────────────────────────────────────────────────── //
 
 fn run_pipeline(
-    stream: sdr::SdrStream,
+    initial_stream: sdr::SdrStream,
+    device_config: Option<sdr::DeviceConfig>,
     audio_out: Option<audio::AudioOutput>,
     update_tx: mpsc::SyncSender<PipelineUpdate>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<PipelineCmd>>>,
 ) {
-    let mut ofdm = OfdmProcessor::new();
-    let mut fic = FicDecoder::new();
-    let mut msc = MscDecoder::new();
-    let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
-    let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
-
-    // Currently selected SId (None = scan-only).
+    let mut stream = initial_stream;
+    // Currently selected SId (None = scan-only).  Preserved across retunes.
     let mut playing_sid: Option<u32> = None;
-    let mut last_ens_label = String::new();
-    let mut last_svc_count = 0usize;
-    let mut last_svc_labels = String::new();
-    let mut frame_count = 0u64;
+    // Track the current centre frequency so ensemble snapshots carry it.
+    let mut current_freq_hz: u32 = device_config.as_ref().map_or(0, |c| c.center_freq_hz);
 
-    let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
+    'pipeline: loop {
+        let mut ofdm = OfdmProcessor::new();
+        let mut fic = FicDecoder::new();
+        let mut msc = MscDecoder::new();
+        let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
+        let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
 
-    for iq_buf in stream.rx.iter() {
-        // Drain any pending commands.
-        if let Ok(guard) = cmd_rx.try_lock() {
-            while let Ok(cmd) = guard.try_recv() {
-                match cmd {
-                    PipelineCmd::Play(sid) => {
-                        playing_sid = Some(sid);
-                        msc.set_target_sid(sid);
-                    }
-                    PipelineCmd::Stop => {
-                        playing_sid = None;
-                        msc.clear_target();
-                    }
-                }
-            }
+        let mut last_ens_label = String::new();
+        let mut last_svc_count = 0usize;
+        let mut last_svc_labels = String::new();
+        let mut frame_count = 0u64;
+        let mut pending_retune: Option<u32> = None;
+        // DLS decoder: decodes the packet-mode DLS subchannel for the playing service.
+        let mut dls_msc = MscDecoder::new();
+        // X-PAD DLS assembler: extracts DLS from the audio subchannel itself.
+        let mut xpad = XPadAssembler::new();
+        let mut last_dls_text = String::new();
+
+        let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
+
+        // Restore playing state if we re-tuned to the same channel.
+        if let Some(sid) = playing_sid {
+            msc.set_target_sid(sid);
+            dls_msc.set_target_sid(sid);
         }
 
-        // OFDM demodulation.
-        for frame in ofdm.push_samples(&iq_buf) {
-            frame_count += 1;
-            log::debug!("Pipeline: OFDM frame #{}", frame_count);
-
-            // ── FIC (symbols 0-2) ────────────────────────────────────────── //
-            fic.begin_frame();
-            let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
-            for sym in fic_symbols {
-                fic.process_symbol(sym);
+        'stream: for iq_buf in stream.rx.iter() {
+            // Drain any pending commands.
+            if let Ok(guard) = cmd_rx.try_lock() {
+                while let Ok(cmd) = guard.try_recv() {
+                    match cmd {
+                        PipelineCmd::Play(sid) => {
+                            playing_sid = Some(sid);
+                            msc.set_target_sid(sid);
+                            dls_msc.set_target_sid(sid);
+                            xpad.reset();
+                            last_dls_text.clear();
+                        }
+                        PipelineCmd::Stop => {
+                            playing_sid = None;
+                            msc.clear_target();
+                            dls_msc.clear_target();
+                            xpad.reset();
+                            last_dls_text.clear();
+                        }
+                        PipelineCmd::Retune(freq_hz) => {
+                            pending_retune = Some(freq_hz);
+                        }
+                    }
+                }
             }
 
-            // Propagate ensemble changes to the TUI.
-            let ens = fic.handler.ensemble();
-            // Build a fingerprint of service labels so we detect when labels
-            // arrive (they come in separate FIG messages after services appear).
-            let svc_labels: String = ens
-                .services
-                .iter()
-                .map(|s| format!("{:04X}:{}", s.id, s.label))
-                .collect::<Vec<_>>()
-                .join(",");
-            if ens.label != last_ens_label
-                || ens.services.len() != last_svc_count
-                || svc_labels != last_svc_labels
-            {
-                last_ens_label = ens.label.clone();
-                last_svc_count = ens.services.len();
-                last_svc_labels = svc_labels;
-                log::info!(
-                    "Ensemble: id={:04X} label={:?} services={}",
-                    ens.id,
-                    ens.label,
-                    ens.services.len()
-                );
-                for svc in &ens.services {
+            if pending_retune.is_some() {
+                break 'stream;
+            }
+
+            // OFDM demodulation.
+            for frame in ofdm.push_samples(&iq_buf) {
+                frame_count += 1;
+                log::debug!("Pipeline: OFDM frame #{}", frame_count);
+
+                // ── FIC (symbols 0-2) ────────────────────────────────────────── //
+                fic.begin_frame();
+                let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
+                for sym in fic_symbols {
+                    fic.process_symbol(sym);
+                }
+
+                // Propagate ensemble changes to the TUI.
+                let ens = fic.handler.ensemble();
+                // Build a fingerprint of service labels so we detect when labels
+                // arrive (they come in separate FIG messages after services appear).
+                let svc_labels: String = ens
+                    .services
+                    .iter()
+                    .map(|s| format!("{:04X}:{}", s.id, s.label))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                if ens.label != last_ens_label
+                    || ens.services.len() != last_svc_count
+                    || svc_labels != last_svc_labels
+                {
+                    last_ens_label = ens.label.clone();
+                    last_svc_count = ens.services.len();
+                    last_svc_labels = svc_labels;
                     log::info!(
-                        "  Service: id={:04X} label={:?} dab+={} components={}",
-                        svc.id,
-                        svc.label,
-                        svc.is_dab_plus,
-                        svc.components.len()
+                        "Ensemble: id={:04X} label={:?} services={}",
+                        ens.id,
+                        ens.label,
+                        ens.services.len()
                     );
-                    for comp in &svc.components {
+                    for svc in &ens.services {
                         log::info!(
-                            "    Component: subch={} start={} size={} prot={:?}",
-                            comp.subchannel_id,
-                            comp.start_address,
-                            comp.size,
-                            comp.protection
+                            "  Service: id={:04X} label={:?} dab+={} components={}",
+                            svc.id,
+                            svc.label,
+                            svc.is_dab_plus,
+                            svc.components.len()
                         );
-                    }
-                }
-                let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens.clone()));
-                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
-                    "Locked — {} services",
-                    ens.services.len()
-                )));
-            }
-
-            // Announce when we start playing.
-            if let Some(sid) = playing_sid {
-                if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
-                    let _ = update_tx.try_send(PipelineUpdate::Playing {
-                        label: svc.label.clone(),
-                    });
-                }
-            }
-
-            // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
-            if playing_sid.is_some() {
-                let ens_snap = ens.clone();
-                let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
-
-                for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
-                    if cif_syms.len() < 18 {
-                        continue;
-                    }
-                    // Flatten CIF symbols → 55296 soft bits.
-                    let cif_soft: Vec<f32> =
-                        cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
-
-                    if let Some(sid) = playing_sid {
-                        let component = find_component(&ens_snap, sid);
-                        if component.is_none() && cif_idx == 0 {
-                            log::debug!(
-                                "MSC: no component found for SId {:04X} (service has {} components)",
-                                sid,
-                                ens_snap
-                                    .services
-                                    .iter()
-                                    .find(|s| s.id == sid)
-                                    .map_or(0, |s| s.components.len())
+                        for comp in &svc.components {
+                            log::info!(
+                                "    Component: subch={} start={} size={} prot={:?}",
+                                comp.subchannel_id,
+                                comp.start_address,
+                                comp.size,
+                                comp.protection
                             );
                         }
-                        if let Some(component) = component {
-                            if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx) {
+                    }
+                    let mut ens_snapshot = ens.clone();
+                    ens_snapshot.freq_hz = current_freq_hz;
+                    let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens_snapshot));
+                    let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                        "Locked — {} services",
+                        ens.services.len()
+                    )));
+                }
+
+                // Announce when we start playing.
+                if let Some(sid) = playing_sid {
+                    if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
+                        let _ = update_tx.try_send(PipelineUpdate::Playing {
+                            sid,
+                            label: svc.label.clone(),
+                        });
+                    }
+                }
+
+                // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
+                if playing_sid.is_some() {
+                    let ens_snap = ens.clone();
+                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+
+                    for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
+                        if cif_syms.len() < 18 {
+                            continue;
+                        }
+                        // Flatten CIF symbols → 55296 soft bits.
+                        let cif_soft: Vec<f32> =
+                            cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
+
+                        if let Some(sid) = playing_sid {
+                            let component = find_component(&ens_snap, sid);
+                            if component.is_none() && cif_idx == 0 {
                                 log::debug!(
-                                    "MSC: CIF {} subchannel {} → {} bytes ({})",
-                                    cif_idx,
-                                    frame.subchannel_id,
-                                    frame.data.len(),
-                                    if frame.is_dab_plus { "DAB+" } else { "DAB" }
+                                    "MSC: no component found for SId {:04X} (service has {} components)",
+                                    sid,
+                                    ens_snap
+                                        .services
+                                        .iter()
+                                        .find(|s| s.id == sid)
+                                        .map_or(0, |s| s.components.len())
                                 );
-                                // Set DAB+ superframe size from actual Viterbi output.
-                                if frame.is_dab_plus
-                                    && !frame.data.is_empty()
-                                    && dab_plus.superframe_size != frame.data.len()
+                            }
+                            if let Some(component) = component {
+                                if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx)
                                 {
-                                    log::info!(
-                                        "DAB+: setting per-CIF size to {} bytes (was {})",
+                                    log::debug!(
+                                        "MSC: CIF {} subchannel {} → {} bytes ({})",
+                                        cif_idx,
+                                        frame.subchannel_id,
                                         frame.data.len(),
-                                        dab_plus.superframe_size
+                                        if frame.is_dab_plus { "DAB+" } else { "DAB" }
                                     );
-                                    dab_plus.set_superframe_size(frame.data.len());
+                                    // Set DAB+ superframe size from actual Viterbi output.
+                                    if frame.is_dab_plus
+                                        && !frame.data.is_empty()
+                                        && dab_plus.superframe_size != frame.data.len()
+                                    {
+                                        log::info!(
+                                            "DAB+: setting per-CIF size to {} bytes (was {})",
+                                            frame.data.len(),
+                                            dab_plus.superframe_size
+                                        );
+                                        dab_plus.set_superframe_size(frame.data.len());
+                                    }
+                                    let pcm = if frame.is_dab_plus {
+                                        let pcm = dab_plus.push(&frame.data);
+                                        // Extract X-PAD DLS from each validated AU.
+                                        let n_aus = dab_plus.pad_aus.len();
+                                        if cif_idx == 0 || n_aus > 0 {
+                                            log::debug!(
+                                                "X-PAD DAB+: CIF={} pad_aus={} (pcm_samples={})",
+                                                cif_idx,
+                                                n_aus,
+                                                pcm.len()
+                                            );
+                                        }
+                                        for au_data in dab_plus.pad_aus.drain(..) {
+                                            if let Some(text) = xpad.push_dabplus_au(&au_data) {
+                                                if text != last_dls_text {
+                                                    log::info!(
+                                                        "X-PAD DLS (DAB+): SId={:04X} text={:?}",
+                                                        sid,
+                                                        text
+                                                    );
+                                                    last_dls_text = text.clone();
+                                                    let _ =
+                                                        update_tx.try_send(PipelineUpdate::Dls {
+                                                            sid,
+                                                            text,
+                                                        });
+                                                }
+                                            }
+                                        }
+                                        pcm
+                                    } else {
+                                        let pcm = mp2.push(&frame.data);
+                                        // Extract X-PAD DLS from the MPEG Layer 2 frames.
+                                        log::debug!(
+                                            "X-PAD DAB (MP2): CIF={} passing {} bytes to X-PAD scanner \
+                                             (first {:02X} {:02X} {:02X} {:02X})",
+                                            cif_idx,
+                                            frame.data.len(),
+                                            frame.data.first().copied().unwrap_or(0),
+                                            frame.data.get(1).copied().unwrap_or(0),
+                                            frame.data.get(2).copied().unwrap_or(0),
+                                            frame.data.get(3).copied().unwrap_or(0),
+                                        );
+                                        if let Some(text) = xpad.push_mp2_bytes(&frame.data) {
+                                            if text != last_dls_text {
+                                                log::info!(
+                                                    "X-PAD DLS (DAB): SId={:04X} text={:?}",
+                                                    sid,
+                                                    text
+                                                );
+                                                last_dls_text = text.clone();
+                                                let _ = update_tx
+                                                    .try_send(PipelineUpdate::Dls { sid, text });
+                                            }
+                                        }
+                                        pcm
+                                    };
+                                    if pcm.is_empty() {
+                                        log::debug!(
+                                            "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
+                                        );
+                                    } else if let Some(ao) = &audio_out {
+                                        let (min, max) = pcm
+                                            .iter()
+                                            .fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
+                                                (lo.min(s), hi.max(s))
+                                            });
+                                        log::debug!(
+                                            "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
+                                            pcm.len(),
+                                            min,
+                                            max
+                                        );
+                                        ao.write_samples(&pcm);
+                                    } else {
+                                        log::debug!(
+                                            "MSC: {} PCM samples ready but no audio device",
+                                            pcm.len()
+                                        );
+                                    }
                                 }
-                                let pcm = if frame.is_dab_plus {
-                                    dab_plus.push(&frame.data)
-                                } else {
-                                    mp2.push(&frame.data)
-                                };
-                                if pcm.is_empty() {
+                            }
+                        }
+
+                        // ── DLS packet-mode subchannel ────────────────── //
+                        if let Some(sid) = playing_sid {
+                            match find_dls_component(&ens_snap, sid) {
+                                None => {
+                                    if frame_count.is_multiple_of(100) {
+                                        let svc = ens_snap.services.iter().find(|s| s.id == sid);
+                                        log::debug!(
+                                            "DLS: no packet component for SId={:04X} (service found={}, components={:?})",
+                                            sid,
+                                            svc.is_some(),
+                                            svc.map(|s| s.components.iter().map(|c| format!("subchan={} pkt_addr={:?}", c.subchannel_id, c.packet_address)).collect::<Vec<_>>()),
+                                        );
+                                    }
+                                }
+                                Some(dls_comp) => {
                                     log::debug!(
-                                        "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
+                                        "DLS: processing CIF {cif_idx} for SId={:04X} subchan={} pkt_addr={:?}",
+                                        sid,
+                                        dls_comp.subchannel_id,
+                                        dls_comp.packet_address,
                                     );
-                                } else if let Some(ao) = &audio_out {
-                                    let (min, max) =
-                                        pcm.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
-                                            (lo.min(s), hi.max(s))
-                                        });
-                                    log::debug!(
-                                        "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
-                                        pcm.len(),
-                                        min,
-                                        max
-                                    );
-                                    ao.write_samples(&pcm);
-                                } else {
-                                    log::debug!(
-                                        "MSC: {} PCM samples ready but no audio device",
-                                        pcm.len()
-                                    );
+                                    match dls_msc.process_cif(&cif_soft, dls_comp, cif_idx) {
+                                        None => {
+                                            log::debug!("DLS: process_cif returned None (still accumulating)");
+                                        }
+                                        Some(frame) => {
+                                            log::debug!(
+                                                "DLS: decoded frame {} bytes, target_addr={}",
+                                                frame.data.len(),
+                                                dls_comp.packet_address.unwrap_or(0),
+                                            );
+                                            if log::log_enabled!(log::Level::Debug) {
+                                                log::debug!(
+                                                    "DLS: frame hex={}",
+                                                    frame
+                                                        .data
+                                                        .iter()
+                                                        .map(|b| format!("{b:02X}"))
+                                                        .collect::<Vec<_>>()
+                                                        .join(" ")
+                                                );
+                                            }
+                                            match parse_dls_packets(
+                                                &frame.data,
+                                                dls_comp.packet_address.unwrap_or(0),
+                                            ) {
+                                                None => {
+                                                    log::debug!("DLS: parse_dls_packets returned None (no matching packet / bad command)");
+                                                }
+                                                Some(text) => {
+                                                    if text != last_dls_text {
+                                                        log::info!(
+                                                            "DLS: SId={:04X} text={:?}",
+                                                            sid,
+                                                            text
+                                                        );
+                                                        last_dls_text = text.clone();
+                                                        let _ = update_tx.try_send(
+                                                            PipelineUpdate::Dls { sid, text },
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-    }
+        } // end 'stream: for iq_buf
 
-    log::info!("pipeline: IQ stream ended, thread exiting");
+        // Handle retune: drop the old stream and open a new one at the new frequency.
+        match pending_retune.take() {
+            Some(freq_hz) if device_config.is_some() => {
+                let cfg = device_config.as_ref().unwrap();
+                let new_cfg = sdr::DeviceConfig {
+                    center_freq_hz: freq_hz,
+                    ..cfg.clone()
+                };
+                log::info!("pipeline: retuning to {:.3} MHz", freq_hz as f64 / 1e6);
+                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                    "Retuning to {:.3} MHz…",
+                    freq_hz as f64 / 1e6
+                )));
+                // Drop the old stream so the USB device is released before reopening.
+                drop(stream);
+                match sdr::open_stream(new_cfg, 32_768) {
+                    Ok(new_stream) => {
+                        stream = new_stream;
+                        current_freq_hz = freq_hz;
+                        continue 'pipeline;
+                    }
+                    Err(e) => {
+                        log::error!("pipeline: retune failed: {e}");
+                        let _ = update_tx
+                            .try_send(PipelineUpdate::Status(format!("Retune failed: {e}")));
+                        break 'pipeline;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        break 'pipeline; // stream ended naturally
+    } // end 'pipeline: loop
+
+    log::info!("pipeline: thread exiting");
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -308,6 +539,12 @@ pub struct FicDecoder {
     pub handler: FicHandler,
     /// Accumulation buffer for FIC soft bits across OFDM symbols.
     fic_buf: Vec<f32>,
+}
+
+impl Default for FicDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FicDecoder {
@@ -436,6 +673,12 @@ pub struct MscDecoder {
     deint_count: usize,
     /// Expected subchannel soft-bit count per CIF (reset on subchannel change).
     deint_bits_per_cif: usize,
+}
+
+impl Default for MscDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MscDecoder {
@@ -605,6 +848,78 @@ fn find_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
         .first()
 }
 
+/// Find the DLS packet-mode component for a service (has a packet address).
+fn find_dls_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
+    ens.services
+        .iter()
+        .find(|s| s.id == sid)?
+        .components
+        .iter()
+        .find(|c| c.packet_address.is_some())
+}
+
+/// Parse MSC packets from decoded subchannel bytes and extract DLS text.
+///
+/// MSC packet header (ETSI EN 300 401 §5.3.2.1, 3 bytes):
+///   Byte 0: Packet_length[7:6] | Continuity_index[5:4] | First_last[3:2] | Address[9:8]
+///   Byte 1: Address[7:0]
+///   Byte 2: Command_flag[7] | Useful_data_length[6:0]
+///
+/// DLS command (ETSI TS 102 980):
+///   Byte 0 of useful data: command tag (0x01 = Set DL)
+///   Byte 1: Charset[7:4] | Toggle[3] | Item_Running[2] | rfa[1:0]
+///   Bytes 2+: label text (EBU Latin or UTF-8 per charset)
+fn parse_dls_packets(data: &[u8], target_address: u16) -> Option<String> {
+    let mut pos = 0usize;
+    while pos + 3 <= data.len() {
+        let packet_length = (data[pos] >> 6) & 0x03;
+        let packet_size = 24 * (packet_length as usize + 1);
+        let address = (((data[pos] & 0x03) as u16) << 8) | data[pos + 1] as u16;
+        let useful_data_len = (data[pos + 2] & 0x7F) as usize;
+
+        if pos + packet_size > data.len() {
+            break;
+        }
+
+        if address == target_address && useful_data_len >= 2 {
+            // Useful data lives between the 3-byte header and the 2-byte CRC.
+            let data_start = pos + 3;
+            let data_end = (pos + packet_size - 2).min(data_start + useful_data_len);
+            if data_end > data_start {
+                let useful = &data[data_start..data_end];
+                if useful.first() == Some(&0x01) && useful.len() >= 2 {
+                    // Set DL command
+                    let charset = (useful[1] >> 4) & 0x0F;
+                    let text_bytes = &useful[2..];
+                    // Strip trailing null padding.
+                    let trimmed: Vec<u8> =
+                        text_bytes.iter().copied().take_while(|&b| b != 0).collect();
+                    if !trimmed.is_empty() {
+                        let text = if charset == 0x06 {
+                            // UTF-8
+                            String::from_utf8_lossy(&trimmed).trim().to_string()
+                        } else {
+                            // EBU Latin (treat non-ASCII as '?')
+                            trimmed
+                                .iter()
+                                .map(|&b| if b < 0x80 { b as char } else { '?' })
+                                .collect::<String>()
+                                .trim()
+                                .to_string()
+                        };
+                        if !text.is_empty() {
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+        }
+
+        pos += packet_size;
+    }
+    None
+}
+
 /// Quick FIB CRC-16/CCITT check for debug logging.
 fn fib_crc_check(fib: &[u8]) -> bool {
     if fib.len() < 32 {
@@ -709,6 +1024,7 @@ mod tests {
             start_address: 0,
             size: 60,
             protection: ProtectionLevel::EepA(3),
+            packet_address: None,
         };
 
         // Encode known data through rate-1/4 convolutional encoder
@@ -815,6 +1131,7 @@ mod tests {
             start_address: 0,
             size: 4,
             protection: ProtectionLevel::EepA(2),
+            packet_address: None,
         };
         let cif = vec![1.0f32; 55296];
         assert!(dec.process_cif(&cif, &comp, 0).is_none());
@@ -1787,6 +2104,7 @@ mod tests {
                             start_address: comp.start_address,
                             size: comp.size,
                             protection: ProtectionLevel::EepA(eep_level),
+                            packet_address: None,
                         };
                         let depunct = eep_depuncture(&normalized, &test_comp);
                         let bits = vit.decode(&depunct);
@@ -1862,6 +2180,7 @@ mod tests {
                         start_address: comp.start_address,
                         size: comp.size,
                         protection: ProtectionLevel::EepA(eep_level),
+                        packet_address: None,
                     };
                     let depunct = eep_depuncture(&normalized, &test_comp);
                     let (_, metric) = vit.decode_with_metric(&depunct);

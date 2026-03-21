@@ -10,6 +10,8 @@ pub struct Ensemble {
     pub country_id: u8,
     /// Services carried in this ensemble.
     pub services: Vec<Service>,
+    /// Tuner centre frequency in Hz (0 = unknown).
+    pub freq_hz: u32,
 }
 
 impl Ensemble {
@@ -41,6 +43,8 @@ pub struct Service {
     pub is_dab_plus: bool,
     /// Service components (audio/data subchannels).
     pub components: Vec<Component>,
+    /// Dynamic Label Segment text (from MSC data packets), if received.
+    pub dls_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +57,9 @@ pub struct Component {
     /// Size of the subchannel in Capacity Units (1 CU = 64 bits).
     pub size: u16,
     pub protection: ProtectionLevel,
+    /// 10-bit packet address for packet-mode components (FIG 0/3).
+    /// `None` for stream-mode (audio) components.
+    pub packet_address: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

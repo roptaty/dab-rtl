@@ -23,6 +23,11 @@ pub fn channels_for_country(code: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Return a list of all supported countries as `(iso_code, display_name, channels)` triples.
+pub fn country_list() -> &'static [(&'static str, &'static str, &'static [&'static str])] {
+    COUNTRY_TABLE
+}
+
 /// Print a formatted list of all supported countries.
 pub fn print_countries() {
     println!("{:<6}  Country", "Code");
@@ -68,7 +73,7 @@ static COUNTRY_TABLE: &[(&str, &str, &[&str])] = &[
 //  13A   230.784 MHz  – Finnmark
 
 static NORWAY: &[&str] = &[
-    "5A", "7B", "7D", "8A", "9A", "9C", "10B", "11A", "11D", "12A", "12C", "12D", "13A",
+    "5A", "7B", "7D", "8A", "9A", "9C", "10B", "11A", "11D", "12A", "12C", "12D", "13A", "13B",
 ];
 
 // ─── United Kingdom ───────────────────────────────────────────────────────── //

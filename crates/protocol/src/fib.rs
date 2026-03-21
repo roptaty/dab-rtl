@@ -176,6 +176,7 @@ impl FibParser {
             0 => self.parse_fig_0_0(payload),
             1 => self.parse_fig_0_1(payload),
             2 => self.parse_fig_0_2(payload),
+            3 => self.parse_fig_0_3(payload),
             _ => {}
         }
     }
@@ -335,6 +336,7 @@ impl FibParser {
                         start_address,
                         size,
                         protection,
+                        packet_address: None,
                     });
                 }
                 log::debug!(
@@ -345,6 +347,59 @@ impl FibParser {
                     ascty
                 );
             }
+        }
+    }
+
+    /// FIG 0/3 — Service component in packet mode (ETSI EN 300 401 §6.3.2).
+    ///
+    /// Provides SubChId and PacketAddress for packet-mode service components.
+    /// Each entry (P/D=0, 16-bit SId) is 6 bytes:
+    ///   Bytes 0-1: SId [15:0]
+    ///   Byte  2:   SCIdS[7:4] | BackwardLink[3] | Toggle[2] | rfa[1:0]
+    ///   Byte  3:   SubChId[7:2] | DSCTy_high[1:0]
+    ///   Byte  4:   DSCTy_low[7:4] | PacketAddress_high[3:0]
+    ///   Byte  5:   PacketAddress_low[7:2] | CA_flag[1] | DG_flag[0]
+    fn parse_fig_0_3(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+        while i + 6 <= data.len() {
+            let sid = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            let sub_ch_id = (data[i + 3] >> 2) & 0x3F;
+            let packet_address = (((data[i + 4] & 0x0F) as u16) << 6) | ((data[i + 5] >> 2) as u16);
+
+            let svc = self.ensemble.get_or_insert_service(sid);
+            // Find the component with this subchannel and set its packet address.
+            if let Some(comp) = svc
+                .components
+                .iter_mut()
+                .find(|c| c.subchannel_id == sub_ch_id)
+            {
+                comp.packet_address = Some(packet_address);
+                comp.service_type = crate::ensemble::ServiceType::Data;
+            } else {
+                // FIG 0/3 may arrive before FIG 0/2; insert a skeleton component.
+                let (start_address, size, protection) =
+                    if let Some(info) = self.subchannels.get(&sub_ch_id) {
+                        (info.start_address, info.size, info.protection.clone())
+                    } else {
+                        (0, 0, Default::default())
+                    };
+                svc.components.push(crate::ensemble::Component {
+                    subchannel_id: sub_ch_id,
+                    service_type: crate::ensemble::ServiceType::Data,
+                    start_address,
+                    size,
+                    protection,
+                    packet_address: Some(packet_address),
+                });
+            }
+
+            log::debug!(
+                "FIG 0/3: SId={:04X} SubChId={} PacketAddr={}",
+                sid,
+                sub_ch_id,
+                packet_address
+            );
+            i += 6;
         }
     }
 
@@ -543,6 +598,7 @@ mod tests {
             start_address: 0,
             size: 0,
             protection: Default::default(),
+            packet_address: None,
         });
 
         // FIG 0/1 long form: SubChId=5, StartAddr=100, Option=0 (EEP-A),
@@ -573,6 +629,7 @@ mod tests {
             start_address: 0,
             size: 0,
             protection: Default::default(),
+            packet_address: None,
         });
 
         // Short form: SubChId=10, StartAddr=50, TableIndex=15 (64kbit/s lvl4, 42 CU)
