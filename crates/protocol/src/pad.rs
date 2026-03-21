@@ -11,8 +11,10 @@
 /// For DAB (MP2): F-PAD is the last 2 bytes of each MPEG Layer 2 frame;
 /// X-PAD bytes precede it within the frame's ancillary data area.
 ///
-/// For DAB+ (HE-AAC): F-PAD is the last 2 bytes of each Access Unit before
-/// the 2-byte AU CRC; X-PAD bytes precede it within the AU.
+/// For DAB+ (HE-AAC): PAD is carried in a `data_stream_element()` (DSE,
+/// SYN_ELE = 0b100) at the very start of the AU's `raw_data_block()`
+/// (ETSI TS 102 563 §5.4.3).  F-PAD is the last 2 bytes of the DSE payload;
+/// X-PAD precedes F-PAD within the DSE payload.
 use std::collections::BTreeMap;
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -148,27 +150,28 @@ impl XPadAssembler {
     /// Process one DAB+ Access Unit (without its 2-byte CRC) and return DLS
     /// text if a complete label was received.
     ///
-    /// F-PAD occupies the last 2 bytes of `au_data`; X-PAD (if present)
-    /// occupies the bytes immediately before F-PAD.
+    /// Per ETSI TS 102 563 §5.4.3, PAD data is carried in a
+    /// `data_stream_element()` (DSE) at the beginning of the AU.  F-PAD
+    /// occupies the last 2 bytes of the DSE payload; X-PAD (if present)
+    /// occupies the preceding bytes of the DSE payload.
     pub fn push_dabplus_au(&mut self, au_data: &[u8]) -> Option<String> {
-        if au_data.len() < 2 {
-            log::debug!("X-PAD DAB+: AU too short ({} bytes)", au_data.len());
+        let pad = extract_dab_plus_pad(au_data)?;
+        if pad.len() < 2 {
+            log::debug!(
+                "X-PAD DAB+: DSE PAD payload too short ({} bytes)",
+                pad.len()
+            );
             return None;
         }
-        let fpad = [au_data[au_data.len() - 2], au_data[au_data.len() - 1]];
-        let tail_start = au_data.len().saturating_sub(20);
-        let tail: Vec<String> = au_data[tail_start..]
-            .iter()
-            .map(|b| format!("{b:02X}"))
-            .collect();
+        let fpad = [pad[pad.len() - 2], pad[pad.len() - 1]];
         log::debug!(
-            "X-PAD DAB+: AU {} bytes, F-PAD=[{:02X} {:02X}], last 20 bytes: [{}]",
+            "X-PAD DAB+: AU {} bytes, DSE PAD {} bytes, F-PAD=[{:02X} {:02X}]",
             au_data.len(),
+            pad.len(),
             fpad[0],
             fpad[1],
-            tail.join(" ")
         );
-        self.process_fpad_xpad(&au_data[..au_data.len() - 2], fpad)
+        self.process_fpad_xpad(&pad[..pad.len() - 2], fpad)
     }
 
     // ──────────────────────────────────────────────────────────────────────── //
@@ -181,16 +184,19 @@ impl XPadAssembler {
     /// `xpad_area` is every byte *before* F-PAD in the audio frame / AU.
     /// `fpad` is the 2-byte Fixed PAD [byte0, byte1].
     fn process_fpad_xpad(&mut self, xpad_area: &[u8], fpad: [u8; 2]) -> Option<String> {
-        // F-PAD byte 0:
-        //   bits 7-6 = X-PAD type: 00=none, 01=short, 10=variable, 11=none
-        //   bit  5   = CI flag (1 = Content Indicator list present)
-        let xpad_type = (fpad[0] >> 6) & 0x03;
-        let ci_flag = (fpad[0] & 0x20) != 0;
+        // Per ETSI EN 300 401 v2.1.1 Table 7, F-PAD byte 0:
+        //   bits 7-6 = frame type (00 = standard; non-zero → skip)
+        //   bits 5-4 = X-PAD indicator: 00=none, 01=short, 10=variable, 11=end
+        // F-PAD byte 1 bit 1: CI flag (1 = Content Indicator list present)
+        let fpad_type = (fpad[0] >> 6) & 0x03;
+        let xpad_type = (fpad[0] >> 4) & 0x03;
+        let ci_flag = (fpad[1] & 0x02) != 0;
 
         log::debug!(
-            "X-PAD: F-PAD=[{:02X} {:02X}] type={} ({}) ci_flag={} xpad_area_len={}",
+            "X-PAD: F-PAD=[{:02X} {:02X}] fpad_type={} xpad_type={} ({}) ci_flag={} xpad_area_len={}",
             fpad[0],
             fpad[1],
+            fpad_type,
             xpad_type,
             match xpad_type {
                 0b00 => "no X-PAD",
@@ -202,23 +208,31 @@ impl XPadAssembler {
             xpad_area.len(),
         );
 
-        // Short X-PAD (type=01): fixed 4 bytes immediately before F-PAD, always DLS.
-        // F-PAD byte 0 bit 5 is the Z flag: 0 = data present, 1 = zero-byte padding only.
+        if fpad_type != 0b00 {
+            log::debug!("X-PAD: non-standard F-PAD type={} — skipping", fpad_type);
+            return None;
+        }
+
+        // Short X-PAD (xpad_type=01): 4 bytes immediately before F-PAD.
+        // Layout: [data[0], data[1], data[2], app_type_byte] (left to right).
+        // app_type_byte (rightmost) carries the application type (bits 3-0).
+        // Data is 3 bytes; we only process it if app_type == DLS (2).
         if xpad_type == 0b01 {
-            let z_flag = (fpad[0] & 0x20) != 0;
-            if z_flag {
-                log::debug!("X-PAD: short X-PAD Z=1 (padding only) — skipping");
-                return None;
-            }
             if xpad_area.len() < 4 {
                 log::debug!("X-PAD: short X-PAD too short ({} bytes)", xpad_area.len());
                 return None;
             }
-            let dls_chunk = xpad_area[xpad_area.len() - 4..].to_vec();
-            log::debug!(
-                "X-PAD: short X-PAD DLS chunk: {:02X?}",
-                &dls_chunk
-            );
+            let type_byte = xpad_area[xpad_area.len() - 1];
+            let app_type = type_byte & 0x0F;
+            if app_type != APP_TYPE_DLS {
+                log::debug!(
+                    "X-PAD: short X-PAD app_type={} (not DLS) — skipping",
+                    app_type
+                );
+                return None;
+            }
+            let dls_chunk = xpad_area[xpad_area.len() - 4..xpad_area.len() - 1].to_vec();
+            log::debug!("X-PAD: short X-PAD DLS chunk: {:02X?}", &dls_chunk);
             return self.process_dls_chunk(&dls_chunk);
         }
 
@@ -282,11 +296,7 @@ impl XPadAssembler {
         let toggle = (cmd & 0x08) != 0;
         // When both first and last are set the entire label fits in this one
         // segment; normalise to segment 0 so try_assemble finds it immediately.
-        let seg_num = if first && last {
-            0
-        } else {
-            (cmd >> 4) & 0x0F
-        };
+        let seg_num = if first && last { 0 } else { (cmd >> 4) & 0x0F };
 
         log::debug!(
             "X-PAD DLS: cmd={:02X} first={} last={} toggle={} seg={} chunk_len={}",
@@ -362,6 +372,69 @@ impl Default for XPadAssembler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────── //
+//  DAB+ DSE PAD extraction                                                     //
+// ─────────────────────────────────────────────────────────────────────────── //
+
+/// Extract the PAD byte slice from the `data_stream_element()` at the start
+/// of a DAB+ Access Unit.
+///
+/// Per ETSI TS 102 563 §5.4.3 and ISO/IEC 14496-3 (MPEG-4 AAC), the DSE
+/// header occupies exactly 2 bytes (3-bit SYN_ELE + 4-bit instance_tag +
+/// 1-bit align_flag + 8-bit count), giving the PAD data immediately after:
+///
+/// ```text
+/// Byte 0: [SYN_ELE(3=0b100) | instance_tag(4) | align_flag(1)]
+/// Byte 1: count (number of PAD bytes; 255 triggers escape extension)
+/// Byte 2+: PAD payload = [X-PAD | F-PAD(2)]
+/// ```
+///
+/// Returns `None` if the AU does not start with a DSE or is truncated.
+fn extract_dab_plus_pad(au: &[u8]) -> Option<&[u8]> {
+    if au.len() < 2 {
+        return None;
+    }
+    // Top 3 bits of byte 0 must be 0b100 (ID_DSE = 4).
+    if au[0] & 0xE0 != 0x80 {
+        log::debug!(
+            "X-PAD DAB+: AU byte[0]={:02X} — no DSE at start, no PAD",
+            au[0]
+        );
+        return None;
+    }
+    // data_byte_align_flag (bit 0 of byte 0): if set the DSE data is byte-aligned
+    // within the bitstream.  Since the DSE header is already 2 full bytes we are
+    // always byte-aligned at the data start, so this flag has no practical effect
+    // here and is intentionally ignored.
+    let mut count = au[1] as usize;
+    let data_start = if count == 255 {
+        // Escape: total count = 255 + esc_count (per ISO/IEC 14496-3).
+        if au.len() < 3 {
+            log::debug!("X-PAD DAB+: DSE truncated before escape count byte");
+            return None;
+        }
+        count = 255 + au[2] as usize;
+        3
+    } else {
+        2
+    };
+    if au.len() < data_start + count {
+        log::debug!(
+            "X-PAD DAB+: DSE payload truncated (need {} bytes after offset {}, have {})",
+            count,
+            data_start,
+            au.len()
+        );
+        return None;
+    }
+    log::debug!(
+        "X-PAD DAB+: DSE found, instance_tag={}, count={} bytes",
+        (au[0] >> 1) & 0x0F,
+        count
+    );
+    Some(&au[data_start..data_start + count])
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -653,11 +726,11 @@ mod tests {
         frame.extend_from_slice(&dls_chunk);
         frame.push(end);
         frame.push(ci);
-        // F-PAD: variable X-PAD + CI flag.
-        //   byte0 = 0b10100000 = 0xA0 (type=10 variable, bit5=1 CI flag)
-        //   byte1 = 0x00 (Z=0)
-        frame.push(0xA0);
-        frame.push(0x00);
+        // F-PAD per ETSI EN 300 401 v2.1.1:
+        //   byte0 = 0x20: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
+        //   byte1 = 0x02: bit 1 = 1 (CI flag set)
+        frame.push(0x20);
+        frame.push(0x02);
 
         let result = asm.push_mp2_frame(&frame);
         assert_eq!(result, Some("Hi".to_string()));
@@ -678,8 +751,8 @@ mod tests {
             f.extend_from_slice(dls);
             f.push(0xF0); // end marker (left of CI)
             f.push(0x12); // CI: length_code=1 (6 bytes), app_type=2
-            f.push(0xA0); // F-PAD byte0: variable X-PAD, CI flag
-            f.push(0x00); // F-PAD byte1
+            f.push(0x20); // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
+            f.push(0x02); // F-PAD byte1: bit 1 = 1 (CI flag set)
             f
         };
 
@@ -709,8 +782,8 @@ mod tests {
         frame1.extend_from_slice(&dls_chunk);
         frame1.push(0xF0); // end marker
         frame1.push(0x12); // CI: length_code=1 (6 bytes), app_type=2
-        frame1.push(0xA0); // F-PAD byte0: variable X-PAD (type=10), CI flag set
-        frame1.push(0x00); // F-PAD byte1
+        frame1.push(0x20); // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
+        frame1.push(0x02); // F-PAD byte1: bit 1 = 1 (CI flag set)
 
         let r1 = asm.push_mp2_frame(&frame1);
         assert_eq!(r1, Some("OK".to_string()));
@@ -722,9 +795,9 @@ mod tests {
         let dls_chunk2 = [0x0Eu8, 0x00, 0x47, 0x6F, 0x00, 0x00]; // toggle=1, "Go"
         let mut frame2 = vec![0u8; 4]; // fake audio
         frame2.extend_from_slice(&dls_chunk2);
-        // F-PAD byte0: variable X-PAD (type=10), CI flag NOT set (bit5=0)
-        frame2.push(0x80); // 0b10000000
-        frame2.push(0x00); // F-PAD byte1
+        // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD), CI flag NOT set
+        frame2.push(0x20); // 0b00100000
+        frame2.push(0x00); // F-PAD byte1: bit 1 = 0 (no CI list)
 
         let r2 = asm.push_mp2_frame(&frame2);
         assert_eq!(r2, Some("Go".to_string()));
@@ -736,6 +809,73 @@ mod tests {
         // F-PAD byte0 = 0x00: type=00 (no X-PAD)
         let frame = [0xFF, 0xFA, 0x84, 0xC4, 0x00, 0x00u8]; // tiny fake frame
         assert!(asm.push_mp2_frame(&frame).is_none());
+    }
+
+    // ── extract_dab_plus_pad ─────────────────────────────────────────────── //
+
+    #[test]
+    fn dab_plus_pad_no_dse_returns_none() {
+        // Byte 0 top 3 bits != 0b100 → not a DSE.
+        let au = [0x00u8, 0x06, 0xA0, 0x00]; // SYN_ELE=0b000 (SCE)
+        assert!(extract_dab_plus_pad(&au).is_none());
+    }
+
+    #[test]
+    fn dab_plus_pad_extracts_dse_payload() {
+        // DSE header: byte0=0x80 (SYN_ELE=0b100, tag=0, align=0), byte1=0x04 (count=4)
+        // PAD payload: 4 bytes of dummy data
+        let au = [0x80u8, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0x99, 0x99];
+        let pad = extract_dab_plus_pad(&au).unwrap();
+        assert_eq!(pad, &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn dab_plus_pad_escape_count() {
+        // count=255 → escape; total = 255 + esc_count.
+        let mut au = vec![0x80u8, 0xFF, 0x01]; // header: count=255, esc=1 → total 256
+        au.extend(vec![0xABu8; 256]); // 256 bytes of PAD payload
+        au.extend(vec![0x00u8; 10]); // trailing audio bytes
+        let pad = extract_dab_plus_pad(&au).unwrap();
+        assert_eq!(pad.len(), 256);
+        assert!(pad.iter().all(|&b| b == 0xAB));
+    }
+
+    #[test]
+    fn dab_plus_pad_truncated_returns_none() {
+        // count says 10 bytes but AU only has 3 bytes of payload.
+        let au = [0x80u8, 0x0A, 0x01, 0x02, 0x03];
+        assert!(extract_dab_plus_pad(&au).is_none());
+    }
+
+    #[test]
+    fn assembler_dabplus_au_single_segment_label() {
+        let mut asm = XPadAssembler::new();
+
+        // DLS chunk (6 bytes, length_code=1 in CI list).
+        // cmd=0x06: seg=0, toggle=0, first=1, last=1, command=0
+        // charset=0x00 (EBU Latin), text="Hi", pad bytes
+        let dls_chunk = [0x06u8, 0x00, 0x48, 0x69, 0x00, 0x00];
+        let end = 0xF0u8; // CI end marker
+        let ci = 0x12u8; // CI: length_code=1 (6 bytes), app_type=2 (DLS)
+
+        // PAD field: [dls_chunk | end_marker | CI | F-PAD]
+        // F-PAD per ETSI EN 300 401 v2.1.1:
+        //   byte0 = 0x20: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
+        //   byte1 = 0x02: bit 1 = 1 (CI flag set)
+        let mut pad: Vec<u8> = dls_chunk.to_vec();
+        pad.push(end);
+        pad.push(ci);
+        pad.push(0x20); // F-PAD byte0
+        pad.push(0x02); // F-PAD byte1
+
+        // AU: DSE header + PAD payload + trailing AAC audio bytes
+        let count = pad.len() as u8; // 10
+        let mut au = vec![0x80u8, count]; // DSE: SYN_ELE=DSE, tag=0, align=0; count
+        au.extend_from_slice(&pad);
+        au.extend(vec![0u8; 20]); // fake AAC audio bytes
+
+        let result = asm.push_dabplus_au(&au);
+        assert_eq!(result, Some("Hi".to_string()));
     }
 
     #[test]
