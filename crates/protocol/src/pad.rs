@@ -231,7 +231,9 @@ impl XPadAssembler {
                 );
                 return None;
             }
-            let dls_chunk = xpad_area[xpad_area.len() - 4..xpad_area.len() - 1].to_vec();
+            // Short X-PAD data is also stored right-to-left; reverse for logical order.
+            let mut dls_chunk = xpad_area[xpad_area.len() - 4..xpad_area.len() - 1].to_vec();
+            dls_chunk.reverse();
             log::debug!("X-PAD: short X-PAD DLS chunk: {:02X?}", &dls_chunk);
             return self.process_dls_chunk(&dls_chunk);
         }
@@ -537,7 +539,12 @@ fn extract_dls_with_ci(
             data_right
         );
         if *app_type == APP_TYPE_DLS {
-            return Some(xpad_area[data_left..data_right].to_vec());
+            // Per ETSI EN 300 401 §7.4.2.2.2, byte 0 of each data subfield is
+            // physically adjacent to the CI list (rightmost), so bytes appear in
+            // reverse logical order.  Reverse to restore cmd-byte-first order.
+            let mut chunk = xpad_area[data_left..data_right].to_vec();
+            chunk.reverse();
+            return Some(chunk);
         }
         data_right = data_left;
     }
@@ -682,15 +689,18 @@ mod tests {
         //
         // CI byte: length_code=0 (4 bytes), app_type=2 → 0x02
         // End marker: length_code=15 → 0xF0 (any low nibble)
-        // DLS data: 4 bytes
-        let dls_data = [0xC0u8, 0x00, 0x41, 0x42]; // command + charset + 'A' + 'B'
+        // DLS data: 4 bytes in physical order (byte 0 = cmd is RIGHTMOST per spec)
+        //   Logical: [cmd=0xC0, charset=0x00, 'A', 'B']
+        //   Physical (rightmost = byte 0): ['B', 'A', 0x00, 0xC0]
+        let dls_data_physical = [0x42u8, 0x41, 0x00, 0xC0]; // 'B' 'A' charset cmd
         let end = 0xF0u8; // end marker (left of CI)
         let ci = 0x02u8; // CI: length_code=0 (4 bytes), app_type=2 (right, closest to F-PAD)
-        let xpad_area: Vec<u8> = dls_data.iter().copied().chain([end, ci]).collect();
+        let xpad_area: Vec<u8> = dls_data_physical.iter().copied().chain([end, ci]).collect();
         let (ci_entries, data_right) = parse_ci_list(&xpad_area);
         let chunk = extract_dls_with_ci(&xpad_area, &ci_entries, data_right)
             .expect("should find DLS chunk");
-        assert_eq!(chunk, dls_data);
+        // extract_dls_with_ci reverses physical→logical; expect logical order
+        assert_eq!(chunk, [0xC0u8, 0x00, 0x41, 0x42]);
     }
 
     #[test]
@@ -712,11 +722,10 @@ mod tests {
 
         // Build an X-PAD area with a single-segment DLS label "Hi".
         // DLS chunk (6 bytes = length_code=1) — ETSI TS 102 980 §5.1.1 format:
-        //   cmd: seg=0 (bits7:4), toggle=0 (bit3), first=1 (bit2), last=1 (bit1),
-        //        command=0 (bit0) → 0b0000_0110 = 0x06
-        //   charset: 0 (EBU Latin) → 0x00
-        //   text: 'H'=0x48, 'i'=0x69, 0x00 (pad), 0x00 (pad)
-        let dls_chunk = [0x06u8, 0x00, 0x48, 0x69, 0x00, 0x00];
+        //   Logical: [cmd=0x06, charset=0x00, 'H'=0x48, 'i'=0x69, pad, pad]
+        //   Physical (byte 0 = cmd is rightmost per spec):
+        //     [0x00, 0x00, 'i'=0x69, 'H'=0x48, 0x00, cmd=0x06]
+        let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
         let end = 0xF0u8; // end marker (left of CI entries)
         let ci = 0x12u8; // CI: length_code=1 (6 bytes), app_type=2 (rightmost, closest to F-PAD)
 
@@ -741,9 +750,11 @@ mod tests {
         let mut asm = XPadAssembler::new();
 
         // First label "AA" with toggle=0; second label "BB" with toggle=1.
-        // ETSI TS 102 980: seg=0(bits7:4=0), toggle=bit3, first=bit2, last=bit1, cmd=bit0=0.
-        let dls1 = [0x06u8, 0x00, 0x41, 0x41, 0x00, 0x00]; // toggle=0: 0b0000_0110
-        let dls2 = [0x0Eu8, 0x00, 0x42, 0x42, 0x00, 0x00]; // toggle=1: 0b0000_1110
+        // Stored in physical order (byte 0 = cmd is rightmost per spec).
+        // Logical dls1: [0x06, 0x00, 'A', 'A', 0x00, 0x00] → physical: [0x00, 0x00, 'A', 'A', 0x00, 0x06]
+        // Logical dls2: [0x0E, 0x00, 'B', 'B', 0x00, 0x00] → physical: [0x00, 0x00, 'B', 'B', 0x00, 0x0E]
+        let dls1 = [0x00u8, 0x00, 0x41, 0x41, 0x00, 0x06]; // toggle=0
+        let dls2 = [0x00u8, 0x00, 0x42, 0x42, 0x00, 0x0E]; // toggle=1
 
         // Frame layout: fake_audio | dls_chunk | end_marker | CI | F-PAD
         let build_frame = |dls: &[u8]| {
@@ -769,12 +780,10 @@ mod tests {
         // Second frame: CI flag NOT set — continuation, should reuse cached CI.
         let mut asm = XPadAssembler::new();
 
-        // DLS chunk (6 bytes = length_code=1) — ETSI TS 102 980 format:
-        //   cmd: seg=0(bits7:4=0), toggle=0(bit3), first=1(bit2), last=1(bit1),
-        //        command=0(bit0) → 0b0000_0110 = 0x06
-        //   charset: 0 → 0x00
-        //   text: 'O'=0x4F, 'K'=0x4B, pad, pad
-        let dls_chunk = [0x06u8, 0x00, 0x4F, 0x4B, 0x00, 0x00];
+        // DLS chunk (6 bytes = length_code=1) — stored in physical order.
+        // Logical: [cmd=0x06, charset=0x00, 'O'=0x4F, 'K'=0x4B, pad, pad]
+        // Physical (byte 0 = cmd is rightmost): [0x00, 0x00, 'K', 'O', 0x00, 0x06]
+        let dls_chunk = [0x00u8, 0x00, 0x4B, 0x4F, 0x00, 0x06];
 
         // Frame 1: explicit CI list present (ci_flag=1).
         // Layout: dls_chunk | end_marker | CI | F-PAD
@@ -790,9 +799,10 @@ mod tests {
 
         // Frame 2: continuation (ci_flag=0).
         // Layout: dls_chunk | F-PAD  (no CI bytes — entire xpad area is data)
-        // We send a new single-segment label "Go" with toggle=1 to distinguish.
-        // ETSI TS 102 980: toggle=1(bit3)=0x08 → 0b0000_1110 = 0x0E.
-        let dls_chunk2 = [0x0Eu8, 0x00, 0x47, 0x6F, 0x00, 0x00]; // toggle=1, "Go"
+        // Frame 2: "Go" with toggle=1. Physical order (byte 0 = cmd is rightmost).
+        // Logical: [0x0E, 0x00, 'G'=0x47, 'o'=0x6F, 0x00, 0x00]
+        // Physical: [0x00, 0x00, 'o', 'G', 0x00, 0x0E]
+        let dls_chunk2 = [0x00u8, 0x00, 0x6F, 0x47, 0x00, 0x0E]; // toggle=1, "Go"
         let mut frame2 = vec![0u8; 4]; // fake audio
         frame2.extend_from_slice(&dls_chunk2);
         // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD), CI flag NOT set
@@ -852,9 +862,10 @@ mod tests {
         let mut asm = XPadAssembler::new();
 
         // DLS chunk (6 bytes, length_code=1 in CI list).
-        // cmd=0x06: seg=0, toggle=0, first=1, last=1, command=0
-        // charset=0x00 (EBU Latin), text="Hi", pad bytes
-        let dls_chunk = [0x06u8, 0x00, 0x48, 0x69, 0x00, 0x00];
+        // Stored in physical order (byte 0 = cmd is rightmost per spec).
+        // Logical: [cmd=0x06, charset=0x00, 'H'=0x48, 'i'=0x69, pad, pad]
+        // Physical: [0x00, 0x00, 'i', 'H', 0x00, cmd=0x06]
+        let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
         let end = 0xF0u8; // CI end marker
         let ci = 0x12u8; // CI: length_code=1 (6 bytes), app_type=2 (DLS)
 
