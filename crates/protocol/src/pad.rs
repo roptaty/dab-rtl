@@ -24,10 +24,11 @@ use std::collections::BTreeMap;
 /// X-PAD Application Type 2 = DLS (Dynamic Label Segment).
 const APP_TYPE_DLS: u8 = 2;
 
-/// Map CI length code (upper 4 bits of a Content Indicator byte) to byte count.
+/// Map CI sub-field length indicator (upper 3 bits of a Content Indicator byte)
+/// to byte count.
 ///
-/// Per ETSI EN 300 401 Table 2a.  Returns `None` for the end-marker (15) or
-/// reserved codes (7–14).
+/// Per ETSI EN 300 401 §7.4.2.2, Table 2 (variable-size X-PAD).
+/// Returns `None` for the end-marker (7).
 fn ci_length(code: u8) -> Option<usize> {
     match code {
         0 => Some(4),
@@ -37,8 +38,8 @@ fn ci_length(code: u8) -> Option<usize> {
         4 => Some(16),
         5 => Some(24),
         6 => Some(32),
-        15 => None, // end marker — stop scanning CI list
-        _ => None,  // reserved — stop scanning
+        7 => None, // end of CI list
+        _ => None, // unreachable for 3-bit code, but defensive
     }
 }
 
@@ -154,6 +155,12 @@ impl XPadAssembler {
     /// `data_stream_element()` (DSE) at the beginning of the AU.  F-PAD
     /// occupies the last 2 bytes of the DSE payload; X-PAD (if present)
     /// occupies the preceding bytes of the DSE payload.
+    ///
+    /// **Byte ordering:** the DSE stores X-PAD bytes in reversed order
+    /// compared to DAB (MPEG Layer 2).  In DAB, byte 0 of the X-PAD data
+    /// group is closest to F-PAD (at the highest address); in the DSE, it
+    /// maps to `data_stream_byte[cnt-3]`.  We reverse the X-PAD area so that
+    /// `process_fpad_xpad` can use the same right-to-left CI parsing as DAB.
     pub fn push_dabplus_au(&mut self, au_data: &[u8]) -> Option<String> {
         let pad = extract_dab_plus_pad(au_data)?;
         if pad.len() < 2 {
@@ -171,7 +178,13 @@ impl XPadAssembler {
             fpad[0],
             fpad[1],
         );
-        self.process_fpad_xpad(&pad[..pad.len() - 2], fpad)
+        // Reverse the X-PAD area: in the DSE, X-PAD bytes are stored in
+        // forward order (CI at low indices, data growing right), but
+        // process_fpad_xpad expects the DAB/MPEG layout (CI at high indices,
+        // data growing left).  Reversing makes the layouts equivalent.
+        let mut xpad_area: Vec<u8> = pad[..pad.len() - 2].to_vec();
+        xpad_area.reverse();
+        self.process_fpad_xpad(&xpad_area, fpad)
     }
 
     // ──────────────────────────────────────────────────────────────────────── //
@@ -466,8 +479,11 @@ fn parse_ci_list(xpad_area: &[u8]) -> (Vec<(usize, u8)>, usize) {
         }
         pos -= 1;
         let ci = xpad_area[pos];
-        let length_code = ci >> 4;
-        let app_type = ci & 0x0F;
+        // ETSI EN 300 401 §7.4.2.2, Table 2: variable-size X-PAD CI byte
+        // is 3-bit sub-field length indicator (bits 7-5) + 5-bit application
+        // type (bits 4-0).
+        let length_code = (ci >> 5) & 0x07;
+        let app_type = ci & 0x1F;
 
         match ci_length(length_code) {
             None => {
@@ -687,13 +703,13 @@ mod tests {
         // X-PAD area layout (left to right): data | end_marker | CI
         // CI entries are rightmost (closest to F-PAD); end_marker is just left of them.
         //
-        // CI byte: length_code=0 (4 bytes), app_type=2 → 0x02
-        // End marker: length_code=15 → 0xF0 (any low nibble)
+        // CI byte (3+5 split): length_code=0 (4 bytes), app_type=2 → (0<<5)|2 = 0x02
+        // End marker: length_code=7 → (7<<5) = 0xE0
         // DLS data: 4 bytes in physical order (byte 0 = cmd is RIGHTMOST per spec)
         //   Logical: [cmd=0xC0, charset=0x00, 'A', 'B']
         //   Physical (rightmost = byte 0): ['B', 'A', 0x00, 0xC0]
         let dls_data_physical = [0x42u8, 0x41, 0x00, 0xC0]; // 'B' 'A' charset cmd
-        let end = 0xF0u8; // end marker (left of CI)
+        let end = 0xE0u8; // end marker (left of CI)
         let ci = 0x02u8; // CI: length_code=0 (4 bytes), app_type=2 (right, closest to F-PAD)
         let xpad_area: Vec<u8> = dls_data_physical.iter().copied().chain([end, ci]).collect();
         let (ci_entries, data_right) = parse_ci_list(&xpad_area);
@@ -708,8 +724,8 @@ mod tests {
         // CI with app_type=3 (not DLS).  Layout: data | end_marker | CI.
         let data = [0u8; 4];
         let mut xpad = data.to_vec();
-        xpad.push(0xF0); // end marker (left of CI)
-        xpad.push(0x03); // CI: length_code=0 (4 bytes), app_type=3
+        xpad.push(0xE0); // end marker (left of CI)
+        xpad.push(0x03); // CI (3+5): length_code=0 (4 bytes), app_type=3
         let (ci_entries, data_right) = parse_ci_list(&xpad);
         assert!(extract_dls_with_ci(&xpad, &ci_entries, data_right).is_none());
     }
@@ -726,8 +742,8 @@ mod tests {
         //   Physical (byte 0 = cmd is rightmost per spec):
         //     [0x00, 0x00, 'i'=0x69, 'H'=0x48, 0x00, cmd=0x06]
         let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
-        let end = 0xF0u8; // end marker (left of CI entries)
-        let ci = 0x12u8; // CI: length_code=1 (6 bytes), app_type=2 (rightmost, closest to F-PAD)
+        let end = 0xE0u8; // end marker (left of CI entries)
+        let ci = 0x22u8; // CI (3+5): length_code=1 (6 bytes), app_type=2 (rightmost, closest to F-PAD)
 
         // Build a fake MPEG frame: arbitrary audio bytes + X-PAD area + F-PAD.
         // X-PAD area layout (left to right): dls_chunk | end_marker | CI
@@ -760,8 +776,8 @@ mod tests {
         let build_frame = |dls: &[u8]| {
             let mut f = vec![0u8; 4]; // fake audio
             f.extend_from_slice(dls);
-            f.push(0xF0); // end marker (left of CI)
-            f.push(0x12); // CI: length_code=1 (6 bytes), app_type=2
+            f.push(0xE0); // end marker (left of CI)
+            f.push(0x22); // CI (3+5): length_code=1 (6 bytes), app_type=2
             f.push(0x20); // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
             f.push(0x02); // F-PAD byte1: bit 1 = 1 (CI flag set)
             f
@@ -789,8 +805,8 @@ mod tests {
         // Layout: dls_chunk | end_marker | CI | F-PAD
         let mut frame1 = vec![0u8; 4]; // fake audio
         frame1.extend_from_slice(&dls_chunk);
-        frame1.push(0xF0); // end marker
-        frame1.push(0x12); // CI: length_code=1 (6 bytes), app_type=2
+        frame1.push(0xE0); // end marker
+        frame1.push(0x22); // CI (3+5): length_code=1 (6 bytes), app_type=2
         frame1.push(0x20); // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
         frame1.push(0x02); // F-PAD byte1: bit 1 = 1 (CI flag set)
 
@@ -861,23 +877,20 @@ mod tests {
     fn assembler_dabplus_au_single_segment_label() {
         let mut asm = XPadAssembler::new();
 
-        // DLS chunk (6 bytes, length_code=1 in CI list).
-        // Stored in physical order (byte 0 = cmd is rightmost per spec).
-        // Logical: [cmd=0x06, charset=0x00, 'H'=0x48, 'i'=0x69, pad, pad]
-        // Physical: [0x00, 0x00, 'i', 'H', 0x00, cmd=0x06]
-        let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
-        let end = 0xF0u8; // CI end marker
-        let ci = 0x12u8; // CI: length_code=1 (6 bytes), app_type=2 (DLS)
+        // In DAB+ (DSE), X-PAD bytes are in forward/logical order:
+        //   [CI | end_marker | data_subfield(forward) | F-PAD]
+        // push_dabplus_au reverses the X-PAD area before processing.
+        //
+        // DLS chunk (6 bytes, length_code=1) in logical order:
+        //   [cmd=0x06, charset=0x00, 'H'=0x48, 'i'=0x69, pad=0x00, pad=0x00]
+        let ci = 0x22u8; // CI (3+5): length_code=1 (6 bytes), app_type=2 (DLS)
+        let end = 0xE0u8; // CI end marker (length_code=7)
 
-        // PAD field: [dls_chunk | end_marker | CI | F-PAD]
-        // F-PAD per ETSI EN 300 401 v2.1.1:
-        //   byte0 = 0x20: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
-        //   byte1 = 0x02: bit 1 = 1 (CI flag set)
-        let mut pad: Vec<u8> = dls_chunk.to_vec();
-        pad.push(end);
-        pad.push(ci);
-        pad.push(0x20); // F-PAD byte0
-        pad.push(0x02); // F-PAD byte1
+        // PAD field: [CI | end_marker | dls_data(forward) | F-PAD]
+        let mut pad: Vec<u8> = vec![ci, end];
+        pad.extend_from_slice(&[0x06, 0x00, 0x48, 0x69, 0x00, 0x00]); // DLS forward
+        pad.push(0x20); // F-PAD byte0: variable X-PAD
+        pad.push(0x02); // F-PAD byte1: CI flag set
 
         // AU: DSE header + PAD payload + trailing AAC audio bytes
         let count = pad.len() as u8; // 10
