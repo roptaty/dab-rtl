@@ -31,9 +31,22 @@ pub enum SdrError {
 /// This maps [0, 255] → [−1.0, +1.0].
 #[inline]
 pub fn iq_to_complex(raw: &[u8]) -> Vec<Complex32> {
-    raw.chunks_exact(2)
-        .map(|c| Complex32::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
-        .collect()
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    iq_to_complex_into(raw, &mut out);
+    out
+}
+
+/// Convert raw RTL-SDR bytes into an existing output buffer.
+#[inline]
+pub fn iq_to_complex_into(raw: &[u8], out: &mut Vec<Complex32>) {
+    out.clear();
+    out.reserve(raw.len() / 2);
+    for chunk in raw.chunks_exact(2) {
+        out.push(Complex32::new(
+            (chunk[0] as f32 - 127.5) / 127.5,
+            (chunk[1] as f32 - 127.5) / 127.5,
+        ));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -149,10 +162,14 @@ pub fn open_stream(config: DeviceConfig, buf_size: u32) -> Result<SdrStream, Sdr
     let thread = std::thread::Builder::new()
         .name("rtlsdr-reader".into())
         .spawn(move || {
+            let mut scratch = Vec::with_capacity(buf_size as usize / 2);
             let read_result = reader.read_async(4, buf_size, |bytes| {
-                let samples = iq_to_complex(bytes);
+                iq_to_complex_into(bytes, &mut scratch);
+                let samples = std::mem::take(&mut scratch);
                 if tx.send(samples).is_err() {
                     log::info!("rtlsdr-reader: receiver dropped, stopping");
+                } else {
+                    scratch = Vec::with_capacity(buf_size as usize / 2);
                 }
             });
 
@@ -191,6 +208,7 @@ pub fn open_file_stream(path: &Path, buf_size: usize) -> Result<SdrStream, SdrEr
         .name("file-reader".into())
         .spawn(move || {
             let mut raw = vec![0u8; buf_size];
+            let mut scratch = Vec::with_capacity(buf_size / 2);
             loop {
                 match file.read(&mut raw) {
                     Ok(0) => break, // EOF
@@ -200,10 +218,12 @@ pub fn open_file_stream(path: &Path, buf_size: usize) -> Result<SdrStream, SdrEr
                         if usable == 0 {
                             continue;
                         }
-                        let samples = iq_to_complex(&raw[..usable]);
+                        iq_to_complex_into(&raw[..usable], &mut scratch);
+                        let samples = std::mem::take(&mut scratch);
                         if tx.send(samples).is_err() {
                             break;
                         }
+                        scratch = Vec::with_capacity(buf_size / 2);
                     }
                     Err(e) => {
                         log::error!("file-reader: {e}");

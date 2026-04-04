@@ -162,9 +162,11 @@ fn run_pipeline(
 
         let mut last_ens_label = String::new();
         let mut last_svc_count = 0usize;
-        let mut last_svc_labels = String::new();
+        let mut last_services: Vec<(u32, String)> = Vec::new();
         let mut frame_count = 0u64;
         let mut pending_retune: Option<u32> = None;
+        let mut last_playing_announced: Option<u32> = None;
+        let mut cif_soft = Vec::<f32>::with_capacity(18 * 3072);
         // DLS decoder: decodes the packet-mode DLS subchannel for the playing service.
         let mut dls_msc = MscDecoder::new();
         // X-PAD DLS assembler: extracts DLS from the audio subchannel itself.
@@ -194,6 +196,7 @@ fn run_pipeline(
                             xpad.reset();
                             packet_dls.reset();
                             last_now_playing = None;
+                            last_playing_announced = None;
                             #[cfg(not(feature = "mp2"))]
                             {
                                 warned_mp2_unsupported = false;
@@ -206,6 +209,7 @@ fn run_pipeline(
                             xpad.reset();
                             packet_dls.reset();
                             last_now_playing = None;
+                            last_playing_announced = None;
                             #[cfg(not(feature = "mp2"))]
                             {
                                 warned_mp2_unsupported = false;
@@ -223,34 +227,37 @@ fn run_pipeline(
             }
 
             // OFDM demodulation.
-            for frame in ofdm.push_samples(&iq_buf) {
+            ofdm.process_samples(&iq_buf, |soft_bits| {
                 frame_count += 1;
                 log::debug!("Pipeline: OFDM frame #{}", frame_count);
 
                 // ── FIC (symbols 0-2) ────────────────────────────────────────── //
                 fic.begin_frame();
-                let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
+                let fic_symbols = soft_bits.get(0..3).unwrap_or_default();
                 for sym in fic_symbols {
                     fic.process_symbol(sym);
                 }
 
                 // Propagate ensemble changes to the TUI.
                 let ens = fic.handler.ensemble();
-                // Build a fingerprint of service labels so we detect when labels
-                // arrive (they come in separate FIG messages after services appear).
-                let svc_labels: String = ens
-                    .services
-                    .iter()
-                    .map(|s| format!("{:04X}:{}", s.id, s.label))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let services_changed = ens.services.len() != last_services.len()
+                    || !ens
+                        .services
+                        .iter()
+                        .zip(last_services.iter())
+                        .all(|(svc, (last_id, last_label))| svc.id == *last_id && svc.label == *last_label);
                 if ens.label != last_ens_label
                     || ens.services.len() != last_svc_count
-                    || svc_labels != last_svc_labels
+                    || services_changed
                 {
                     last_ens_label = ens.label.clone();
                     last_svc_count = ens.services.len();
-                    last_svc_labels = svc_labels;
+                    last_services.clear();
+                    last_services.extend(
+                        ens.services
+                            .iter()
+                            .map(|svc| (svc.id, svc.label.clone())),
+                    );
                     log::info!(
                         "Ensemble: id={:04X} label={:?} services={}",
                         ens.id,
@@ -287,10 +294,13 @@ fn run_pipeline(
                 // Announce when we start playing.
                 if let Some(sid) = playing_sid {
                     if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
-                        let _ = update_tx.try_send(PipelineUpdate::Playing {
-                            sid,
-                            label: svc.label.clone(),
-                        });
+                        if last_playing_announced != Some(sid) {
+                            let _ = update_tx.try_send(PipelineUpdate::Playing {
+                                sid,
+                                label: svc.label.clone(),
+                            });
+                            last_playing_announced = Some(sid);
+                        }
                         #[cfg(not(feature = "mp2"))]
                         if !svc.is_dab_plus && !warned_mp2_unsupported {
                             warned_mp2_unsupported = true;
@@ -304,24 +314,25 @@ fn run_pipeline(
 
                 // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
                 if playing_sid.is_some() {
-                    let ens_snap = ens.clone();
-                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+                    let msc_symbols = soft_bits.get(3..).unwrap_or_default();
 
                     for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
                         if cif_syms.len() < 18 {
                             continue;
                         }
                         // Flatten CIF symbols → 55296 soft bits.
-                        let cif_soft: Vec<f32> =
-                            cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
+                        cif_soft.clear();
+                        for sym in cif_syms {
+                            cif_soft.extend_from_slice(sym);
+                        }
 
                         if let Some(sid) = playing_sid {
-                            let component = find_component(&ens_snap, sid);
+                            let component = find_component(ens, sid);
                             if component.is_none() && cif_idx == 0 {
                                 log::debug!(
                                     "MSC: no component found for SId {:04X} (service has {} components)",
                                     sid,
-                                    ens_snap
+                                    ens
                                         .services
                                         .iter()
                                         .find(|s| s.id == sid)
@@ -436,10 +447,10 @@ fn run_pipeline(
 
                         // ── DLS packet-mode subchannel ────────────────── //
                         if let Some(sid) = playing_sid {
-                            match find_dls_component(&ens_snap, sid) {
+                            match find_dls_component(ens, sid) {
                                 None => {
                                     if frame_count.is_multiple_of(100) {
-                                        let svc = ens_snap.services.iter().find(|s| s.id == sid);
+                                        let svc = ens.services.iter().find(|s| s.id == sid);
                                         log::debug!(
                                             "DLS: no packet component for SId={:04X} (service found={}, components={:?})",
                                             sid,
@@ -499,7 +510,7 @@ fn run_pipeline(
                         }
                     }
                 }
-            }
+            });
         } // end 'stream: for iq_buf
 
         // Handle retune: drop the old stream and open a new one at the new frequency.
@@ -560,6 +571,8 @@ pub struct FicDecoder {
     pub handler: FicHandler,
     /// Accumulation buffer for FIC soft bits across OFDM symbols.
     fic_buf: Vec<f32>,
+    /// Reused normalization scratch for one punctured FIC block.
+    fic_norm: Vec<f32>,
 }
 
 impl Default for FicDecoder {
@@ -575,6 +588,7 @@ impl FicDecoder {
             prbs_bits: Self::generate_prbs(768),
             handler: FicHandler::new(),
             fic_buf: Vec::with_capacity(fec::FIC_PUNCTURED_BITS),
+            fic_norm: vec![0.0; fec::FIC_PUNCTURED_BITS],
         }
     }
 
@@ -618,15 +632,17 @@ impl FicDecoder {
     fn process_fic_block(&mut self) {
         const INFO_BITS: usize = 768;
 
-        let block: Vec<f32> = self.fic_buf.drain(..fec::FIC_PUNCTURED_BITS).collect();
+        let block = &self.fic_buf[..fec::FIC_PUNCTURED_BITS];
 
         // Normalize soft bits to ~[-1, +1] for Viterbi.
         let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = if max_abs > 0.0 { 1.0 / max_abs } else { 1.0 };
-        let normalized: Vec<f32> = block.iter().map(|v| v * scale).collect();
+        for (dst, src) in self.fic_norm.iter_mut().zip(block.iter()) {
+            *dst = *src * scale;
+        }
 
         // Depuncture 2304 → 3096 using PI_16/PI_15/PI_X.
-        let depunctured = fec::fic_depuncture(&normalized);
+        let depunctured = fec::fic_depuncture(&self.fic_norm);
 
         let bits = self.viterbi.decode(&depunctured);
         let info = &bits[..bits.len().min(INFO_BITS)];
@@ -656,6 +672,10 @@ impl FicDecoder {
         }
 
         self.handler.process_fic_bytes(&fic_bytes);
+        let remaining = self.fic_buf.len() - fec::FIC_PUNCTURED_BITS;
+        self.fic_buf
+            .copy_within(fec::FIC_PUNCTURED_BITS.., 0);
+        self.fic_buf.truncate(remaining);
     }
 
     /// XOR FIC bytes (96 bytes = 3 FIBs) with the continuous PRBS.
@@ -694,6 +714,10 @@ pub struct MscDecoder {
     deint_count: usize,
     /// Expected subchannel soft-bit count per CIF (reset on subchannel change).
     deint_bits_per_cif: usize,
+    /// Reused scratch for deinterleaved soft bits.
+    deint_soft: Vec<f32>,
+    /// Reused scratch for normalized soft bits.
+    normalized_soft: Vec<f32>,
 }
 
 impl Default for MscDecoder {
@@ -710,6 +734,8 @@ impl MscDecoder {
             deint_buf: Vec::new(),
             deint_count: 0,
             deint_bits_per_cif: 0,
+            deint_soft: Vec::new(),
+            normalized_soft: Vec::new(),
         }
     }
 
@@ -727,6 +753,8 @@ impl MscDecoder {
         self.deint_buf.clear();
         self.deint_count = 0;
         self.deint_bits_per_cif = 0;
+        self.deint_soft.clear();
+        self.normalized_soft.clear();
     }
 
     /// Decode one CIF (55296 soft bits) for the given component.
@@ -763,12 +791,14 @@ impl MscDecoder {
         if bits_per_cif != self.deint_bits_per_cif {
             self.deint_bits_per_cif = bits_per_cif;
             self.deint_buf = vec![vec![0.0f32; bits_per_cif]; 16];
+            self.deint_soft.resize(bits_per_cif, 0.0);
+            self.normalized_soft.resize(bits_per_cif, 0.0);
             self.deint_count = 0;
         }
 
         // Store in ring buffer.
         let slot = self.deint_count % 16;
-        self.deint_buf[slot] = subchannel_soft.to_vec();
+        self.deint_buf[slot].copy_from_slice(subchannel_soft);
         self.deint_count += 1;
 
         // Need 16 CIFs before the deinterleaver can produce output.
@@ -782,21 +812,21 @@ impl MscDecoder {
         // We output the logical frame whose latest contribution just arrived.
         // For bit i: source physical CIF = (current - 15 + PI[i % 16]).
         let p = self.deint_count - 1;
-        let deint_soft: Vec<f32> = (0..bits_per_cif)
-            .map(|i| {
-                let source_cif = p - 15 + TIME_INTERLEAVE_PI[i % 16];
-                let source_slot = source_cif % 16;
-                self.deint_buf[source_slot][i]
-            })
-            .collect();
+        for i in 0..bits_per_cif {
+            let source_cif = p - 15 + TIME_INTERLEAVE_PI[i % 16];
+            let source_slot = source_cif % 16;
+            self.deint_soft[i] = self.deint_buf[source_slot][i];
+        }
 
         // Normalize soft bits to ~[-1, +1] for Viterbi (matches FIC path).
-        let max_abs = deint_soft.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let max_abs = self.deint_soft.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = if max_abs > 0.0 { 1.0 / max_abs } else { 1.0 };
-        let normalized: Vec<f32> = deint_soft.iter().map(|v| v * scale).collect();
+        for (dst, src) in self.normalized_soft.iter_mut().zip(self.deint_soft.iter()) {
+            *dst = *src * scale;
+        }
 
         // Apply two-region EEP depuncturing (ETSI EN 300 401 Tables 8/9).
-        let depunct = eep_depuncture(&normalized, component);
+        let depunct = eep_depuncture(&self.normalized_soft, component);
 
         // Viterbi decode.  Strip K−1 = 6 tail bits (forced-zero flush bits
         // appended by the encoder; they are not part of the information stream).
@@ -2483,10 +2513,10 @@ mod tests {
 
         for chunk_start in (0..limit).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(limit);
-            for frame in ofdm.push_samples(&samples[chunk_start..chunk_end]) {
+            ofdm.process_samples(&samples[chunk_start..chunk_end], |frame| {
                 frame_count += 1;
                 fic.begin_frame();
-                for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+                for sym in frame.get(0..3).unwrap_or_default() {
                     fic.process_symbol(sym);
                 }
                 let ens = fic.handler.ensemble();
@@ -2512,7 +2542,7 @@ mod tests {
                 }
 
                 if let Some(ref component) = comp_info {
-                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+                    let msc_symbols = frame.get(3..).unwrap_or_default();
                     for cif_syms in msc_symbols.chunks(18) {
                         if cif_syms.len() < 18 {
                             continue;
@@ -2570,7 +2600,7 @@ mod tests {
                         decoded_cifs.push(data);
                     }
                 }
-            }
+            });
         }
 
         eprintln!(
@@ -2653,10 +2683,10 @@ mod tests {
 
         for chunk_start in (0..limit).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(limit);
-            for frame in ofdm.push_samples(&samples[chunk_start..chunk_end]) {
+            ofdm.process_samples(&samples[chunk_start..chunk_end], |frame| {
                 frame_count += 1;
                 fic.begin_frame();
-                for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+                for sym in frame.get(0..3).unwrap_or_default() {
                     fic.process_symbol(sym);
                 }
                 let ens = fic.handler.ensemble();
@@ -2682,7 +2712,7 @@ mod tests {
                 }
 
                 if let Some(sid) = first_sid {
-                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+                    let msc_symbols = frame.get(3..).unwrap_or_default();
                     for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
                         if cif_syms.len() < 18 {
                             continue;
@@ -2696,7 +2726,7 @@ mod tests {
                         }
                     }
                 }
-            }
+            });
         }
 
         eprintln!(

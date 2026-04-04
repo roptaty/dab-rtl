@@ -35,10 +35,6 @@ pub struct OfdmFrame {
     pub soft_bits: Vec<Vec<f32>>,
 }
 
-// -------------------------------------------------------------------------- //
-//  OfdmProcessor                                                              //
-// -------------------------------------------------------------------------- //
-
 /// High-level processor: accepts raw IQ samples and emits `OfdmFrame`s.
 ///
 /// Internally it chains `FrameSync` → `OfdmDemod` → `FreqDeinterleaver`.
@@ -52,6 +48,10 @@ pub struct OfdmProcessor {
     re_scratch: Vec<f32>,
     /// Reused symbol deinterleaver scratch.
     im_scratch: Vec<f32>,
+    /// Reused output frame buffer.
+    frame_soft_bits: Vec<Vec<f32>>,
+    /// Start offset into `sample_buf` for the current logical buffer.
+    sample_buf_start: usize,
     /// Absolute sample index of the most-recent `FrameStart::sample_offset`
     /// (start of the phase-reference symbol after the null).
     prs_offset: Option<usize>,
@@ -67,19 +67,37 @@ impl OfdmProcessor {
             sample_buf: Vec::new(),
             re_scratch: vec![0.0; NUM_CARRIERS],
             im_scratch: vec![0.0; NUM_CARRIERS],
+            frame_soft_bits: (0..(FRAME_SYMBOLS - 1))
+                .map(|_| vec![0.0; NUM_CARRIERS * 2])
+                .collect(),
+            sample_buf_start: 0,
             prs_offset: None,
         }
     }
 
     /// Push new IQ samples into the processor.
     ///
-    /// Returns any complete `OfdmFrame`s produced from these samples.
+    /// Collect complete frames produced from the new samples.
     pub fn push_samples(&mut self, samples: &[Complex32]) -> Vec<OfdmFrame> {
-        self.sample_buf.extend_from_slice(samples);
         let mut frames = Vec::new();
+        self.process_samples(samples, |soft_bits| {
+            frames.push(OfdmFrame {
+                soft_bits: soft_bits.to_vec(),
+            });
+        });
+        frames
+    }
+
+    /// Calls `on_frame` for each complete frame produced from the new samples.
+    pub fn process_samples<F>(&mut self, samples: &[Complex32], mut on_frame: F)
+    where
+        F: FnMut(&[Vec<f32>]),
+    {
+        self.sample_buf.extend_from_slice(samples);
         let mut resync_attempts = 0u32;
 
         loop {
+            let logical_buf = &self.sample_buf[self.sample_buf_start..];
             // ----------------------------------------------------------------
             // Phase 1: try to (re-)synchronise if we don't have a PRS offset.
             // ----------------------------------------------------------------
@@ -88,18 +106,18 @@ impl OfdmProcessor {
                 // `sync.sample_count()` returns the number of samples the sync
                 // has consumed in total; sample_buf[sync_consumed..] is new.
                 let sync_consumed = self.sync.sample_count();
-                if sync_consumed >= self.sample_buf.len() {
+                if sync_consumed >= logical_buf.len() {
                     // Nothing new for the sync — wait for more incoming data.
                     break;
                 }
-                let to_feed = &self.sample_buf[sync_consumed..];
+                let to_feed = &logical_buf[sync_consumed..];
 
                 if let Some(fs) = self.sync.push_samples(to_feed) {
                     // The energy-based null detector has a lag due to its
                     // sliding window.  Refine the PRS start using guard-
                     // interval correlation, which peaks at the exact symbol
                     // boundary.
-                    let refined = Self::refine_prs_start(&self.sample_buf, fs.sample_offset);
+                    let refined = Self::refine_prs_start(logical_buf, fs.sample_offset);
                     self.prs_offset = Some(refined);
                     log::info!(
                         "OfdmProcessor: frame lock, PRS at sample {} (raw {})",
@@ -119,15 +137,15 @@ impl OfdmProcessor {
 
             // A full frame requires: 1 PRS symbol + 75 data symbols.
             let needed = prs_start + FRAME_SYMBOLS * SYMBOL_SIZE;
-            if self.sample_buf.len() < needed {
+            if logical_buf.len() < needed {
                 break; // not enough samples yet
             }
 
             // Refine PRS position using guard-interval correlation search.
             // This compensates for sample clock drift (±6 samples/frame at
             // 30 ppm) and unverified predictions from the previous iteration.
-            let refined = Self::refine_tracking(&self.sample_buf, prs_start);
-            let corr = Self::guard_corr(&self.sample_buf, refined);
+            let refined = Self::refine_tracking(logical_buf, prs_start);
+            let corr = Self::guard_corr(logical_buf, refined);
             if corr < 0.5 {
                 // Signal lost — fall back to re-sync (preserving energy estimate).
                 log::warn!(
@@ -138,9 +156,9 @@ impl OfdmProcessor {
 
                 // Drain past the bad region so we don't re-find the same null.
                 // Skip at least one full frame's worth of samples.
-                let drain_amount =
-                    (prs_start + FRAME_SYMBOLS * SYMBOL_SIZE).min(self.sample_buf.len());
-                self.sample_buf.drain(..drain_amount);
+                let drain_amount = (prs_start + FRAME_SYMBOLS * SYMBOL_SIZE).min(logical_buf.len());
+                self.sample_buf_start += drain_amount;
+                self.compact_sample_buf();
 
                 self.prs_offset = None;
                 self.sync.reset_for_resync();
@@ -155,22 +173,22 @@ impl OfdmProcessor {
             prs_start = refined;
             self.prs_offset = Some(prs_start);
             let needed = prs_start + FRAME_SYMBOLS * SYMBOL_SIZE;
-            if self.sample_buf.len() < needed {
+            if logical_buf.len() < needed {
                 break;
             }
 
             // --- Phase-reference symbol ---
-            let prs_samples = &self.sample_buf[prs_start..prs_start + SYMBOL_SIZE];
+            let logical_buf = &self.sample_buf[self.sample_buf_start..];
+            let prs_samples = &logical_buf[prs_start..prs_start + SYMBOL_SIZE];
             self.demod.process_phase_ref(prs_samples);
 
             // --- 75 data symbols ---
             let data_start = prs_start + SYMBOL_SIZE;
-            let mut soft_bits: Vec<Vec<f32>> = Vec::with_capacity(FRAME_SYMBOLS - 1);
 
             for sym_idx in 0..(FRAME_SYMBOLS - 1) {
                 let sym_start = data_start + sym_idx * SYMBOL_SIZE;
                 let sym_end = sym_start + SYMBOL_SIZE;
-                let sym_samples = &self.sample_buf[sym_start..sym_end];
+                let sym_samples = &logical_buf[sym_start..sym_end];
 
                 let raw_bits = self.demod.demod_symbol(sym_samples);
 
@@ -184,29 +202,27 @@ impl OfdmProcessor {
                 self.deinterleaver
                     .deinterleave_into(im_channel, &mut self.im_scratch);
 
-                let mut deinterleaved = Vec::with_capacity(NUM_CARRIERS * 2);
-                deinterleaved.extend_from_slice(&self.re_scratch);
-                deinterleaved.extend_from_slice(&self.im_scratch);
-
-                soft_bits.push(deinterleaved);
+                let deinterleaved = &mut self.frame_soft_bits[sym_idx];
+                deinterleaved[..NUM_CARRIERS].copy_from_slice(&self.re_scratch);
+                deinterleaved[NUM_CARRIERS..].copy_from_slice(&self.im_scratch);
             }
 
             if log::log_enabled!(log::Level::Debug) {
                 // Log soft-bit statistics for the first FIC symbol.
-                if let Some(sym0) = soft_bits.first() {
+                if let Some(sym0) = self.frame_soft_bits.first() {
                     let mean_abs: f32 =
                         sym0.iter().map(|v| v.abs()).sum::<f32>() / sym0.len() as f32;
                     let max_abs: f32 = sym0.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
                     log::debug!(
                         "OFDM frame: {} symbols, FIC sym0 mean_abs={:.4} max_abs={:.4}",
-                        soft_bits.len(),
+                        self.frame_soft_bits.len(),
                         mean_abs,
                         max_abs
                     );
                 }
             }
 
-            frames.push(OfdmFrame { soft_bits });
+            on_frame(&self.frame_soft_bits);
 
             // ----------------------------------------------------------------
             // Phase 3: advance buffer and predict next frame position.
@@ -217,8 +233,9 @@ impl OfdmProcessor {
             //
             // We predict the next PRS position; Phase 2 will refine it with
             // guard-interval correlation before extracting the next frame.
-            let drain_to = needed.min(self.sample_buf.len());
-            self.sample_buf.drain(..drain_to);
+            let drain_to = needed.min(logical_buf.len());
+            self.sample_buf_start += drain_to;
+            self.compact_sample_buf();
 
             // After draining, the next PRS is expected at index NULL_SIZE
             // in the remaining buffer (null symbol sits right at position 0).
@@ -226,8 +243,23 @@ impl OfdmProcessor {
             // compensate for clock drift.
             self.prs_offset = Some(NULL_SIZE);
         }
+    }
 
-        frames
+    fn compact_sample_buf(&mut self) {
+        if self.sample_buf_start == 0 {
+            return;
+        }
+        if self.sample_buf_start >= self.sample_buf.len() {
+            self.sample_buf.clear();
+            self.sample_buf_start = 0;
+            return;
+        }
+        if self.sample_buf_start >= self.sample_buf.capacity() / 2
+            || self.sample_buf_start >= FrameSync::frame_size()
+        {
+            self.sample_buf.drain(..self.sample_buf_start);
+            self.sample_buf_start = 0;
+        }
     }
 }
 
@@ -382,8 +414,9 @@ mod tests {
     #[test]
     fn empty_push_returns_no_frames() {
         let mut p = OfdmProcessor::new();
-        let frames = p.push_samples(&[]);
-        assert!(frames.is_empty());
+        let mut seen = 0usize;
+        p.process_samples(&[], |_| seen += 1);
+        assert_eq!(seen, 0);
     }
 
     #[test]
@@ -395,22 +428,27 @@ mod tests {
         let mut p = OfdmProcessor::new();
 
         // Warm-up: enough samples for the sync to start detecting nulls.
-        p.push_samples(&loud(MIN_WARMUP_SAMPLES + 4096));
+        p.process_samples(&loud(MIN_WARMUP_SAMPLES + 4096), |_| {});
 
         // Null symbol.
-        p.push_samples(&quiet(NULL_SIZE));
+        p.process_samples(&quiet(NULL_SIZE), |_| {});
 
         // Phase-reference + 75 data symbols (all loud).
         let frame_samples = loud(FRAME_SYMBOLS * SYMBOL_SIZE);
-        let frames = p.push_samples(&frame_samples);
+        let mut seen = 0usize;
+        let mut first_shape = None;
+        p.process_samples(&frame_samples, |frame| {
+            seen += 1;
+            first_shape = Some((frame.len(), frame[0].len()));
+        });
 
-        if !frames.is_empty() {
-            let frame = &frames[0];
-            assert_eq!(frame.soft_bits.len(), FRAME_SYMBOLS - 1);
-            assert_eq!(frame.soft_bits[0].len(), NUM_CARRIERS * 2);
+        if let Some((n_syms, sym_len)) = first_shape {
+            assert_eq!(n_syms, FRAME_SYMBOLS - 1);
+            assert_eq!(sym_len, NUM_CARRIERS * 2);
         }
         // If sync didn't fire (timing edge case) that is also acceptable;
         // the important thing is no panic.
+        assert!(seen <= 1);
     }
 
     #[test]

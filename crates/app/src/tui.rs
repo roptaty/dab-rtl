@@ -147,6 +147,12 @@ struct AppState {
     discovered: Vec<DiscoveredService>,
     /// Log messages shown in the bottom scan-log panel during scanning.
     scan_log: std::collections::VecDeque<String>,
+    /// Cached service labels used by the station list.
+    service_items: Vec<String>,
+    /// Cached now-playing lines.
+    now_playing_lines: Vec<Line<'static>>,
+    /// Cached scan-log title.
+    scan_log_title: String,
 }
 
 impl AppState {
@@ -168,6 +174,115 @@ impl AppState {
             scan_state: None,
             discovered: Vec::new(),
             scan_log: std::collections::VecDeque::new(),
+            service_items: Vec::new(),
+            now_playing_lines: Self::build_now_playing_lines(None, "", None),
+            scan_log_title: " Scan Log ".into(),
+        }
+    }
+
+    fn rebuild_service_items(&mut self) {
+        self.service_items.clear();
+        if !self.discovered.is_empty() {
+            self.service_items.extend(self.discovered.iter().map(|s| {
+                let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
+                format!("{}{tag}", s.label)
+            }));
+        } else {
+            self.service_items.extend(self.ensemble.services.iter().map(|s| {
+                let label = if s.label.is_empty() {
+                    format!("{:08X}", s.id)
+                } else {
+                    s.label.clone()
+                };
+                let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
+                format!("{label}{tag}")
+            }));
+        }
+    }
+
+    fn rebuild_now_playing(&mut self) {
+        let now_playing = self.playing_sid.and_then(|sid| {
+            self.discovered
+                .iter()
+                .find(|s| s.sid == sid)
+                .and_then(|s| s.now_playing.clone())
+                .or_else(|| {
+                    self.ensemble
+                        .services
+                        .iter()
+                        .find(|s| s.id == sid)
+                        .and_then(|s| s.now_playing.clone())
+                })
+        });
+        self.now_playing_lines = Self::build_now_playing_lines(
+            self.playing_label.as_deref(),
+            &self.ensemble.label,
+            now_playing.as_ref(),
+        );
+    }
+
+    fn rebuild_scan_log_title(&mut self) {
+        let found = self.scan_state.as_ref().map_or(0, |s| s.services.len());
+        self.scan_log_title = format!(" Scan Log — {found} stations found so far ");
+    }
+
+    fn build_now_playing_lines(
+        playing_label: Option<&str>,
+        ensemble_label: &str,
+        now_playing: Option<&NowPlaying>,
+    ) -> Vec<Line<'static>> {
+        if let Some(label) = playing_label {
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        "Now playing: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(label.to_string()),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Ensemble: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(ensemble_label.to_string()),
+                ]),
+            ];
+            if let Some(meta) = now_playing {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Text: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(meta.raw_text.clone(), Style::default().fg(Color::Yellow)),
+                ]));
+                if let Some(title) = &meta.title {
+                    lines.push(Line::from(vec![
+                        Span::styled("Title: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(title.clone()),
+                    ]));
+                }
+                if let Some(artist) = &meta.artist {
+                    lines.push(Line::from(vec![
+                        Span::styled("Artist: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(artist.clone()),
+                    ]));
+                }
+            }
+            lines
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    "No station selected",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press [Enter] to play the selected station",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Press [c] to select country and scan channels",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
         }
     }
 
@@ -177,6 +292,7 @@ impl AppState {
         while self.scan_log.len() > MAX_SCAN_LOG {
             self.scan_log.pop_front();
         }
+        self.rebuild_scan_log_title();
     }
 
     /// Return the SId and freq of the currently highlighted service.
@@ -331,9 +447,13 @@ fn run_loop(
     if !initial_channels.is_empty() {
         start_scan(&mut state, &handle, initial_channels);
     }
+    state.rebuild_service_items();
+    state.rebuild_now_playing();
+    state.rebuild_scan_log_title();
 
     let tick = Duration::from_millis(200);
     let mut last_tick = Instant::now();
+    let mut dirty = true;
 
     loop {
         // Drain pipeline updates.
@@ -351,10 +471,14 @@ fn run_loop(
                         }
                     }
                     state.ensemble = ens;
+                    state.rebuild_now_playing();
 
                     if state.scan_state.is_some() {
                         state.collect_from_ensemble();
+                        state.rebuild_service_items();
+                        state.rebuild_scan_log_title();
                     } else if state.discovered.is_empty() {
+                        state.rebuild_service_items();
                         let n = state.ensemble.services.len();
                         if n == 0 {
                             state.list_state.select(None);
@@ -362,15 +486,19 @@ fn run_loop(
                             state.list_state.select(Some(old_idx.min(n - 1)));
                         }
                     }
+                    dirty = true;
                 }
                 PipelineUpdate::Playing { sid, label } => {
                     state.playing_sid = Some(sid);
                     state.playing_label = Some(label.clone());
                     state.status = format!("Playing: {label}");
+                    state.rebuild_now_playing();
+                    dirty = true;
                 }
                 PipelineUpdate::Status(s) => {
                     if state.scan_state.is_none() {
                         state.status = s;
+                        dirty = true;
                     } else {
                         log::debug!("pipeline status (suppressed during scan): {s}");
                     }
@@ -387,6 +515,8 @@ fn run_loop(
                         entry.dls_text = Some(text.clone());
                         entry.now_playing = Some(metadata.clone());
                     }
+                    state.rebuild_now_playing();
+                    dirty = true;
                 }
             }
         }
@@ -395,9 +525,13 @@ fn run_loop(
         if last_tick.elapsed() >= tick {
             last_tick = Instant::now();
             advance_scan(&mut state, &handle);
+            dirty = true;
         }
 
-        terminal.draw(|f| render(f, &mut state))?;
+        if dirty {
+            terminal.draw(|f| render(f, &mut state))?;
+            dirty = false;
+        }
 
         // Input handling.
         let timeout = tick.saturating_sub(last_tick.elapsed());
@@ -413,6 +547,9 @@ fn run_loop(
                 // Capture mode before handling the key (it may change inside).
                 let was_normal = matches!(state.mode, UiMode::Normal);
                 handle_key(key.code, &mut state, &handle);
+                state.rebuild_now_playing();
+                state.rebuild_service_items();
+                dirty = true;
 
                 // Only quit if we were already in Normal mode with no active scan.
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
@@ -445,6 +582,8 @@ fn start_scan(state: &mut AppState, handle: &PipelineHandle, channels: Vec<(Stri
     state.push_scan_log(format!("Starting scan: {total} channels"));
     state.push_scan_log(format!("Tuning to channel 1/{total}: {first_name}…"));
     state.scan_state = Some(ScanState::new(channels));
+    state.rebuild_service_items();
+    state.rebuild_scan_log_title();
 
     let _ = handle.cmd_tx.try_send(PipelineCmd::Stop);
     let _ = handle.cmd_tx.try_send(PipelineCmd::Retune(first_freq));
@@ -502,6 +641,7 @@ fn advance_scan(state: &mut AppState, handle: &PipelineHandle) {
         let services = state.scan_state.take().unwrap().services;
         let count = services.len();
         state.discovered = services;
+        state.rebuild_service_items();
         let msg = if count == 0 {
             "Scan complete — no stations found".to_string()
         } else {
@@ -628,31 +768,11 @@ fn render_service_list(f: &mut Frame, state: &mut AppState, area: Rect) {
         " Services ".to_string()
     };
 
-    let items: Vec<ListItem> = if !state.discovered.is_empty() {
-        state
-            .discovered
-            .iter()
-            .map(|s| {
-                let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
-                ListItem::new(format!("{}{tag}", s.label))
-            })
-            .collect()
-    } else {
-        state
-            .ensemble
-            .services
-            .iter()
-            .map(|s| {
-                let label = if s.label.is_empty() {
-                    format!("{:08X}", s.id)
-                } else {
-                    s.label.clone()
-                };
-                let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
-                ListItem::new(format!("{label}{tag}"))
-            })
-            .collect()
-    };
+    let items: Vec<ListItem> = state
+        .service_items
+        .iter()
+        .map(|label| ListItem::new(label.as_str()))
+        .collect();
 
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -668,78 +788,7 @@ fn render_service_list(f: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
-    // Look up now-playing metadata for the currently playing service by SId.
-    let now_playing = state.playing_sid.and_then(|sid| {
-        state
-            .discovered
-            .iter()
-            .find(|s| s.sid == sid)
-            .and_then(|s| s.now_playing.clone())
-            .or_else(|| {
-                state
-                    .ensemble
-                    .services
-                    .iter()
-                    .find(|s| s.id == sid)
-                    .and_then(|s| s.now_playing.clone())
-            })
-    });
-
-    let content = if let Some(ref label) = state.playing_label {
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    "Now playing: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(label.clone()),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Ensemble: ", Style::default().fg(Color::DarkGray)),
-                Span::raw(state.ensemble.label.clone()),
-            ]),
-        ];
-        if let Some(ref meta) = now_playing {
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled("Text: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(meta.raw_text.clone(), Style::default().fg(Color::Yellow)),
-            ]));
-            if let Some(title) = &meta.title {
-                lines.push(Line::from(vec![
-                    Span::styled("Title: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(title.clone()),
-                ]));
-            }
-            if let Some(artist) = &meta.artist {
-                lines.push(Line::from(vec![
-                    Span::styled("Artist: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(artist.clone()),
-                ]));
-            }
-        }
-        lines
-    } else {
-        vec![
-            Line::from(Span::styled(
-                "No station selected",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press [Enter] to play the selected station",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press [c] to select country and scan channels",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]
-    };
-
-    let para = Paragraph::new(content)
+    let para = Paragraph::new(state.now_playing_lines.clone())
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -822,13 +871,10 @@ fn render_scan_log(f: &mut Frame, state: &AppState, area: Rect) {
         .collect();
 
     // Show how many stations have been found so far in the title.
-    let found = state.scan_state.as_ref().map_or(0, |s| s.services.len());
-    let title = format!(" Scan Log — {found} stations found so far ");
-
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(title)
+            .title(state.scan_log_title.as_str())
             .title_alignment(Alignment::Left),
     );
 

@@ -330,10 +330,10 @@ fn scan_single(
     let mut last_new_service = Option::<Instant>::None;
 
     'outer: for iq_buf in stream.rx.iter() {
-        for frame in ofdm.push_samples(&iq_buf) {
+        ofdm.process_samples(&iq_buf, |frame| {
             // Decode the 3 FIC symbols.
             fic.begin_frame();
-            for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+            for sym in frame.get(0..3).unwrap_or_default() {
                 fic.process_symbol(sym);
             }
 
@@ -345,7 +345,7 @@ fn scan_single(
                     }
                 }
             }
-        }
+        });
 
         // Timeout checks run on every IQ buffer, not just when frames are
         // produced.  Without signal the OFDM processor never yields frames,
