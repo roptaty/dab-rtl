@@ -6,6 +6,7 @@ pub mod pad;
 
 pub use ensemble::{
     Component, Ensemble, MetadataSource, NowPlaying, ProtectionLevel, Service, ServiceType,
+    UserApplication,
 };
 pub use fic::FicHandler;
 pub use msc::{AudioFrame, MscHandler};

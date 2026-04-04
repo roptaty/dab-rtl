@@ -75,10 +75,63 @@ pub struct Service {
     pub now_playing: Option<NowPlaying>,
 }
 
+impl Service {
+    pub fn advertised_app_labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        for comp in &self.components {
+            for app in &comp.user_applications {
+                let label = match app.uatype {
+                    UserApplication::UATYPE_DYNAMIC_LABEL => "DLS",
+                    UserApplication::UATYPE_SLIDESHOW => "SlideShow",
+                    UserApplication::UATYPE_EPG => "EPG",
+                    UserApplication::UATYPE_TPEG => "TPEG",
+                    _ => continue,
+                };
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        labels
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserApplication {
+    /// 11-bit User Application Type from FIG 0/13.
+    pub uatype: u16,
+    /// Raw application data bytes from FIG 0/13.
+    pub data: Vec<u8>,
+    /// Optional X-PAD application type signalled for X-PAD transports.
+    pub xpad_app_type: Option<u8>,
+    /// Optional DSCTy / transport indication when present.
+    pub dscty: Option<u8>,
+    /// Whether MSC data groups are indicated for this application, when signalled.
+    pub uses_msc_data_groups: Option<bool>,
+    /// Whether CA applies to this application, when signalled.
+    pub ca_applies: Option<bool>,
+}
+
+impl UserApplication {
+    pub const UATYPE_DYNAMIC_LABEL: u16 = 0x002;
+    pub const UATYPE_SLIDESHOW: u16 = 0x004;
+    pub const UATYPE_EPG: u16 = 0x007;
+    pub const UATYPE_TPEG: u16 = 0x00D;
+
+    pub fn is_known_metadata_app(&self) -> bool {
+        matches!(
+            self.uatype,
+            Self::UATYPE_DYNAMIC_LABEL | Self::UATYPE_SLIDESHOW | Self::UATYPE_EPG
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Component {
     /// Subchannel number (0–63).
     pub subchannel_id: u8,
+    /// Service Component Identifier within the Service when known.
+    pub scids: Option<u8>,
     pub service_type: ServiceType,
     /// Start address in Capacity Units within the MSC.
     pub start_address: u16,
@@ -88,6 +141,8 @@ pub struct Component {
     /// 10-bit packet address for packet-mode components (FIG 0/3).
     /// `None` for stream-mode (audio) components.
     pub packet_address: Option<u16>,
+    /// User applications signalled for this component via FIG 0/13.
+    pub user_applications: Vec<UserApplication>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

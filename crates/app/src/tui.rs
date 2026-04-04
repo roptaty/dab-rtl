@@ -43,7 +43,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use protocol::{Ensemble, NowPlaying};
+use protocol::{Ensemble, NowPlaying, Service};
 
 use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 
@@ -175,7 +175,7 @@ impl AppState {
             discovered: Vec::new(),
             scan_log: std::collections::VecDeque::new(),
             service_items: Vec::new(),
-            now_playing_lines: Self::build_now_playing_lines(None, "", None),
+            now_playing_lines: Self::build_now_playing_lines(None, "", None, None),
             scan_log_title: " Scan Log ".into(),
         }
     }
@@ -214,9 +214,13 @@ impl AppState {
                         .and_then(|s| s.now_playing.clone())
                 })
         });
+        let playing_service = self
+            .playing_sid
+            .and_then(|sid| self.ensemble.services.iter().find(|s| s.id == sid));
         self.now_playing_lines = Self::build_now_playing_lines(
             self.playing_label.as_deref(),
             &self.ensemble.label,
+            playing_service,
             now_playing.as_ref(),
         );
     }
@@ -229,6 +233,7 @@ impl AppState {
     fn build_now_playing_lines(
         playing_label: Option<&str>,
         ensemble_label: &str,
+        service: Option<&Service>,
         now_playing: Option<&NowPlaying>,
     ) -> Vec<Line<'static>> {
         if let Some(label) = playing_label {
@@ -246,6 +251,15 @@ impl AppState {
                     Span::raw(ensemble_label.to_string()),
                 ]),
             ];
+            if let Some(service) = service {
+                let app_labels = service.advertised_app_labels();
+                if !app_labels.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("Apps: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(app_labels.join(", ")),
+                    ]));
+                }
+            }
             if let Some(meta) = now_playing {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![

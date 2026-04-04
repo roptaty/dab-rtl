@@ -274,11 +274,17 @@ fn run_pipeline(
                         );
                         for comp in &svc.components {
                             log::info!(
-                                "    Component: subch={} start={} size={} prot={:?}",
+                                "    Component: subch={} scids={:?} start={} size={} prot={:?} pkt_addr={:?} apps={:?}",
                                 comp.subchannel_id,
+                                comp.scids,
                                 comp.start_address,
                                 comp.size,
-                                comp.protection
+                                comp.protection,
+                                comp.packet_address,
+                                comp.user_applications
+                                    .iter()
+                                    .map(|app| format!("{:#05x}", app.uatype))
+                                    .collect::<Vec<_>>()
                             );
                         }
                     }
@@ -1278,11 +1284,13 @@ mod tests {
 
         let comp = Component {
             subchannel_id: 0,
+            scids: Some(0),
             service_type: ServiceType::DabPlus,
             start_address: 0,
             size: 60,
             protection: ProtectionLevel::EepA(3),
             packet_address: None,
+            user_applications: Vec::new(),
         };
 
         // Encode known data through rate-1/4 convolutional encoder
@@ -1385,11 +1393,13 @@ mod tests {
         use protocol::ensemble::{Component, ProtectionLevel, ServiceType};
         let comp = Component {
             subchannel_id: 0,
+            scids: Some(0),
             service_type: ServiceType::Audio,
             start_address: 0,
             size: 4,
             protection: ProtectionLevel::EepA(2),
             packet_address: None,
+            user_applications: Vec::new(),
         };
         let cif = vec![1.0f32; 55296];
         assert!(dec.process_cif(&cif, &comp, 0).is_none());
@@ -2358,11 +2368,13 @@ mod tests {
                         // Depuncture with this level
                         let test_comp = Component {
                             subchannel_id: comp.subchannel_id,
+                            scids: comp.scids,
                             service_type: comp.service_type.clone(),
                             start_address: comp.start_address,
                             size: comp.size,
                             protection: ProtectionLevel::EepA(eep_level),
                             packet_address: None,
+                            user_applications: comp.user_applications.clone(),
                         };
                         let depunct = eep_depuncture(&normalized, &test_comp);
                         let bits = vit.decode(&depunct);
@@ -2434,11 +2446,13 @@ mod tests {
 
                     let test_comp = Component {
                         subchannel_id: comp.subchannel_id,
+                        scids: comp.scids,
                         service_type: comp.service_type.clone(),
                         start_address: comp.start_address,
                         size: comp.size,
                         protection: ProtectionLevel::EepA(eep_level),
                         packet_address: None,
+                        user_applications: comp.user_applications.clone(),
                     };
                     let depunct = eep_depuncture(&normalized, &test_comp);
                     let (_, metric) = vit.decode_with_metric(&depunct);
