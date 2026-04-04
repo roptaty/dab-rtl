@@ -16,14 +16,16 @@
 ///
 /// MSC decoding (per CIF = 18 symbols = 55296 soft bits = 864 CUs):
 ///   Extract target subchannel (start_address … start_address+size CUs)
-///   → EEP depuncture → Viterbi → pack bytes → MP2 decoder
+///   → EEP depuncture → Viterbi → pack bytes → audio decoder
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use audio::{DabPlusDecoder, Mp2Decoder};
+use audio::DabPlusDecoder;
+#[cfg(feature = "mp2")]
+use audio::Mp2Decoder;
 use fec::ViterbiDecoder;
 use ofdm::OfdmProcessor;
 use protocol::{
@@ -154,6 +156,7 @@ fn run_pipeline(
         let mut ofdm = OfdmProcessor::new();
         let mut fic = FicDecoder::new();
         let mut msc = MscDecoder::new();
+        #[cfg(feature = "mp2")]
         let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
         let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
 
@@ -168,6 +171,8 @@ fn run_pipeline(
         let mut xpad = XPadAssembler::new();
         let mut packet_dls = PacketDlsAssembler::new();
         let mut last_now_playing: Option<NowPlaying> = None;
+        #[cfg(not(feature = "mp2"))]
+        let mut warned_mp2_unsupported = false;
 
         let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
@@ -189,6 +194,10 @@ fn run_pipeline(
                             xpad.reset();
                             packet_dls.reset();
                             last_now_playing = None;
+                            #[cfg(not(feature = "mp2"))]
+                            {
+                                warned_mp2_unsupported = false;
+                            }
                         }
                         PipelineCmd::Stop => {
                             playing_sid = None;
@@ -197,6 +206,10 @@ fn run_pipeline(
                             xpad.reset();
                             packet_dls.reset();
                             last_now_playing = None;
+                            #[cfg(not(feature = "mp2"))]
+                            {
+                                warned_mp2_unsupported = false;
+                            }
                         }
                         PipelineCmd::Retune(freq_hz) => {
                             pending_retune = Some(freq_hz);
@@ -278,6 +291,14 @@ fn run_pipeline(
                             sid,
                             label: svc.label.clone(),
                         });
+                        #[cfg(not(feature = "mp2"))]
+                        if !svc.is_dab_plus && !warned_mp2_unsupported {
+                            warned_mp2_unsupported = true;
+                            let _ = update_tx.try_send(PipelineUpdate::Status(
+                                "Legacy MP2 audio is disabled in this build. Rebuild with --features mp2 to enable it."
+                                    .into(),
+                            ));
+                        }
                     }
                 }
 
@@ -355,6 +376,8 @@ fn run_pipeline(
                                         }
                                         pcm
                                     } else {
+                                        #[cfg(feature = "mp2")]
+                                        {
                                         let pcm = mp2.push(&frame.data);
                                         // Extract X-PAD DLS from the MPEG Layer 2 frames.
                                         log::debug!(
@@ -378,6 +401,11 @@ fn run_pipeline(
                                             );
                                         }
                                         pcm
+                                        }
+                                        #[cfg(not(feature = "mp2"))]
+                                        {
+                                            Vec::new()
+                                        }
                                     };
                                     if pcm.is_empty() {
                                         log::debug!(

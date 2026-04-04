@@ -4,6 +4,7 @@
 /// DAB+ audio is carried as HE-AAC v2 Access Units packed inside a DAB+
 /// superframe (ETSI TS 102 563).  Raw AUs are fed to fdk-aac via RAW
 /// transport with an AudioSpecificConfig (960-sample frames, SBR/PS).
+#[cfg(feature = "mp2")]
 use symphonia::core::{
     audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
     meta::MetadataOptions, probe::Hint,
@@ -13,6 +14,7 @@ use symphonia::core::{
 ///
 /// Returns interleaved stereo (or mono) f32 samples, or an empty vec on
 /// failure.  Errors are logged at warn level.
+#[cfg(feature = "mp2")]
 pub fn decode_mp2(data: &[u8]) -> Vec<f32> {
     if data.is_empty() {
         return Vec::new();
@@ -79,11 +81,13 @@ pub fn decode_mp2(data: &[u8]) -> Vec<f32> {
 ///
 /// DAB audio superframes are typically 3 MP2 frames (for 48 kHz stereo).
 /// We buffer until we have at least `min_bytes` and then flush.
+#[cfg(feature = "mp2")]
 pub struct Mp2Decoder {
     buf: Vec<u8>,
     min_bytes: usize,
 }
 
+#[cfg(feature = "mp2")]
 impl Mp2Decoder {
     /// Create a decoder.
     ///
@@ -624,17 +628,20 @@ impl DabPlusDecoder {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "mp2")]
     #[test]
     fn empty_input_returns_empty() {
         assert!(decode_mp2(&[]).is_empty());
     }
 
+    #[cfg(feature = "mp2")]
     #[test]
     fn garbage_input_returns_empty_no_panic() {
         let garbage = vec![0xFFu8; 256];
         let _ = decode_mp2(&garbage); // must not panic
     }
 
+    #[cfg(feature = "mp2")]
     #[test]
     fn mp2_decoder_buffers_until_min() {
         let mut dec = Mp2Decoder::new(512);

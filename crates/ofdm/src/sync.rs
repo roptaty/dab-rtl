@@ -16,7 +16,7 @@ const WINDOW_SIZE: usize = 256;
 pub const MIN_WARMUP_SAMPLES: usize = 8192;
 
 /// State machine for the synchroniser.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SyncState {
     /// Searching for the first null symbol.
     Hunting,
@@ -91,7 +91,7 @@ impl FrameSync {
                 0.0
             };
 
-            match &self.state.clone() {
+            match self.state {
                 SyncState::Hunting | SyncState::Locked => {
                     // Update long-term average only when not in a null.
                     self.long_term_avg = 0.999 * self.long_term_avg + 0.001 * (window_mean);
@@ -138,7 +138,7 @@ impl FrameSync {
                         // Null ended — energy rose back.
                         // The phase-reference symbol starts right here.
                         let frame_start = FrameStart {
-                            null_start: *null_start,
+                            null_start,
                             sample_offset: self.sample_count.wrapping_sub(1),
                         };
                         log::info!(

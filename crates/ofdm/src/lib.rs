@@ -48,6 +48,10 @@ pub struct OfdmProcessor {
     deinterleaver: FreqDeinterleaver,
     /// Accumulation buffer for incoming samples.
     sample_buf: Vec<Complex32>,
+    /// Reused symbol deinterleaver scratch.
+    re_scratch: Vec<f32>,
+    /// Reused symbol deinterleaver scratch.
+    im_scratch: Vec<f32>,
     /// Absolute sample index of the most-recent `FrameStart::sample_offset`
     /// (start of the phase-reference symbol after the null).
     prs_offset: Option<usize>,
@@ -61,6 +65,8 @@ impl OfdmProcessor {
             demod: OfdmDemod::new(),
             deinterleaver: FreqDeinterleaver::new(),
             sample_buf: Vec::new(),
+            re_scratch: vec![0.0; NUM_CARRIERS],
+            im_scratch: vec![0.0; NUM_CARRIERS],
             prs_offset: None,
         }
     }
@@ -173,12 +179,14 @@ impl OfdmProcessor {
                 // Deinterleave each half separately, keep split layout.
                 let (re_channel, im_channel) = raw_bits.split_at(NUM_CARRIERS);
 
-                let re_di = self.deinterleaver.deinterleave(re_channel);
-                let im_di = self.deinterleaver.deinterleave(im_channel);
+                self.deinterleaver
+                    .deinterleave_into(re_channel, &mut self.re_scratch);
+                self.deinterleaver
+                    .deinterleave_into(im_channel, &mut self.im_scratch);
 
                 let mut deinterleaved = Vec::with_capacity(NUM_CARRIERS * 2);
-                deinterleaved.extend_from_slice(&re_di);
-                deinterleaved.extend_from_slice(&im_di);
+                deinterleaved.extend_from_slice(&self.re_scratch);
+                deinterleaved.extend_from_slice(&self.im_scratch);
 
                 soft_bits.push(deinterleaved);
             }

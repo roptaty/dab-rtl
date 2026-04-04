@@ -77,12 +77,22 @@ impl FreqDeinterleaver {
     ///   out[logical] = carriers[table[logical]]
     pub fn deinterleave(&self, carriers: &[f32]) -> Vec<f32> {
         let mut out = vec![0.0f32; NUM_CARRIERS];
-        for (logical, &src) in self.table.iter().enumerate() {
-            if src < carriers.len() && logical < NUM_CARRIERS {
-                out[logical] = carriers[src];
-            }
-        }
+        self.deinterleave_into(carriers, &mut out);
         out
+    }
+
+    /// Reorder `carriers` into the caller-provided output buffer.
+    pub fn deinterleave_into(&self, carriers: &[f32], out: &mut [f32]) {
+        let n = NUM_CARRIERS.min(out.len());
+        for (logical, &src) in self.table.iter().enumerate() {
+            if logical >= n {
+                break;
+            }
+            out[logical] = if src < carriers.len() { carriers[src] } else { 0.0 };
+        }
+        for dst in out[n..].iter_mut() {
+            *dst = 0.0;
+        }
     }
 }
 
