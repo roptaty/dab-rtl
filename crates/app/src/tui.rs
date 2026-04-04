@@ -188,15 +188,16 @@ impl AppState {
                 format!("{}{tag}", s.label)
             }));
         } else {
-            self.service_items.extend(self.ensemble.services.iter().map(|s| {
-                let label = if s.label.is_empty() {
-                    format!("{:08X}", s.id)
-                } else {
-                    s.label.clone()
-                };
-                let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
-                format!("{label}{tag}")
-            }));
+            self.service_items
+                .extend(self.ensemble.services.iter().map(|s| {
+                    let label = if s.label.is_empty() {
+                        format!("{:08X}", s.id)
+                    } else {
+                        s.label.clone()
+                    };
+                    let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
+                    format!("{label}{tag}")
+                }));
         }
     }
 

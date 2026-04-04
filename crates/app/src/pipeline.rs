@@ -679,8 +679,7 @@ impl FicDecoder {
 
         self.handler.process_fic_bytes(&fic_bytes);
         let remaining = self.fic_buf.len() - fec::FIC_PUNCTURED_BITS;
-        self.fic_buf
-            .copy_within(fec::FIC_PUNCTURED_BITS.., 0);
+        self.fic_buf.copy_within(fec::FIC_PUNCTURED_BITS.., 0);
         self.fic_buf.truncate(remaining);
     }
 
@@ -825,7 +824,11 @@ impl MscDecoder {
         }
 
         // Normalize soft bits to ~[-1, +1] for Viterbi (matches FIC path).
-        let max_abs = self.deint_soft.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let max_abs = self
+            .deint_soft
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max);
         let scale = if max_abs > 0.0 { 1.0 / max_abs } else { 1.0 };
         for (dst, src) in self.normalized_soft.iter_mut().zip(self.deint_soft.iter()) {
             *dst = *src * scale;

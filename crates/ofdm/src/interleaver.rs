@@ -88,7 +88,11 @@ impl FreqDeinterleaver {
             if logical >= n {
                 break;
             }
-            out[logical] = if src < carriers.len() { carriers[src] } else { 0.0 };
+            out[logical] = if src < carriers.len() {
+                carriers[src]
+            } else {
+                0.0
+            };
         }
         for dst in out[n..].iter_mut() {
             *dst = 0.0;

@@ -337,7 +337,11 @@ impl FibParser {
                         // SCIdS=0 is enough to link FIG 0/13 applications for the
                         // common single-audio-component case. Secondary stream
                         // components need FIG 0/8 for exact SCIdS resolution.
-                        scids: if svc.components.is_empty() { Some(0) } else { None },
+                        scids: if svc.components.is_empty() {
+                            Some(0)
+                        } else {
+                            None
+                        },
                         service_type,
                         start_address,
                         size,
@@ -565,7 +569,9 @@ fn decode_label(bytes: &[u8]) -> String {
     s.trim_end().to_string()
 }
 
-fn parse_fig_0_13_transport_fields(data: &[u8]) -> (Option<u8>, Option<u8>, Option<bool>, Option<bool>) {
+fn parse_fig_0_13_transport_fields(
+    data: &[u8],
+) -> (Option<u8>, Option<u8>, Option<bool>, Option<bool>) {
     let Some(&b0) = data.first() else {
         return (None, None, None, None);
     };
@@ -580,7 +586,10 @@ fn parse_fig_0_13_transport_fields(data: &[u8]) -> (Option<u8>, Option<u8>, Opti
 }
 
 fn upsert_user_application(apps: &mut Vec<UserApplication>, app: UserApplication) {
-    if let Some(existing) = apps.iter_mut().find(|existing| existing.uatype == app.uatype) {
+    if let Some(existing) = apps
+        .iter_mut()
+        .find(|existing| existing.uatype == app.uatype)
+    {
         *existing = app;
     } else {
         apps.push(app);
@@ -812,8 +821,8 @@ mod tests {
             0x34,
             0x90,
             0x14,
-            0x05,       // low nibble carries PacketAddress[9:6] = 0b0101
-            0x05 << 2,  // PacketAddress[5:0] = 0b000101 = 5 => total 325
+            0x05,      // low nibble carries PacketAddress[9:6] = 0b0101
+            0x05 << 2, // PacketAddress[5:0] = 0b000101 = 5 => total 325
         ];
         parser.parse_fig_0_3(&payload);
 

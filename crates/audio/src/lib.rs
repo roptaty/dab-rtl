@@ -1,8 +1,8 @@
 pub mod decode;
 mod fdk;
-pub use decode::{firecode_check, DabPlusDecoder};
 #[cfg(feature = "mp2")]
 pub use decode::{decode_mp2, Mp2Decoder};
+pub use decode::{firecode_check, DabPlusDecoder};
 
 /// Audio output via cpal (ALSA or PulseAudio on Linux).
 ///
@@ -76,7 +76,10 @@ impl PcmRingBuffer {
         }
         let remaining = count - first;
         if remaining > 0 {
-            for (dst, src) in out[first..count].iter_mut().zip(self.data[..remaining].iter()) {
+            for (dst, src) in out[first..count]
+                .iter_mut()
+                .zip(self.data[..remaining].iter())
+            {
                 *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             }
         }
