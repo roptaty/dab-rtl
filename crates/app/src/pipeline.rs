@@ -17,15 +17,17 @@
 /// MSC decoding (per CIF = 18 symbols = 55296 soft bits = 864 CUs):
 ///   Extract target subchannel (start_address … start_address+size CUs)
 ///   → EEP depuncture → Viterbi → pack bytes → MP2 decoder
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use audio::{DabPlusDecoder, Mp2Decoder};
 use fec::ViterbiDecoder;
 use ofdm::OfdmProcessor;
 use protocol::{
-    ensemble::{Component, ProtectionLevel},
+    ensemble::{Component, MetadataSource, NowPlaying, ProtectionLevel, ServiceType},
     Ensemble, FicHandler, XPadAssembler,
 };
 
@@ -42,8 +44,8 @@ pub enum PipelineUpdate {
     Playing { sid: u32, label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
-    /// DLS (Dynamic Label Segment) text updated for a service.
-    Dls { sid: u32, text: String },
+    /// Structured now-playing metadata updated for a service.
+    NowPlaying { sid: u32, metadata: NowPlaying },
 }
 
 /// Commands sent to the pipeline background thread.
@@ -164,7 +166,8 @@ fn run_pipeline(
         let mut dls_msc = MscDecoder::new();
         // X-PAD DLS assembler: extracts DLS from the audio subchannel itself.
         let mut xpad = XPadAssembler::new();
-        let mut last_dls_text = String::new();
+        let mut packet_dls = PacketDlsAssembler::new();
+        let mut last_now_playing: Option<NowPlaying> = None;
 
         let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
 
@@ -184,14 +187,16 @@ fn run_pipeline(
                             msc.set_target_sid(sid);
                             dls_msc.set_target_sid(sid);
                             xpad.reset();
-                            last_dls_text.clear();
+                            packet_dls.reset();
+                            last_now_playing = None;
                         }
                         PipelineCmd::Stop => {
                             playing_sid = None;
                             msc.clear_target();
                             dls_msc.clear_target();
                             xpad.reset();
-                            last_dls_text.clear();
+                            packet_dls.reset();
+                            last_now_playing = None;
                         }
                         PipelineCmd::Retune(freq_hz) => {
                             pending_retune = Some(freq_hz);
@@ -337,20 +342,15 @@ fn run_pipeline(
                                             );
                                         }
                                         for au_data in dab_plus.pad_aus.drain(..) {
-                                            if let Some(text) = xpad.push_dabplus_au(&au_data) {
-                                                if text != last_dls_text {
-                                                    log::info!(
-                                                        "X-PAD DLS (DAB+): SId={:04X} text={:?}",
-                                                        sid,
-                                                        text
-                                                    );
-                                                    last_dls_text = text.clone();
-                                                    let _ =
-                                                        update_tx.try_send(PipelineUpdate::Dls {
-                                                            sid,
-                                                            text,
-                                                        });
-                                                }
+                                            if let Some(meta) =
+                                                xpad.push_dabplus_au_metadata(&au_data)
+                                            {
+                                                maybe_emit_now_playing(
+                                                    &update_tx,
+                                                    sid,
+                                                    meta,
+                                                    &mut last_now_playing,
+                                                );
                                             }
                                         }
                                         pcm
@@ -367,17 +367,15 @@ fn run_pipeline(
                                             frame.data.get(2).copied().unwrap_or(0),
                                             frame.data.get(3).copied().unwrap_or(0),
                                         );
-                                        if let Some(text) = xpad.push_mp2_bytes(&frame.data) {
-                                            if text != last_dls_text {
-                                                log::info!(
-                                                    "X-PAD DLS (DAB): SId={:04X} text={:?}",
-                                                    sid,
-                                                    text
-                                                );
-                                                last_dls_text = text.clone();
-                                                let _ = update_tx
-                                                    .try_send(PipelineUpdate::Dls { sid, text });
-                                            }
+                                        if let Some(meta) =
+                                            xpad.push_mp2_bytes_metadata(&frame.data)
+                                        {
+                                            maybe_emit_now_playing(
+                                                &update_tx,
+                                                sid,
+                                                meta,
+                                                &mut last_now_playing,
+                                            );
                                         }
                                         pcm
                                     };
@@ -450,25 +448,20 @@ fn run_pipeline(
                                                         .join(" ")
                                                 );
                                             }
-                                            match parse_dls_packets(
+                                            match packet_dls.push_frame(
                                                 &frame.data,
                                                 dls_comp.packet_address.unwrap_or(0),
                                             ) {
                                                 None => {
-                                                    log::debug!("DLS: parse_dls_packets returned None (no matching packet / bad command)");
+                                                    log::debug!("DLS: packet reassembly returned no complete item");
                                                 }
-                                                Some(text) => {
-                                                    if text != last_dls_text {
-                                                        log::info!(
-                                                            "DLS: SId={:04X} text={:?}",
-                                                            sid,
-                                                            text
-                                                        );
-                                                        last_dls_text = text.clone();
-                                                        let _ = update_tx.try_send(
-                                                            PipelineUpdate::Dls { sid, text },
-                                                        );
-                                                    }
+                                                Some(meta) => {
+                                                    maybe_emit_now_playing(
+                                                        &update_tx,
+                                                        sid,
+                                                        meta,
+                                                        &mut last_now_playing,
+                                                    );
                                                 }
                                             }
                                         }
@@ -855,69 +848,226 @@ fn find_dls_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
         .find(|s| s.id == sid)?
         .components
         .iter()
-        .find(|c| c.packet_address.is_some())
+        .find(|c| c.packet_address.is_some() && c.service_type == ServiceType::Data)
 }
 
-/// Parse MSC packets from decoded subchannel bytes and extract DLS text.
-///
-/// MSC packet header (ETSI EN 300 401 §5.3.2.1, 3 bytes):
-///   Byte 0: Packet_length[7:6] | Continuity_index[5:4] | First_last[3:2] | Address[9:8]
-///   Byte 1: Address[7:0]
-///   Byte 2: Command_flag[7] | Useful_data_length[6:0]
-///
-/// DLS command (ETSI TS 102 980):
-///   Byte 0 of useful data: command tag (0x01 = Set DL)
-///   Byte 1: Charset[7:4] | Toggle[3] | Item_Running[2] | rfa[1:0]
-///   Bytes 2+: label text (EBU Latin or UTF-8 per charset)
-fn parse_dls_packets(data: &[u8], target_address: u16) -> Option<String> {
-    let mut pos = 0usize;
-    while pos + 3 <= data.len() {
-        let packet_length = (data[pos] >> 6) & 0x03;
-        let packet_size = 24 * (packet_length as usize + 1);
-        let address = (((data[pos] & 0x03) as u16) << 8) | data[pos + 1] as u16;
-        let useful_data_len = (data[pos + 2] & 0x7F) as usize;
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
-        if pos + packet_size > data.len() {
-            break;
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_charset_text(bytes: &[u8], charset: u8) -> String {
+    let mut trimmed = bytes.to_vec();
+    while trimmed.last() == Some(&0) {
+        trimmed.pop();
+    }
+    let raw = if charset == 0x06 {
+        String::from_utf8_lossy(&trimmed).into_owned()
+    } else {
+        trimmed.iter().map(|&b| b as char).collect::<String>()
+    };
+    normalize_text(raw.trim())
+}
+
+fn maybe_emit_now_playing(
+    update_tx: &mpsc::SyncSender<PipelineUpdate>,
+    sid: u32,
+    incoming: NowPlaying,
+    last: &mut Option<NowPlaying>,
+) {
+    let merged = merge_metadata(last.clone(), incoming);
+    let should_emit = match last {
+        None => true,
+        Some(prev) => {
+            prev.raw_text != merged.raw_text
+                || prev.title != merged.title
+                || prev.artist != merged.artist
+                || prev.toggle != merged.toggle
+                || prev.item_running != merged.item_running
+                || prev.source != merged.source
         }
+    };
+    if should_emit {
+        log::info!(
+            "NowPlaying: SId={:04X} source={:?} text={:?} title={:?} artist={:?}",
+            sid,
+            merged.source,
+            merged.raw_text,
+            merged.title,
+            merged.artist
+        );
+        *last = Some(merged.clone());
+        let _ = update_tx.try_send(PipelineUpdate::NowPlaying {
+            sid,
+            metadata: merged,
+        });
+    }
+}
 
-        if address == target_address && useful_data_len >= 2 {
-            // Useful data lives between the 3-byte header and the 2-byte CRC.
+fn merge_metadata(current: Option<NowPlaying>, mut incoming: NowPlaying) -> NowPlaying {
+    incoming.raw_text = normalize_text(&incoming.raw_text);
+    if incoming.updated_at_unix_ms == 0 {
+        incoming.updated_at_unix_ms = unix_ms_now();
+    }
+    let Some(existing) = current else {
+        return incoming;
+    };
+
+    if incoming.toggle.is_some() && incoming.toggle != existing.toggle {
+        return incoming;
+    }
+    let incoming_structured = incoming.title.is_some() || incoming.artist.is_some();
+    let existing_structured = existing.title.is_some() || existing.artist.is_some();
+    if incoming_structured && !existing_structured {
+        return incoming;
+    }
+    if existing.source == Some(MetadataSource::XPad)
+        && incoming.source == Some(MetadataSource::Packet)
+        && !incoming_structured
+    {
+        return existing;
+    }
+    if incoming.raw_text != existing.raw_text {
+        return incoming;
+    }
+    let mut merged = existing;
+    if merged.title.is_none() {
+        merged.title = incoming.title;
+    }
+    if merged.artist.is_none() {
+        merged.artist = incoming.artist;
+    }
+    if merged.item_running.is_none() {
+        merged.item_running = incoming.item_running;
+    }
+    merged.updated_at_unix_ms = incoming.updated_at_unix_ms;
+    merged
+}
+
+#[derive(Default)]
+struct PacketDlsAssembler {
+    by_address: HashMap<u16, PacketDataGroup>,
+}
+
+#[derive(Default)]
+struct PacketDataGroup {
+    bytes: Vec<u8>,
+    last_continuity: Option<u8>,
+}
+
+impl PacketDlsAssembler {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        self.by_address.clear();
+    }
+
+    fn push_frame(&mut self, data: &[u8], target_address: u16) -> Option<NowPlaying> {
+        let mut pos = 0usize;
+        while pos + 3 <= data.len() {
+            let packet_length = (data[pos] >> 6) & 0x03;
+            let packet_size = 24 * (packet_length as usize + 1);
+            let continuity = (data[pos] >> 4) & 0x03;
+            let first_last = (data[pos] >> 2) & 0x03;
+            let address = (((data[pos] & 0x03) as u16) << 8) | data[pos + 1] as u16;
+            let command_flag = (data[pos + 2] & 0x80) != 0;
+            let useful_data_len = (data[pos + 2] & 0x7F) as usize;
+
+            if pos + packet_size > data.len() {
+                break;
+            }
             let data_start = pos + 3;
             let data_end = (pos + packet_size - 2).min(data_start + useful_data_len);
-            if data_end > data_start {
-                let useful = &data[data_start..data_end];
-                if useful.first() == Some(&0x01) && useful.len() >= 2 {
-                    // Set DL command
-                    let charset = (useful[1] >> 4) & 0x0F;
-                    let text_bytes = &useful[2..];
-                    // Strip trailing null padding.
-                    let trimmed: Vec<u8> =
-                        text_bytes.iter().copied().take_while(|&b| b != 0).collect();
-                    if !trimmed.is_empty() {
-                        let text = if charset == 0x06 {
-                            // UTF-8
-                            String::from_utf8_lossy(&trimmed).trim().to_string()
-                        } else {
-                            // EBU Latin (treat non-ASCII as '?')
-                            trimmed
-                                .iter()
-                                .map(|&b| if b < 0x80 { b as char } else { '?' })
-                                .collect::<String>()
-                                .trim()
-                                .to_string()
-                        };
-                        if !text.is_empty() {
-                            return Some(text);
-                        }
-                    }
+            if data_end <= data_start {
+                pos += packet_size;
+                continue;
+            }
+            let useful = &data[data_start..data_end];
+            if address == target_address && !command_flag {
+                if let Some(meta) = self.push_packet(address, continuity, first_last, useful) {
+                    return Some(meta);
                 }
             }
+            pos += packet_size;
         }
-
-        pos += packet_size;
+        None
     }
-    None
+
+    fn push_packet(
+        &mut self,
+        address: u16,
+        continuity: u8,
+        first_last: u8,
+        useful: &[u8],
+    ) -> Option<NowPlaying> {
+        let group = self.by_address.entry(address).or_default();
+        match first_last {
+            0b11 => {
+                group.bytes.clear();
+                group.last_continuity = Some(continuity);
+                parse_packet_dls_bytes(useful)
+            }
+            0b10 => {
+                group.bytes.clear();
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                None
+            }
+            0b00 => {
+                if let Some(prev) = group.last_continuity {
+                    if ((prev + 1) & 0x03) != continuity {
+                        group.bytes.clear();
+                    }
+                }
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                None
+            }
+            0b01 => {
+                if let Some(prev) = group.last_continuity {
+                    if ((prev + 1) & 0x03) != continuity {
+                        group.bytes.clear();
+                    }
+                }
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                let assembled = std::mem::take(&mut group.bytes);
+                parse_packet_dls_bytes(&assembled)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn parse_packet_dls_bytes(bytes: &[u8]) -> Option<NowPlaying> {
+    if bytes.len() < 2 || bytes.first() != Some(&0x01) {
+        return None;
+    }
+    let ctrl = bytes[1];
+    let charset = (ctrl >> 4) & 0x0F;
+    let toggle = Some((ctrl & 0x08) != 0);
+    let item_running = Some((ctrl & 0x04) != 0);
+    let raw_text = decode_charset_text(&bytes[2..], charset);
+    if raw_text.is_empty() {
+        return None;
+    }
+    Some(NowPlaying {
+        raw_text,
+        title: None,
+        artist: None,
+        toggle,
+        item_running,
+        source: Some(MetadataSource::Packet),
+        updated_at_unix_ms: unix_ms_now(),
+    })
 }
 
 /// Quick FIB CRC-16/CCITT check for debug logging.
@@ -980,6 +1130,56 @@ fn pack_bits(bits: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_metadata_prefers_xpad_over_plain_packet() {
+        let existing = NowPlaying {
+            raw_text: "Track A".into(),
+            title: None,
+            artist: None,
+            toggle: Some(false),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 100,
+        };
+        let incoming = NowPlaying {
+            raw_text: "Track A".into(),
+            title: None,
+            artist: None,
+            toggle: Some(false),
+            item_running: Some(true),
+            source: Some(MetadataSource::Packet),
+            updated_at_unix_ms: 200,
+        };
+        let merged = merge_metadata(Some(existing.clone()), incoming);
+        assert_eq!(merged.source, existing.source);
+        assert_eq!(merged.raw_text, "Track A");
+    }
+
+    #[test]
+    fn packet_dls_single_packet_decodes_text() {
+        let mut asm = PacketDlsAssembler::new();
+        let addr = 0x0155u16;
+        // One 24-byte packet:
+        // byte0: len=0 (24B), continuity=1, first_last=3 (single), address_hi
+        // byte1: address_lo
+        // byte2: command_flag=0, useful_len=6
+        // useful: [0x01, ctrl(charset0,toggle0,item1), 'H', 'e', 'j', 0]
+        let mut pkt = vec![0u8; 24];
+        pkt[0] = (1 << 4) | (3 << 2) | ((addr >> 8) as u8 & 0x03);
+        pkt[1] = (addr & 0xFF) as u8;
+        pkt[2] = 6;
+        pkt[3] = 0x01;
+        pkt[4] = 0x04;
+        pkt[5] = b'H';
+        pkt[6] = b'e';
+        pkt[7] = b'j';
+        pkt[8] = 0;
+        let meta = asm.push_frame(&pkt, addr).expect("expected metadata");
+        assert_eq!(meta.raw_text, "Hej");
+        assert_eq!(meta.source, Some(MetadataSource::Packet));
+        assert_eq!(meta.item_running, Some(true));
+    }
 
     #[test]
     fn pack_bits_all_ones() {

@@ -43,7 +43,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use protocol::Ensemble;
+use protocol::{Ensemble, NowPlaying};
 
 use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 
@@ -59,6 +59,7 @@ pub struct DiscoveredService {
     pub freq_hz: u32,
     pub is_dab_plus: bool,
     pub dls_text: Option<String>,
+    pub now_playing: Option<NowPlaying>,
 }
 
 /// Per-channel scan progress tracked by the TUI.
@@ -254,6 +255,7 @@ impl AppState {
                         freq_hz: freq,
                         is_dab_plus: svc.is_dab_plus,
                         dls_text: svc.dls_text.clone(),
+                        now_playing: svc.now_playing.clone(),
                     },
                 )
             })
@@ -345,6 +347,7 @@ fn run_loop(
                     for svc in &mut ens.services {
                         if let Some(old) = state.ensemble.services.iter().find(|s| s.id == svc.id) {
                             svc.dls_text = old.dls_text.clone();
+                            svc.now_playing = old.now_playing.clone();
                         }
                     }
                     state.ensemble = ens;
@@ -372,14 +375,17 @@ fn run_loop(
                         log::debug!("pipeline status (suppressed during scan): {s}");
                     }
                 }
-                PipelineUpdate::Dls { sid, text } => {
-                    // Update dls_text in the live ensemble snapshot.
+                PipelineUpdate::NowPlaying { sid, metadata } => {
+                    let text = metadata.raw_text.clone();
+                    // Update metadata in the live ensemble snapshot.
                     if let Some(svc) = state.ensemble.services.iter_mut().find(|s| s.id == sid) {
                         svc.dls_text = Some(text.clone());
+                        svc.now_playing = Some(metadata.clone());
                     }
                     // Also update any discovered service entry for cross-channel scans.
                     if let Some(entry) = state.discovered.iter_mut().find(|s| s.sid == sid) {
                         entry.dls_text = Some(text.clone());
+                        entry.now_playing = Some(metadata.clone());
                     }
                 }
             }
@@ -662,21 +668,20 @@ fn render_service_list(f: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
-    // Look up DLS text for the currently playing service by SId.
-    // SId-based lookup is reliable because the Dls pipeline update also uses SId.
-    let dls_text = state.playing_sid.and_then(|sid| {
+    // Look up now-playing metadata for the currently playing service by SId.
+    let now_playing = state.playing_sid.and_then(|sid| {
         state
             .discovered
             .iter()
             .find(|s| s.sid == sid)
-            .and_then(|s| s.dls_text.clone())
+            .and_then(|s| s.now_playing.clone())
             .or_else(|| {
                 state
                     .ensemble
                     .services
                     .iter()
                     .find(|s| s.id == sid)
-                    .and_then(|s| s.dls_text.clone())
+                    .and_then(|s| s.now_playing.clone())
             })
     });
 
@@ -695,12 +700,24 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
                 Span::raw(state.ensemble.label.clone()),
             ]),
         ];
-        if let Some(ref dls) = dls_text {
+        if let Some(ref meta) = now_playing {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("Text: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(dls.clone(), Style::default().fg(Color::Yellow)),
+                Span::styled(meta.raw_text.clone(), Style::default().fg(Color::Yellow)),
             ]));
+            if let Some(title) = &meta.title {
+                lines.push(Line::from(vec![
+                    Span::styled("Title: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(title.clone()),
+                ]));
+            }
+            if let Some(artist) = &meta.artist {
+                lines.push(Line::from(vec![
+                    Span::styled("Artist: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(artist.clone()),
+                ]));
+            }
         }
         lines
     } else {

@@ -1,5 +1,31 @@
 /// DAB ensemble and service description types.
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataSource {
+    /// Metadata extracted from audio-associated X-PAD.
+    XPad,
+    /// Metadata extracted from packet-mode DLS components.
+    Packet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NowPlaying {
+    /// Full unstructured text as carried by DLS (fallback for display).
+    pub raw_text: String,
+    /// Song title extracted from DL+ tags when available.
+    pub title: Option<String>,
+    /// Artist extracted from DL+ tags when available.
+    pub artist: Option<String>,
+    /// DLS toggle bit (changes when item changes), if signalled.
+    pub toggle: Option<bool>,
+    /// Item running flag, if signalled by the broadcaster.
+    pub item_running: Option<bool>,
+    /// Origin transport for this metadata update.
+    pub source: Option<MetadataSource>,
+    /// Receiver timestamp in Unix milliseconds.
+    pub updated_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Ensemble {
     /// 16-bit Ensemble Identifier (EId).
@@ -45,6 +71,8 @@ pub struct Service {
     pub components: Vec<Component>,
     /// Dynamic Label Segment text (from MSC data packets), if received.
     pub dls_text: Option<String>,
+    /// Structured now-playing metadata (from X-PAD and/or packet DLS).
+    pub now_playing: Option<NowPlaying>,
 }
 
 #[derive(Debug, Clone)]

@@ -523,8 +523,14 @@ fn cmd_play(
             PipelineUpdate::Status(s) => {
                 log::info!("Pipeline: {s}");
             }
-            PipelineUpdate::Dls { sid, text } => {
-                log::info!("DLS SId={:04X}: {}", sid, text);
+            PipelineUpdate::NowPlaying { sid, metadata } => {
+                log::info!(
+                    "NowPlaying SId={:04X}: text={:?} title={:?} artist={:?}",
+                    sid,
+                    metadata.raw_text,
+                    metadata.title,
+                    metadata.artist
+                );
             }
         }
     }

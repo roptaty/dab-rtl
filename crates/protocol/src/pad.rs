@@ -16,30 +16,37 @@
 /// (ETSI TS 102 563 §5.4.3).  F-PAD is the last 2 bytes of the DSE payload;
 /// X-PAD precedes F-PAD within the DSE payload.
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::ensemble::{MetadataSource, NowPlaying};
 
 // ─────────────────────────────────────────────────────────────────────────── //
 //  Constants                                                                   //
 // ─────────────────────────────────────────────────────────────────────────── //
 
-/// X-PAD Application Type 2 = DLS (Dynamic Label Segment).
-const APP_TYPE_DLS: u8 = 2;
+/// X-PAD Application Type 2 = DLS start (Dynamic Label Segment, start of data group).
+const APP_TYPE_DLS_START: u8 = 2;
+
+/// X-PAD Application Type 3 = DLS continuation.
+const APP_TYPE_DLS_CONT: u8 = 3;
 
 /// Map CI sub-field length indicator (upper 3 bits of a Content Indicator byte)
 /// to byte count.
 ///
 /// Per ETSI EN 300 401 §7.4.2.2, Table 2 (variable-size X-PAD).
-/// Returns `None` for the end-marker (7).
-fn ci_length(code: u8) -> Option<usize> {
+/// All 3-bit codes 0–7 are valid lengths.  The end of the CI list is signalled
+/// by `app_type == 0` (bottom 5 bits), not by the length indicator.
+fn ci_length(code: u8) -> usize {
     match code {
-        0 => Some(4),
-        1 => Some(6),
-        2 => Some(8),
-        3 => Some(12),
-        4 => Some(16),
-        5 => Some(24),
-        6 => Some(32),
-        7 => None, // end of CI list
-        _ => None, // unreachable for 3-bit code, but defensive
+        0 => 4,
+        1 => 6,
+        2 => 8,
+        3 => 12,
+        4 => 16,
+        5 => 24,
+        6 => 32,
+        7 => 48,
+        _ => unreachable!(), // 3-bit code is always 0–7
     }
 }
 
@@ -64,6 +71,26 @@ pub struct XPadAssembler {
     /// Cached CI list from the most recent frame with CI flag set.
     /// Used for variable X-PAD continuation frames (CI flag = 0).
     last_ci: Vec<(usize, u8)>,
+    /// Command segments (bit0=1 in DLS command byte), keyed by segment number.
+    command_segments: BTreeMap<u8, Vec<u8>>,
+    /// Segment number that carried the "last" flag for command segments.
+    command_last_seg_num: Option<u8>,
+    /// Most recently decoded DL+ tags.
+    dl_plus: Option<DlPlusFields>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DlPlusFields {
+    tags: Vec<(u8, usize, usize)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedDls {
+    text: String,
+    title: Option<String>,
+    artist: Option<String>,
+    toggle: Option<bool>,
+    item_running: Option<bool>,
 }
 
 impl XPadAssembler {
@@ -74,6 +101,9 @@ impl XPadAssembler {
             segments: BTreeMap::new(),
             last_seg_num: None,
             last_ci: Vec::new(),
+            command_segments: BTreeMap::new(),
+            command_last_seg_num: None,
+            dl_plus: None,
         }
     }
 
@@ -84,6 +114,9 @@ impl XPadAssembler {
         self.segments.clear();
         self.last_seg_num = None;
         self.last_ci.clear();
+        self.command_segments.clear();
+        self.command_last_seg_num = None;
+        self.dl_plus = None;
     }
 
     /// Process one MPEG Layer 2 frame and return DLS text if a complete label
@@ -92,6 +125,12 @@ impl XPadAssembler {
     /// F-PAD occupies the last 2 bytes of the frame; X-PAD (if present)
     /// occupies the bytes immediately before F-PAD.
     pub fn push_mp2_frame(&mut self, frame: &[u8]) -> Option<String> {
+        self.push_mp2_frame_metadata(frame).map(|m| m.raw_text)
+    }
+
+    /// Process one MPEG Layer 2 frame and return structured metadata if a
+    /// complete Dynamic Label was received.
+    pub fn push_mp2_frame_metadata(&mut self, frame: &[u8]) -> Option<NowPlaying> {
         if frame.len() < 2 {
             return None;
         }
@@ -105,6 +144,12 @@ impl XPadAssembler {
     /// Scans for MPEG sync words, computes each frame boundary, and calls
     /// [`push_mp2_frame`] for every complete frame found.
     pub fn push_mp2_bytes(&mut self, data: &[u8]) -> Option<String> {
+        self.push_mp2_bytes_metadata(data).map(|m| m.raw_text)
+    }
+
+    /// Process raw MP2 bytes and return structured metadata if a complete
+    /// Dynamic Label was received.
+    pub fn push_mp2_bytes_metadata(&mut self, data: &[u8]) -> Option<NowPlaying> {
         let mut pos = 0;
         let mut frames_found = 0usize;
         let mut result = None;
@@ -129,8 +174,8 @@ impl XPadAssembler {
                 size,
                 data.len()
             );
-            if let Some(text) = self.push_mp2_frame(&data[pos..pos + size]) {
-                result = Some(text);
+            if let Some(meta) = self.push_mp2_frame_metadata(&data[pos..pos + size]) {
+                result = Some(meta);
             }
             pos += size;
         }
@@ -156,12 +201,16 @@ impl XPadAssembler {
     /// occupies the last 2 bytes of the DSE payload; X-PAD (if present)
     /// occupies the preceding bytes of the DSE payload.
     ///
-    /// **Byte ordering:** the DSE stores X-PAD bytes in reversed order
-    /// compared to DAB (MPEG Layer 2).  In DAB, byte 0 of the X-PAD data
-    /// group is closest to F-PAD (at the highest address); in the DSE, it
-    /// maps to `data_stream_byte[cnt-3]`.  We reverse the X-PAD area so that
-    /// `process_fpad_xpad` can use the same right-to-left CI parsing as DAB.
+    /// The DSE preserves the same byte layout as the MPEG Layer 2 ancillary
+    /// data area: CI list at the right end (closest to F-PAD), data sub-fields
+    /// growing leftward.  No byte reversal is needed.
     pub fn push_dabplus_au(&mut self, au_data: &[u8]) -> Option<String> {
+        self.push_dabplus_au_metadata(au_data).map(|m| m.raw_text)
+    }
+
+    /// Process one DAB+ Access Unit and return structured metadata if a
+    /// complete Dynamic Label was received.
+    pub fn push_dabplus_au_metadata(&mut self, au_data: &[u8]) -> Option<NowPlaying> {
         let pad = extract_dab_plus_pad(au_data)?;
         if pad.len() < 2 {
             log::debug!(
@@ -178,13 +227,7 @@ impl XPadAssembler {
             fpad[0],
             fpad[1],
         );
-        // Reverse the X-PAD area: in the DSE, X-PAD bytes are stored in
-        // forward order (CI at low indices, data growing right), but
-        // process_fpad_xpad expects the DAB/MPEG layout (CI at high indices,
-        // data growing left).  Reversing makes the layouts equivalent.
-        let mut xpad_area: Vec<u8> = pad[..pad.len() - 2].to_vec();
-        xpad_area.reverse();
-        self.process_fpad_xpad(&xpad_area, fpad)
+        self.process_fpad_xpad(&pad[..pad.len() - 2], fpad)
     }
 
     // ──────────────────────────────────────────────────────────────────────── //
@@ -196,7 +239,7 @@ impl XPadAssembler {
     ///
     /// `xpad_area` is every byte *before* F-PAD in the audio frame / AU.
     /// `fpad` is the 2-byte Fixed PAD [byte0, byte1].
-    fn process_fpad_xpad(&mut self, xpad_area: &[u8], fpad: [u8; 2]) -> Option<String> {
+    fn process_fpad_xpad(&mut self, xpad_area: &[u8], fpad: [u8; 2]) -> Option<NowPlaying> {
         // Per ETSI EN 300 401 v2.1.1 Table 7, F-PAD byte 0:
         //   bits 7-6 = frame type (00 = standard; non-zero → skip)
         //   bits 5-4 = X-PAD indicator: 00=none, 01=short, 10=variable, 11=end
@@ -237,7 +280,7 @@ impl XPadAssembler {
             }
             let type_byte = xpad_area[xpad_area.len() - 1];
             let app_type = type_byte & 0x0F;
-            if app_type != APP_TYPE_DLS {
+            if app_type != APP_TYPE_DLS_START {
                 log::debug!(
                     "X-PAD: short X-PAD app_type={} (not DLS) — skipping",
                     app_type
@@ -287,7 +330,7 @@ impl XPadAssembler {
     }
 
     /// Incorporate one DLS data chunk and return a complete label if ready.
-    fn process_dls_chunk(&mut self, chunk: &[u8]) -> Option<String> {
+    fn process_dls_chunk(&mut self, chunk: &[u8]) -> Option<NowPlaying> {
         if chunk.is_empty() {
             return None;
         }
@@ -300,11 +343,6 @@ impl XPadAssembler {
         //   bit 0:    Command flag (1 = command/control, not label text → skip)
         let cmd = chunk[0];
         let is_command = (cmd & 0x01) != 0;
-
-        if is_command {
-            log::debug!("X-PAD DLS: cmd={:02X} is a command segment — skipping", cmd);
-            return None;
-        }
 
         let first = (cmd & 0x04) != 0;
         let last = (cmd & 0x02) != 0;
@@ -323,11 +361,14 @@ impl XPadAssembler {
             chunk.len()
         );
 
-        // Detect label change via toggle bit.
+        // Detect item change via toggle bit and reset in-progress buffers.
         if let Some(prev) = self.toggle {
             if toggle != prev {
                 self.segments.clear();
                 self.last_seg_num = None;
+                self.command_segments.clear();
+                self.command_last_seg_num = None;
+                self.dl_plus = None;
                 log::debug!(
                     "X-PAD DLS: toggle changed ({} → {}) — new label",
                     prev,
@@ -337,7 +378,22 @@ impl XPadAssembler {
         }
         self.toggle = Some(toggle);
 
-        // The charset byte follows the command byte only in the first segment.
+        if is_command {
+            // Command segment payload begins right after the segment header.
+            let payload = &chunk[1..];
+            if !payload.is_empty() {
+                self.command_segments.insert(seg_num, payload.to_vec());
+            }
+            if last {
+                self.command_last_seg_num = Some(seg_num);
+            }
+            if let Some(cmd_bytes) = self.try_assemble_command_segments() {
+                self.dl_plus = parse_dl_plus_command(&cmd_bytes);
+            }
+            return None;
+        }
+
+        // The charset byte follows the command byte only in the first text segment.
         let text_bytes = if first {
             if chunk.len() < 2 {
                 return None;
@@ -348,12 +404,11 @@ impl XPadAssembler {
             &chunk[1..]
         };
 
-        // Strip null padding and store.
-        let text_bytes: Vec<u8> = text_bytes
-            .iter()
-            .copied()
-            .take_while(|&b| b != 0x00)
-            .collect();
+        // Strip trailing null padding and store.
+        let mut text_bytes: Vec<u8> = text_bytes.to_vec();
+        while text_bytes.last() == Some(&0x00) {
+            text_bytes.pop();
+        }
         if !text_bytes.is_empty() {
             self.segments.insert(seg_num, text_bytes);
         }
@@ -361,11 +416,20 @@ impl XPadAssembler {
             self.last_seg_num = Some(seg_num);
         }
 
-        self.try_assemble()
+        let parsed = self.try_assemble()?;
+        Some(NowPlaying {
+            raw_text: parsed.text,
+            title: parsed.title,
+            artist: parsed.artist,
+            toggle: parsed.toggle,
+            item_running: parsed.item_running,
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: unix_ms_now(),
+        })
     }
 
     /// Try to produce a complete label from accumulated segments.
-    fn try_assemble(&self) -> Option<String> {
+    fn try_assemble(&self) -> Option<ParsedDls> {
         let last = self.last_seg_num?;
         // Require all segments 0..=last.
         for i in 0..=last {
@@ -376,10 +440,28 @@ impl XPadAssembler {
             .collect();
         let text = decode_dls_text(&bytes, self.charset);
         if text.is_empty() {
-            None
-        } else {
-            Some(text)
+            return None;
         }
+        let (title, artist) = apply_dl_plus_to_text(&text, self.dl_plus.as_ref());
+        Some(ParsedDls {
+            text,
+            title,
+            artist,
+            toggle: self.toggle,
+            item_running: None,
+        })
+    }
+
+    fn try_assemble_command_segments(&self) -> Option<Vec<u8>> {
+        let last = self.command_last_seg_num?;
+        for i in 0..=last {
+            self.command_segments.get(&i)?;
+        }
+        Some(
+            (0..=last)
+                .flat_map(|i| self.command_segments[&i].iter().copied())
+                .collect(),
+        )
     }
 }
 
@@ -472,7 +554,10 @@ fn parse_ci_list(xpad_area: &[u8]) -> (Vec<(usize, u8)>, usize) {
     let mut pos = xpad_area.len();
     let mut ci_entries: Vec<(usize, u8)> = Vec::new();
 
-    loop {
+    // Per dablin / ETSI EN 300 401 §7.4.2.2: at most 4 CI entries before the
+    // end marker.  The end marker is a CI byte with app_type == 0 (bottom 5
+    // bits all zero), NOT signalled by the length indicator.
+    while ci_entries.len() < 4 {
         if pos == 0 {
             log::debug!("X-PAD CI: reached left edge without end marker");
             break;
@@ -485,28 +570,22 @@ fn parse_ci_list(xpad_area: &[u8]) -> (Vec<(usize, u8)>, usize) {
         let length_code = (ci >> 5) & 0x07;
         let app_type = ci & 0x1F;
 
-        match ci_length(length_code) {
-            None => {
-                log::debug!(
-                    "X-PAD CI: end/reserved at pos={} byte={:02X} (length_code={})",
-                    pos,
-                    ci,
-                    length_code
-                );
-                break;
-            }
-            Some(len) => {
-                log::debug!(
-                    "X-PAD CI: pos={} byte={:02X} length_code={} len={}B app_type={}",
-                    pos,
-                    ci,
-                    length_code,
-                    len,
-                    app_type
-                );
-                ci_entries.push((len, app_type));
-            }
+        // End marker: app_type == 0 terminates the CI list.
+        if app_type == 0 {
+            log::debug!("X-PAD CI: end marker at pos={} byte={:02X}", pos, ci,);
+            break;
         }
+
+        let len = ci_length(length_code);
+        log::debug!(
+            "X-PAD CI: pos={} byte={:02X} length_code={} len={}B app_type={}",
+            pos,
+            ci,
+            length_code,
+            len,
+            app_type
+        );
+        ci_entries.push((len, app_type));
     }
 
     if ci_entries.is_empty() {
@@ -554,7 +633,7 @@ fn extract_dls_with_ci(
             data_left,
             data_right
         );
-        if *app_type == APP_TYPE_DLS {
+        if *app_type == APP_TYPE_DLS_START || *app_type == APP_TYPE_DLS_CONT {
             // Per ETSI EN 300 401 §7.4.2.2.2, byte 0 of each data subfield is
             // physically adjacent to the CI list (rightmost), so bytes appear in
             // reverse logical order.  Reverse to restore cmd-byte-first order.
@@ -566,6 +645,96 @@ fn extract_dls_with_ci(
     }
     log::debug!("X-PAD CI: no DLS (app_type=2) in CI list");
     None
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
+    if bytes.is_empty() {
+        return None;
+    }
+    // Best-effort parsing:
+    //   [0]      command id (=0x02 for DL+)
+    //   [1..]    optional control byte(s), then tag triplets:
+    //            [content_type, start_char, length_char]
+    // The exact framing differs across implementations, so we search for a
+    // plausible triplet boundary rather than assuming one fixed offset.
+    let mut start = if bytes[0] == 0x02 { 1 } else { 0 };
+    if start < bytes.len() && (bytes.len() - start) % 3 == 1 {
+        // Common case with one control byte between command id and tags.
+        start += 1;
+    }
+    if start >= bytes.len() {
+        return None;
+    }
+    let mut tags: Vec<(u8, usize, usize)> = Vec::new();
+    let mut i = start;
+    while i + 2 < bytes.len() {
+        tags.push((bytes[i], bytes[i + 1] as usize, bytes[i + 2] as usize));
+        i += 3;
+    }
+    if tags.is_empty() {
+        None
+    } else {
+        Some(DlPlusFields::from_tags(&tags))
+    }
+}
+
+impl DlPlusFields {
+    fn from_tags(tags: &[(u8, usize, usize)]) -> Self {
+        DlPlusFields {
+            tags: tags.to_vec(),
+        }
+    }
+}
+
+fn apply_dl_plus_to_text(
+    text: &str,
+    dl_plus: Option<&DlPlusFields>,
+) -> (Option<String>, Option<String>) {
+    let Some(dl_plus) = dl_plus else {
+        return (None, None);
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut title = None;
+    let mut artist = None;
+    for (ty, start, len) in &dl_plus.tags {
+        let start = *start;
+        let len = *len;
+        if len == 0 || start >= chars.len() {
+            continue;
+        }
+        let end = (start + len).min(chars.len());
+        let val = chars[start..end]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if val.is_empty() {
+            continue;
+        }
+        match *ty {
+            // DL+ content types commonly used for title-like fields.
+            0x01 | 0x1F => {
+                if title.is_none() {
+                    title = Some(val);
+                }
+            }
+            // DL+ content types commonly used for artist-like fields.
+            0x04 | 0x20 => {
+                if artist.is_none() {
+                    artist = Some(val);
+                }
+            }
+            _ => {}
+        }
+    }
+    (title, artist)
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -704,12 +873,12 @@ mod tests {
         // CI entries are rightmost (closest to F-PAD); end_marker is just left of them.
         //
         // CI byte (3+5 split): length_code=0 (4 bytes), app_type=2 → (0<<5)|2 = 0x02
-        // End marker: length_code=7 → (7<<5) = 0xE0
+        // End marker: app_type=0 → any byte with bottom 5 bits = 0 (e.g. 0x00)
         // DLS data: 4 bytes in physical order (byte 0 = cmd is RIGHTMOST per spec)
         //   Logical: [cmd=0xC0, charset=0x00, 'A', 'B']
         //   Physical (rightmost = byte 0): ['B', 'A', 0x00, 0xC0]
         let dls_data_physical = [0x42u8, 0x41, 0x00, 0xC0]; // 'B' 'A' charset cmd
-        let end = 0xE0u8; // end marker (left of CI)
+        let end = 0x00u8; // end marker: app_type=0 (left of CI)
         let ci = 0x02u8; // CI: length_code=0 (4 bytes), app_type=2 (right, closest to F-PAD)
         let xpad_area: Vec<u8> = dls_data_physical.iter().copied().chain([end, ci]).collect();
         let (ci_entries, data_right) = parse_ci_list(&xpad_area);
@@ -721,11 +890,11 @@ mod tests {
 
     #[test]
     fn find_dls_chunk_no_dls_app() {
-        // CI with app_type=3 (not DLS).  Layout: data | end_marker | CI.
+        // CI with app_type=5 (not DLS).  Layout: data | end_marker | CI.
         let data = [0u8; 4];
         let mut xpad = data.to_vec();
-        xpad.push(0xE0); // end marker (left of CI)
-        xpad.push(0x03); // CI (3+5): length_code=0 (4 bytes), app_type=3
+        xpad.push(0x00); // end marker: app_type=0 (left of CI)
+        xpad.push(0x05); // CI (3+5): length_code=0 (4 bytes), app_type=5
         let (ci_entries, data_right) = parse_ci_list(&xpad);
         assert!(extract_dls_with_ci(&xpad, &ci_entries, data_right).is_none());
     }
@@ -742,7 +911,7 @@ mod tests {
         //   Physical (byte 0 = cmd is rightmost per spec):
         //     [0x00, 0x00, 'i'=0x69, 'H'=0x48, 0x00, cmd=0x06]
         let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
-        let end = 0xE0u8; // end marker (left of CI entries)
+        let end = 0x00u8; // end marker: app_type=0 (left of CI entries)
         let ci = 0x22u8; // CI (3+5): length_code=1 (6 bytes), app_type=2 (rightmost, closest to F-PAD)
 
         // Build a fake MPEG frame: arbitrary audio bytes + X-PAD area + F-PAD.
@@ -776,7 +945,7 @@ mod tests {
         let build_frame = |dls: &[u8]| {
             let mut f = vec![0u8; 4]; // fake audio
             f.extend_from_slice(dls);
-            f.push(0xE0); // end marker (left of CI)
+            f.push(0x00); // end marker: app_type=0 (left of CI)
             f.push(0x22); // CI (3+5): length_code=1 (6 bytes), app_type=2
             f.push(0x20); // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
             f.push(0x02); // F-PAD byte1: bit 1 = 1 (CI flag set)
@@ -805,7 +974,7 @@ mod tests {
         // Layout: dls_chunk | end_marker | CI | F-PAD
         let mut frame1 = vec![0u8; 4]; // fake audio
         frame1.extend_from_slice(&dls_chunk);
-        frame1.push(0xE0); // end marker
+        frame1.push(0x00); // end marker: app_type=0
         frame1.push(0x22); // CI (3+5): length_code=1 (6 bytes), app_type=2
         frame1.push(0x20); // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD)
         frame1.push(0x02); // F-PAD byte1: bit 1 = 1 (CI flag set)
@@ -877,18 +1046,21 @@ mod tests {
     fn assembler_dabplus_au_single_segment_label() {
         let mut asm = XPadAssembler::new();
 
-        // In DAB+ (DSE), X-PAD bytes are in forward/logical order:
-        //   [CI | end_marker | data_subfield(forward) | F-PAD]
-        // push_dabplus_au reverses the X-PAD area before processing.
+        // DSE preserves the same byte layout as DAB (MPEG): CI at right end,
+        // data sub-fields growing leftward, byte 0 of each sub-field closest
+        // to CI (rightmost).
         //
-        // DLS chunk (6 bytes, length_code=1) in logical order:
-        //   [cmd=0x06, charset=0x00, 'H'=0x48, 'i'=0x69, pad=0x00, pad=0x00]
+        // DLS chunk (6 bytes, length_code=1) — physical order (byte 0 = cmd
+        // is rightmost, closest to CI):
+        //   [pad, pad, 'i', 'H', charset=0x00, cmd=0x06]
         let ci = 0x22u8; // CI (3+5): length_code=1 (6 bytes), app_type=2 (DLS)
-        let end = 0xE0u8; // CI end marker (length_code=7)
+        let end = 0x00u8; // CI end marker: app_type=0
 
-        // PAD field: [CI | end_marker | dls_data(forward) | F-PAD]
-        let mut pad: Vec<u8> = vec![ci, end];
-        pad.extend_from_slice(&[0x06, 0x00, 0x48, 0x69, 0x00, 0x00]); // DLS forward
+        // PAD field: [dls_chunk(physical) | end_marker | CI | F-PAD]
+        let dls_physical = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
+        let mut pad: Vec<u8> = dls_physical.to_vec();
+        pad.push(end);
+        pad.push(ci);
         pad.push(0x20); // F-PAD byte0: variable X-PAD
         pad.push(0x02); // F-PAD byte1: CI flag set
 
@@ -929,5 +1101,33 @@ mod tests {
         let bytes = [0xE6u8, 0xF8, 0xE5];
         let s = decode_dls_text(&bytes, 0);
         assert_eq!(s, "æøå");
+    }
+
+    #[test]
+    fn dl_plus_tags_extract_title_artist() {
+        // Command 0x02 + one control byte + tags:
+        // title type 0x01 at chars 0..4, artist type 0x04 at chars 8..13.
+        let cmd = [0x02u8, 0x00, 0x01, 0, 5, 0x04, 8, 6];
+        let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
+        let (title, artist) = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
+        assert_eq!(title.as_deref(), Some("Title"));
+        assert_eq!(artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn push_mp2_frame_metadata_sets_source() {
+        let mut asm = XPadAssembler::new();
+        let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
+        let mut frame = vec![0u8; 8];
+        frame.extend_from_slice(&dls_chunk);
+        frame.push(0x00);
+        frame.push(0x22);
+        frame.push(0x20);
+        frame.push(0x02);
+        let meta = asm
+            .push_mp2_frame_metadata(&frame)
+            .expect("expected metadata");
+        assert_eq!(meta.raw_text, "Hi");
+        assert_eq!(meta.source, Some(MetadataSource::XPad));
     }
 }
