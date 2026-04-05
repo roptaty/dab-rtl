@@ -336,32 +336,44 @@ impl XPadAssembler {
             return None;
         }
 
-        // DLS segment prefix (ETSI EN 300 401 / TS 102 980 packet syntax):
-        //   b15 toggle, b14 first, b13 last, b12 command
-        //   b11..8 field1, b7..4 field2, b3..0 field3
-        let prefix = u16::from_be_bytes([chunk[0], chunk[1]]);
-        let is_command = (prefix & 0x1000) != 0;
-        let first = (prefix & 0x4000) != 0;
-        let last = (prefix & 0x2000) != 0;
-        let toggle = (prefix & 0x8000) != 0;
-        let field1 = ((prefix >> 8) & 0x0F) as usize;
-        let field2 = ((prefix >> 4) & 0x0F) as u8;
-        let body_len = field1 + 1;
+        // Reference layout matches ODR-PadEnc / ETSI EN 300 401 §7.4.5.2:
+        //   byte0: toggle bit7, first bit6, last bit5, command bit4, low4 = len-1 or command id
+        //   byte1: for text first segment = charset<<4, continuation = seg_index<<4
+        //          for DL+ command = optional link bit7 + low7 = len-1
+        let header0 = chunk[0];
+        let header1 = chunk[1];
+        let is_command = (header0 & 0x10) != 0;
+        let first = (header0 & 0x40) != 0;
+        let last = (header0 & 0x20) != 0;
+        let toggle = (header0 & 0x80) != 0;
+        let cmd_or_len = header0 & 0x0F;
+        let body_len = if is_command {
+            // Command frames use a 7-bit payload length in byte1.
+            if cmd_or_len == 0x02 {
+                (header1 as usize & 0x7F) + 1
+            } else {
+                0
+            }
+        } else {
+            (cmd_or_len as usize) + 1
+        };
         if chunk.len() < 2 + body_len + 2 {
             log::debug!(
-                "X-PAD DLS: truncated segment prefix={:04X} body_len={} chunk_len={}",
-                prefix,
+                "X-PAD DLS: truncated segment h0={:02X} h1={:02X} body_len={} chunk_len={}",
+                header0,
+                header1,
                 body_len,
                 chunk.len()
             );
             return None;
         }
         let payload = &chunk[2..2 + body_len];
-        let seg_num = if first { 0 } else { field2 & 0x07 };
+        let seg_num = if first { 0 } else { header1 >> 4 };
 
         log::debug!(
-            "X-PAD DLS: prefix={:04X} first={} last={} toggle={} command={} seg={} body_len={} chunk_len={}",
-            prefix,
+            "X-PAD DLS: h0={:02X} h1={:02X} first={} last={} toggle={} command={} seg={} body_len={} chunk_len={}",
+            header0,
+            header1,
             first,
             last,
             toggle,
@@ -389,6 +401,13 @@ impl XPadAssembler {
         self.toggle = Some(toggle);
 
         if is_command {
+            let command_id = cmd_or_len;
+            if command_id == 0x01 {
+                self.segments.clear();
+                self.last_seg_num = None;
+                log::debug!("X-PAD DLS: remove-label command received");
+                return None;
+            }
             if !payload.is_empty() {
                 self.command_segments.insert(seg_num, payload.to_vec());
             }
@@ -401,9 +420,9 @@ impl XPadAssembler {
             return None;
         }
 
-        // For the first text segment, field2 carries the charset.
+        // For the first text segment, high nibble of byte1 carries the charset.
         if first {
-            self.charset = field2;
+            self.charset = header1 >> 4;
         }
 
         let mut text_bytes: Vec<u8> = payload.to_vec();
@@ -659,17 +678,22 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
     if bytes.is_empty() {
         return None;
     }
-    // Best-effort parsing:
-    //   [0]      command id (=0x02 for DL+)
-    //   [1..]    optional control byte(s), then tag triplets:
-    //            [content_type, start_char, length_char]
-    // The exact framing differs across implementations, so we search for a
-    // plausible triplet boundary rather than assuming one fixed offset.
-    let mut start = if bytes[0] == 0x02 { 1 } else { 0 };
-    if start < bytes.len() && (bytes.len() - start) % 3 == 1 {
-        // Common case with one control byte between command id and tags.
-        start += 1;
-    }
+    // ODR-PadEnc / ETSI DL+ payload:
+    //   [0]      command control nibble + item flags + num_tags_minus_1
+    //   [1..]    tag triplets [content_type, start_char, length_char]
+    //
+    // Some packet-mode paths prepend a command id 0x02 before the control
+    // byte; continue to accept that variant too.
+    let (start, expected_tags) = if bytes[0] == 0x02 && bytes.len() >= 2 {
+        let control = bytes[1];
+        let n = (control & 0x03) as usize + 1;
+        (2, Some(n))
+    } else if (bytes[0] >> 4) == 0x01 {
+        let n = (bytes[0] & 0x03) as usize + 1;
+        (1, Some(n))
+    } else {
+        (0, None)
+    };
     if start >= bytes.len() {
         return None;
     }
@@ -678,6 +702,9 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
     while i + 2 < bytes.len() {
         tags.push((bytes[i], bytes[i + 1] as usize, bytes[i + 2] as usize));
         i += 3;
+    }
+    if let Some(expected) = expected_tags {
+        tags.truncate(expected);
     }
     if tags.is_empty() {
         None
@@ -822,25 +849,38 @@ mod tests {
         charset: u8,
         seg_num: u8,
     ) -> Vec<u8> {
-        let mut prefix = 0u16;
+        let mut byte0 = 0u8;
         if toggle {
-            prefix |= 0x8000;
+            byte0 |= 1 << 7;
         }
         if first {
-            prefix |= 0x4000;
+            byte0 |= 1 << 6;
         }
         if last {
-            prefix |= 0x2000;
+            byte0 |= 1 << 5;
         }
-        prefix |= ((text.len().saturating_sub(1)) as u16 & 0x0F) << 8;
-        if first {
-            prefix |= ((charset & 0x0F) as u16) << 4;
+        byte0 |= text.len().saturating_sub(1) as u8 & 0x0F;
+        let byte1 = if first {
+            (charset & 0x0F) << 4
         } else {
-            prefix |= ((seg_num & 0x07) as u16) << 4;
-        }
+            (seg_num & 0x0F) << 4
+        };
         let mut logical = Vec::with_capacity(2 + text.len() + 2);
-        logical.extend_from_slice(&prefix.to_be_bytes());
+        logical.push(byte0);
+        logical.push(byte1);
         logical.extend_from_slice(text);
+        logical.extend_from_slice(&[0x00, 0x00]); // CRC placeholder
+        logical.reverse();
+        logical
+    }
+
+    fn build_dl_plus_command_physical(payload: &[u8], toggle: bool) -> Vec<u8> {
+        let byte0 = (if toggle { 1 << 7 } else { 0 }) | (1 << 6) | (1 << 5) | (1 << 4) | 0x02;
+        let byte1 = (payload.len().saturating_sub(1) as u8) & 0x7F;
+        let mut logical = Vec::with_capacity(2 + payload.len() + 2);
+        logical.push(byte0);
+        logical.push(byte1);
+        logical.extend_from_slice(payload);
         logical.extend_from_slice(&[0x00, 0x00]); // CRC placeholder
         logical.reverse();
         logical
@@ -1120,13 +1160,37 @@ mod tests {
 
     #[test]
     fn dl_plus_tags_extract_title_artist() {
-        // Command 0x02 + one control byte + tags:
+        // One DL+ command payload as emitted by ODR-PadEnc:
         // title type 0x01 at chars 0..4, artist type 0x04 at chars 8..13.
-        let cmd = [0x02u8, 0x00, 0x01, 0, 5, 0x04, 8, 6];
+        let cmd = [0x11u8, 0x01, 0, 5, 0x04, 8, 6];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         let (title, artist) = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
         assert_eq!(title.as_deref(), Some("Title"));
         assert_eq!(artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn assembler_text_then_dl_plus_command_extracts_artist_title() {
+        let mut asm = XPadAssembler::new();
+        let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
+        let cmd_payload = [0x11u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
+
+        let mut frame1 = vec![0u8; 8];
+        frame1.extend_from_slice(&text_chunk);
+        frame1.push(0x00);
+        frame1.push(0x82);
+        frame1.push(0x20);
+        frame1.push(0x02);
+        let meta1 = asm.push_mp2_frame_metadata(&frame1).expect("expected text");
+        assert_eq!(meta1.raw_text, "TitleArtist");
+
+        let mut logical_cmd = cmd_chunk.clone();
+        logical_cmd.reverse();
+        assert!(asm.process_dls_chunk(&logical_cmd).is_none());
+        let parsed = asm.try_assemble().expect("expected assembled text");
+        assert_eq!(parsed.title.as_deref(), Some("Title"));
+        assert_eq!(parsed.artist.as_deref(), Some("Artist"));
     }
 
     #[test]

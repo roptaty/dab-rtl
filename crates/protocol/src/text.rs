@@ -8,12 +8,23 @@
 /// Unknown charsets fall back to EBU Latin.
 pub fn decode_dab_text(bytes: &[u8], charset: u8) -> String {
     let s = match charset {
-        0x06 => decode_ucs2_be(bytes),
+        0x06 => decode_charset_06(bytes),
         0x0F => String::from_utf8_lossy(bytes).into_owned(),
         _ => decode_ebu_latin(bytes),
     };
     s.trim_matches(|c: char| c == '\0' || c.is_whitespace())
         .to_string()
+}
+
+fn decode_charset_06(bytes: &[u8]) -> String {
+    // In practice, some streams advertise charset 0x06 but still carry
+    // single-byte UTF-8/ASCII text. Prefer UTF-16BE only when the byte
+    // pattern actually looks like it.
+    if looks_like_ucs2_be(bytes) {
+        decode_ucs2_be(bytes)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 fn decode_ucs2_be(bytes: &[u8]) -> String {
@@ -39,6 +50,34 @@ fn decode_ebu_latin(bytes: &[u8]) -> String {
             }
         })
         .collect()
+}
+
+fn looks_like_ucs2_be(bytes: &[u8]) -> bool {
+    if bytes.len() < 4 || !bytes.len().is_multiple_of(2) {
+        return false;
+    }
+
+    if bytes.starts_with(&[0xFE, 0xFF]) || bytes.starts_with(&[0xFF, 0xFE]) {
+        return true;
+    }
+
+    let pairs = bytes.chunks_exact(2);
+    let pair_count = pairs.len();
+    let mut plausible_high_bytes = 0usize;
+    let mut plausible_low_bytes = 0usize;
+
+    for pair in bytes.chunks_exact(2) {
+        let high = pair[0];
+        let low = pair[1];
+        if high <= 0x04 || high == 0x20 {
+            plausible_high_bytes += 1;
+        }
+        if low == b' ' || low.is_ascii_graphic() || low >= 0xA0 {
+            plausible_low_bytes += 1;
+        }
+    }
+
+    plausible_high_bytes * 4 >= pair_count * 3 && plausible_low_bytes * 4 >= pair_count * 3
 }
 
 const EBU_LATIN: [u32; 256] = [
@@ -84,5 +123,15 @@ mod tests {
     fn ucs2_charset_decodes_big_endian() {
         let bytes = [0x00, b'H', 0x00, b'i', 0x01, 0x42];
         assert_eq!(decode_dab_text(&bytes, 0x06), "Hił");
+    }
+
+    #[test]
+    fn charset_06_falls_back_to_utf8_for_single_byte_text() {
+        assert_eq!(decode_dab_text(b"Title", 0x06), "Title");
+    }
+
+    #[test]
+    fn charset_06_falls_back_to_utf8_for_even_length_single_byte_text() {
+        assert_eq!(decode_dab_text(b"Song 12", 0x06), "Song 12");
     }
 }

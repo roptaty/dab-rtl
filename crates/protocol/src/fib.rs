@@ -18,6 +18,7 @@
 ///   Bytes 2+: extension-specific data
 use std::collections::HashMap;
 
+use crate::decode_dab_text;
 use crate::ensemble::{Ensemble, UserApplication};
 
 /// Subchannel parameters from FIG 0/1, stored independently from components.
@@ -521,37 +522,38 @@ impl FibParser {
         if body.is_empty() {
             return;
         }
+        let charset = body[0] >> 4;
         let extension = body[0] & 0x07;
         let payload = &body[1..];
 
         match extension {
-            0 => self.parse_fig_1_0(payload),
-            1 => self.parse_fig_1_1(payload),
+            0 => self.parse_fig_1_0(payload, charset),
+            1 => self.parse_fig_1_1(payload, charset),
             _ => {}
         }
     }
 
     /// FIG 1/0 — Ensemble label.
     /// Layout: [EId:16][label: 16 bytes][short_label_flag: 16 bits]
-    fn parse_fig_1_0(&mut self, data: &[u8]) {
+    fn parse_fig_1_0(&mut self, data: &[u8], charset: u8) {
         if data.len() < 18 {
             return;
         }
         // EId (2 bytes) — cross-check but not required.
         let label_bytes = &data[2..18];
-        self.ensemble.label = decode_label(label_bytes);
+        self.ensemble.label = decode_label(label_bytes, charset);
         log::debug!("FIG 1/0: Ensemble label = {:?}", self.ensemble.label);
     }
 
     /// FIG 1/1 — Programme service label.
     /// Layout: [SId:16][label: 16 bytes][short_label_flag: 16 bits]
-    fn parse_fig_1_1(&mut self, data: &[u8]) {
+    fn parse_fig_1_1(&mut self, data: &[u8], charset: u8) {
         if data.len() < 18 {
             return;
         }
         let sid = u16::from_be_bytes([data[0], data[1]]) as u32;
         let label_bytes = &data[2..18];
-        let label = decode_label(label_bytes);
+        let label = decode_label(label_bytes, charset);
 
         let svc = self.ensemble.get_or_insert_service(sid);
         svc.label = label.clone();
@@ -587,14 +589,9 @@ fn fib_crc_valid(fib: &[u8]) -> bool {
     computed == stored
 }
 
-/// Decode a 16-byte label field (EBU Latin / ASCII, space-padded) to a String.
-fn decode_label(bytes: &[u8]) -> String {
-    // Treat as Latin-1; strip trailing spaces.
-    let s: String = bytes
-        .iter()
-        .map(|&b| if b < 0x80 { b as char } else { '?' })
-        .collect();
-    s.trim_end().to_string()
+/// Decode a FIG 1 label field using the announced DAB charset.
+fn decode_label(bytes: &[u8], charset: u8) -> String {
+    decode_dab_text(bytes, charset)
 }
 
 fn parse_fig_0_13_transport_fields(
@@ -714,7 +711,13 @@ mod tests {
     #[test]
     fn decode_label_trims_spaces() {
         let bytes = b"Radio 4         ";
-        assert_eq!(super::decode_label(bytes), "Radio 4");
+        assert_eq!(super::decode_label(bytes, 0x00), "Radio 4");
+    }
+
+    #[test]
+    fn decode_label_respects_charset() {
+        let bytes = b"Caf\x82            ";
+        assert_eq!(super::decode_label(bytes, 0x00), "Caf\u{00E9}");
     }
 
     #[test]
