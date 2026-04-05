@@ -3,11 +3,13 @@ pub mod fib;
 pub mod fic;
 pub mod msc;
 pub mod pad;
+pub mod text;
 
 pub use ensemble::{
-    Component, Ensemble, MetadataSource, NowPlaying, ProtectionLevel, Service, ServiceType,
-    UserApplication,
+    Component, ContentItem, Ensemble, MetadataSource, NowPlaying, ProtectionLevel, Service,
+    ServiceType, UserApplication,
 };
 pub use fic::FicHandler;
 pub use msc::{AudioFrame, MscHandler};
 pub use pad::XPadAssembler;
+pub use text::decode_dab_text;

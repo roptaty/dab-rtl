@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ensemble::{MetadataSource, NowPlaying};
+use crate::text::decode_dab_text;
 
 // ─────────────────────────────────────────────────────────────────────────── //
 //  Constants                                                                   //
@@ -331,33 +332,42 @@ impl XPadAssembler {
 
     /// Incorporate one DLS data chunk and return a complete label if ready.
     fn process_dls_chunk(&mut self, chunk: &[u8]) -> Option<NowPlaying> {
-        if chunk.is_empty() {
+        if chunk.len() < 4 {
             return None;
         }
 
-        // DLS segment header (ETSI TS 102 980 §5.1.1):
-        //   bits 7-4: Segment number (0-15)
-        //   bit 3:    Toggle bit (changes when label changes)
-        //   bit 2:    First flag (1 = first segment; includes charset byte)
-        //   bit 1:    Last flag  (1 = last segment)
-        //   bit 0:    Command flag (1 = command/control, not label text → skip)
-        let cmd = chunk[0];
-        let is_command = (cmd & 0x01) != 0;
-
-        let first = (cmd & 0x04) != 0;
-        let last = (cmd & 0x02) != 0;
-        let toggle = (cmd & 0x08) != 0;
-        // When both first and last are set the entire label fits in this one
-        // segment; normalise to segment 0 so try_assemble finds it immediately.
-        let seg_num = if first && last { 0 } else { (cmd >> 4) & 0x0F };
+        // DLS segment prefix (ETSI EN 300 401 / TS 102 980 packet syntax):
+        //   b15 toggle, b14 first, b13 last, b12 command
+        //   b11..8 field1, b7..4 field2, b3..0 field3
+        let prefix = u16::from_be_bytes([chunk[0], chunk[1]]);
+        let is_command = (prefix & 0x1000) != 0;
+        let first = (prefix & 0x4000) != 0;
+        let last = (prefix & 0x2000) != 0;
+        let toggle = (prefix & 0x8000) != 0;
+        let field1 = ((prefix >> 8) & 0x0F) as usize;
+        let field2 = ((prefix >> 4) & 0x0F) as u8;
+        let body_len = field1 + 1;
+        if chunk.len() < 2 + body_len + 2 {
+            log::debug!(
+                "X-PAD DLS: truncated segment prefix={:04X} body_len={} chunk_len={}",
+                prefix,
+                body_len,
+                chunk.len()
+            );
+            return None;
+        }
+        let payload = &chunk[2..2 + body_len];
+        let seg_num = if first { 0 } else { field2 & 0x07 };
 
         log::debug!(
-            "X-PAD DLS: cmd={:02X} first={} last={} toggle={} seg={} chunk_len={}",
-            cmd,
+            "X-PAD DLS: prefix={:04X} first={} last={} toggle={} command={} seg={} body_len={} chunk_len={}",
+            prefix,
             first,
             last,
             toggle,
+            is_command,
             seg_num,
+            body_len,
             chunk.len()
         );
 
@@ -379,8 +389,6 @@ impl XPadAssembler {
         self.toggle = Some(toggle);
 
         if is_command {
-            // Command segment payload begins right after the segment header.
-            let payload = &chunk[1..];
             if !payload.is_empty() {
                 self.command_segments.insert(seg_num, payload.to_vec());
             }
@@ -393,19 +401,12 @@ impl XPadAssembler {
             return None;
         }
 
-        // The charset byte follows the command byte only in the first text segment.
-        let text_bytes = if first {
-            if chunk.len() < 2 {
-                return None;
-            }
-            self.charset = (chunk[1] >> 4) & 0x0F;
-            &chunk[2..]
-        } else {
-            &chunk[1..]
-        };
+        // For the first text segment, field2 carries the charset.
+        if first {
+            self.charset = field2;
+        }
 
-        // Strip trailing null padding and store.
-        let mut text_bytes: Vec<u8> = text_bytes.to_vec();
+        let mut text_bytes: Vec<u8> = payload.to_vec();
         while text_bytes.last() == Some(&0x00) {
             text_bytes.pop();
         }
@@ -741,26 +742,8 @@ fn apply_dl_plus_to_text(
 //  Character set decoding                                                       //
 // ─────────────────────────────────────────────────────────────────────────── //
 
-/// Decode DLS text bytes using the given DAB charset code.
-///
-/// - Charset 0: EBU Latin (ETSI TS 101 756 Annex C).  The lower 128 code
-///   points match ASCII; the upper 128 are decoded as their Unicode equivalents
-///   (same as ISO 8859-1 for the practical range 0x80–0xFF).
-/// - Charset 6: UTF-8.
-/// - Others: treated as EBU Latin.
 fn decode_dls_text(bytes: &[u8], charset: u8) -> String {
-    let s = if charset == 6 {
-        String::from_utf8_lossy(bytes).into_owned()
-    } else {
-        // EBU Latin / ISO 8859-1 fallback: each byte maps to the same Unicode
-        // codepoint (0x00–0xFF are all valid Unicode scalar values).
-        bytes
-            .iter()
-            .map(|&b| char::from_u32(b as u32).unwrap_or('\u{FFFD}'))
-            .collect()
-    };
-    s.trim_matches(|c: char| c == '\0' || c.is_whitespace())
-        .to_string()
+    decode_dab_text(bytes, charset)
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -830,6 +813,38 @@ pub fn mp2_frame_size(data: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_dls_segment_physical(
+        text: &[u8],
+        toggle: bool,
+        first: bool,
+        last: bool,
+        charset: u8,
+        seg_num: u8,
+    ) -> Vec<u8> {
+        let mut prefix = 0u16;
+        if toggle {
+            prefix |= 0x8000;
+        }
+        if first {
+            prefix |= 0x4000;
+        }
+        if last {
+            prefix |= 0x2000;
+        }
+        prefix |= ((text.len().saturating_sub(1)) as u16 & 0x0F) << 8;
+        if first {
+            prefix |= ((charset & 0x0F) as u16) << 4;
+        } else {
+            prefix |= ((seg_num & 0x07) as u16) << 4;
+        }
+        let mut logical = Vec::with_capacity(2 + text.len() + 2);
+        logical.extend_from_slice(&prefix.to_be_bytes());
+        logical.extend_from_slice(text);
+        logical.extend_from_slice(&[0x00, 0x00]); // CRC placeholder
+        logical.reverse();
+        logical
+    }
 
     // ── mp2_frame_size ───────────────────────────────────────────────────── //
 
@@ -910,7 +925,7 @@ mod tests {
         //   Logical: [cmd=0x06, charset=0x00, 'H'=0x48, 'i'=0x69, pad, pad]
         //   Physical (byte 0 = cmd is rightmost per spec):
         //     [0x00, 0x00, 'i'=0x69, 'H'=0x48, 0x00, cmd=0x06]
-        let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
+        let dls_chunk = build_dls_segment_physical(b"Hi", false, true, true, 0, 0);
         let end = 0x00u8; // end marker: app_type=0 (left of CI entries)
         let ci = 0x22u8; // CI (3+5): length_code=1 (6 bytes), app_type=2 (rightmost, closest to F-PAD)
 
@@ -938,8 +953,8 @@ mod tests {
         // Stored in physical order (byte 0 = cmd is rightmost per spec).
         // Logical dls1: [0x06, 0x00, 'A', 'A', 0x00, 0x00] → physical: [0x00, 0x00, 'A', 'A', 0x00, 0x06]
         // Logical dls2: [0x0E, 0x00, 'B', 'B', 0x00, 0x00] → physical: [0x00, 0x00, 'B', 'B', 0x00, 0x0E]
-        let dls1 = [0x00u8, 0x00, 0x41, 0x41, 0x00, 0x06]; // toggle=0
-        let dls2 = [0x00u8, 0x00, 0x42, 0x42, 0x00, 0x0E]; // toggle=1
+        let dls1 = build_dls_segment_physical(b"AA", false, true, true, 0, 0);
+        let dls2 = build_dls_segment_physical(b"BB", true, true, true, 0, 0);
 
         // Frame layout: fake_audio | dls_chunk | end_marker | CI | F-PAD
         let build_frame = |dls: &[u8]| {
@@ -968,7 +983,7 @@ mod tests {
         // DLS chunk (6 bytes = length_code=1) — stored in physical order.
         // Logical: [cmd=0x06, charset=0x00, 'O'=0x4F, 'K'=0x4B, pad, pad]
         // Physical (byte 0 = cmd is rightmost): [0x00, 0x00, 'K', 'O', 0x00, 0x06]
-        let dls_chunk = [0x00u8, 0x00, 0x4B, 0x4F, 0x00, 0x06];
+        let dls_chunk = build_dls_segment_physical(b"OK", false, true, true, 0, 0);
 
         // Frame 1: explicit CI list present (ci_flag=1).
         // Layout: dls_chunk | end_marker | CI | F-PAD
@@ -987,7 +1002,7 @@ mod tests {
         // Frame 2: "Go" with toggle=1. Physical order (byte 0 = cmd is rightmost).
         // Logical: [0x0E, 0x00, 'G'=0x47, 'o'=0x6F, 0x00, 0x00]
         // Physical: [0x00, 0x00, 'o', 'G', 0x00, 0x0E]
-        let dls_chunk2 = [0x00u8, 0x00, 0x6F, 0x47, 0x00, 0x0E]; // toggle=1, "Go"
+        let dls_chunk2 = build_dls_segment_physical(b"Go", true, true, true, 0, 0);
         let mut frame2 = vec![0u8; 4]; // fake audio
         frame2.extend_from_slice(&dls_chunk2);
         // F-PAD byte0: bits 7-6=00 (standard), bits 5-4=10 (variable X-PAD), CI flag NOT set
@@ -1057,7 +1072,7 @@ mod tests {
         let end = 0x00u8; // CI end marker: app_type=0
 
         // PAD field: [dls_chunk(physical) | end_marker | CI | F-PAD]
-        let dls_physical = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
+        let dls_physical = build_dls_segment_physical(b"Hi", false, true, true, 0, 0);
         let mut pad: Vec<u8> = dls_physical.to_vec();
         pad.push(end);
         pad.push(ci);
@@ -1077,7 +1092,7 @@ mod tests {
     #[test]
     fn decode_dls_text_utf8() {
         let bytes = "Hællo".as_bytes();
-        let s = decode_dls_text(bytes, 6);
+        let s = decode_dls_text(bytes, 0x0F);
         assert_eq!(s, "Hællo");
     }
 
@@ -1097,10 +1112,10 @@ mod tests {
 
     #[test]
     fn decode_dls_text_ebu_latin_high_bytes() {
-        // 0xE6=æ, 0xF8=ø, 0xE5=å in ISO 8859-1 / EBU Latin
-        let bytes = [0xE6u8, 0xF8, 0xE5];
+        // EBU Latin Annex C differs from ISO-8859-1 for many high bytes.
+        let bytes = [0x24u8, 0x5C, 0x80]; // ł Ů á
         let s = decode_dls_text(&bytes, 0);
-        assert_eq!(s, "æøå");
+        assert_eq!(s, "łŮá");
     }
 
     #[test]
@@ -1117,7 +1132,7 @@ mod tests {
     #[test]
     fn push_mp2_frame_metadata_sets_source() {
         let mut asm = XPadAssembler::new();
-        let dls_chunk = [0x00u8, 0x00, 0x69, 0x48, 0x00, 0x06];
+        let dls_chunk = build_dls_segment_physical(b"Hi", false, true, true, 0, 0);
         let mut frame = vec![0u8; 8];
         frame.extend_from_slice(&dls_chunk);
         frame.push(0x00);

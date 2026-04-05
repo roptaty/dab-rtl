@@ -25,6 +25,7 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use nix::unistd;
@@ -43,7 +44,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use protocol::{Ensemble, NowPlaying, Service};
+use protocol::{ContentItem, Ensemble, NowPlaying, Service};
 
 use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 
@@ -60,6 +61,10 @@ pub struct DiscoveredService {
     pub is_dab_plus: bool,
     pub dls_text: Option<String>,
     pub now_playing: Option<NowPlaying>,
+    pub content_items: Vec<ContentItem>,
+    pub mot_content_types: Vec<String>,
+    pub codec: Option<String>,
+    pub signal_quality_percent: Option<u8>,
 }
 
 /// Per-channel scan progress tracked by the TUI.
@@ -153,6 +158,12 @@ struct AppState {
     service_items: Vec<String>,
     /// Cached now-playing lines.
     now_playing_lines: Vec<Line<'static>>,
+    /// Selected downloadable content index for the active service.
+    content_selection: usize,
+    /// Last codec reported for the active service.
+    codec: Option<String>,
+    /// Last signal quality reported for the active service.
+    signal_quality_percent: Option<u8>,
     /// Cached scan-log title.
     scan_log_title: String,
 }
@@ -177,7 +188,10 @@ impl AppState {
             discovered: Vec::new(),
             scan_log: std::collections::VecDeque::new(),
             service_items: Vec::new(),
-            now_playing_lines: Self::build_now_playing_lines(None, "", None, None),
+            now_playing_lines: Self::build_now_playing_lines(None, "", None, None, 0, None, None),
+            content_selection: 0,
+            codec: None,
+            signal_quality_percent: None,
             scan_log_title: " Scan Log ".into(),
         }
     }
@@ -230,6 +244,9 @@ impl AppState {
             &self.ensemble.label,
             playing_service,
             now_playing.as_ref(),
+            self.content_selection,
+            self.codec.as_deref(),
+            self.signal_quality_percent,
         );
     }
 
@@ -243,6 +260,9 @@ impl AppState {
         ensemble_label: &str,
         service: Option<&Service>,
         now_playing: Option<&NowPlaying>,
+        content_selection: usize,
+        codec: Option<&str>,
+        signal_quality_percent: Option<u8>,
     ) -> Vec<Line<'static>> {
         if let Some(label) = playing_label {
             let mut lines = vec![
@@ -259,6 +279,18 @@ impl AppState {
                     Span::raw(ensemble_label.to_string()),
                 ]),
             ];
+            if let Some(codec) = codec {
+                lines.push(Line::from(vec![
+                    Span::styled("Codec: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(codec.to_string()),
+                ]));
+            }
+            if let Some(signal_quality_percent) = signal_quality_percent {
+                lines.push(Line::from(vec![
+                    Span::styled("Reception: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(format!("{signal_quality_percent}%")),
+                ]));
+            }
             if let Some(service) = service {
                 let app_labels = service.advertised_app_labels();
                 if !app_labels.is_empty() {
@@ -271,6 +303,42 @@ impl AppState {
                     lines.push(Line::from(vec![
                         Span::styled("Slideshow: ", Style::default().fg(Color::DarkGray)),
                         Span::raw("Signalled"),
+                    ]));
+                }
+                if service.advertised_app_labels().contains(&"SlideShow")
+                    || !service.mot_content_types.is_empty()
+                {
+                    lines.push(Line::from(vec![
+                        Span::styled("MOT Types: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(if service.mot_content_types.is_empty() {
+                            "none received".to_string()
+                        } else {
+                            service.mot_content_types.join(", ")
+                        }),
+                    ]));
+                }
+                if !service.content_items.is_empty() {
+                    let idx = content_selection.min(service.content_items.len() - 1);
+                    let selected = &service.content_items[idx];
+                    let types = service
+                        .content_items
+                        .iter()
+                        .map(|item| item.content_type.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    lines.push(Line::from(vec![
+                        Span::styled("Content: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(types),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("Selected: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(format!(
+                            "{}/{}  {}  ({})",
+                            idx + 1,
+                            service.content_items.len(),
+                            selected.content_type,
+                            selected.filename
+                        )),
                     ]));
                 }
             }
@@ -311,6 +379,42 @@ impl AppState {
                     Style::default().fg(Color::DarkGray),
                 )),
             ]
+        }
+    }
+
+    fn selected_content_item(&self) -> Option<&ContentItem> {
+        let sid = self.playing_sid?;
+        let service = self.ensemble.services.iter().find(|s| s.id == sid)?;
+        if service.content_items.is_empty() {
+            return None;
+        }
+        let idx = self.content_selection.min(service.content_items.len() - 1);
+        service.content_items.get(idx)
+    }
+
+    fn cycle_content_next(&mut self) {
+        let Some(count) = self
+            .playing_sid
+            .and_then(|sid| self.ensemble.services.iter().find(|s| s.id == sid))
+            .map(|svc| svc.content_items.len())
+        else {
+            return;
+        };
+        if count > 0 {
+            self.content_selection = (self.content_selection + 1) % count;
+        }
+    }
+
+    fn cycle_content_prev(&mut self) {
+        let Some(count) = self
+            .playing_sid
+            .and_then(|sid| self.ensemble.services.iter().find(|s| s.id == sid))
+            .map(|svc| svc.content_items.len())
+        else {
+            return;
+        };
+        if count > 0 {
+            self.content_selection = (self.content_selection + count - 1) % count;
         }
     }
 
@@ -400,6 +504,10 @@ impl AppState {
                         is_dab_plus: svc.is_dab_plus,
                         dls_text: svc.dls_text.clone(),
                         now_playing: svc.now_playing.clone(),
+                        content_items: svc.content_items.clone(),
+                        mot_content_types: svc.mot_content_types.clone(),
+                        codec: None,
+                        signal_quality_percent: None,
                     },
                 )
             })
@@ -496,6 +604,8 @@ fn run_loop(
                         if let Some(old) = state.ensemble.services.iter().find(|s| s.id == svc.id) {
                             svc.dls_text = old.dls_text.clone();
                             svc.now_playing = old.now_playing.clone();
+                            svc.content_items = old.content_items.clone();
+                            svc.mot_content_types = old.mot_content_types.clone();
                         }
                     }
                     ens.services
@@ -522,6 +632,21 @@ fn run_loop(
                 PipelineUpdate::Playing { sid, label } => {
                     state.playing_sid = Some(sid);
                     state.playing_label = Some(label.clone());
+                    state.content_selection = 0;
+                    state.codec = state
+                        .ensemble
+                        .services
+                        .iter()
+                        .find(|s| s.id == sid)
+                        .map(|s| {
+                            if s.is_dab_plus {
+                                "HE-AAC v2"
+                            } else {
+                                "MPEG Layer II"
+                            }
+                            .to_string()
+                        });
+                    state.signal_quality_percent = None;
                     if state.scan_state.is_none() {
                         state.mode = UiMode::Playback;
                     }
@@ -541,13 +666,53 @@ fn run_loop(
                     let text = metadata.raw_text.clone();
                     // Update metadata in the live ensemble snapshot.
                     if let Some(svc) = state.ensemble.services.iter_mut().find(|s| s.id == sid) {
+                        if is_new_now_playing_item(svc.now_playing.as_ref(), &metadata) {
+                            svc.content_items.clear();
+                            if state.playing_sid == Some(sid) {
+                                state.content_selection = 0;
+                            }
+                        }
                         svc.dls_text = Some(text.clone());
                         svc.now_playing = Some(metadata.clone());
                     }
                     // Also update any discovered service entry for cross-channel scans.
                     if let Some(entry) = state.discovered.iter_mut().find(|s| s.sid == sid) {
+                        if is_new_now_playing_item(entry.now_playing.as_ref(), &metadata) {
+                            entry.content_items.clear();
+                        }
                         entry.dls_text = Some(text.clone());
                         entry.now_playing = Some(metadata.clone());
+                    }
+                    state.rebuild_now_playing();
+                    dirty = true;
+                }
+                PipelineUpdate::PlaybackMeta {
+                    sid,
+                    codec,
+                    signal_quality_percent,
+                } => {
+                    if state.playing_sid == Some(sid) {
+                        state.codec = Some(codec.clone());
+                        state.signal_quality_percent = Some(signal_quality_percent);
+                    }
+                    if let Some(entry) = state.discovered.iter_mut().find(|s| s.sid == sid) {
+                        entry.codec = Some(codec);
+                        entry.signal_quality_percent = Some(signal_quality_percent);
+                    }
+                    state.rebuild_now_playing();
+                    dirty = true;
+                }
+                PipelineUpdate::Content { sid, content } => {
+                    if let Some(svc) = state.ensemble.services.iter_mut().find(|s| s.id == sid) {
+                        record_mot_content_type(&mut svc.mot_content_types, &content.content_type);
+                        upsert_content_item(&mut svc.content_items, content.clone());
+                    }
+                    if let Some(entry) = state.discovered.iter_mut().find(|s| s.sid == sid) {
+                        record_mot_content_type(
+                            &mut entry.mot_content_types,
+                            &content.content_type,
+                        );
+                        upsert_content_item(&mut entry.content_items, content);
                     }
                     state.rebuild_now_playing();
                     dirty = true;
@@ -745,6 +910,19 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                 state.status = "Stopped".into();
                 state.mode = UiMode::Browse;
             }
+            KeyCode::Left | KeyCode::Char('h') => state.cycle_content_prev(),
+            KeyCode::Right | KeyCode::Char('l') => state.cycle_content_next(),
+            KeyCode::Char('d') => match save_selected_content(state) {
+                Ok(Some(path)) => {
+                    state.status = format!("Saved {}", path.display());
+                }
+                Ok(None) => {
+                    state.status = "No downloadable content selected".into();
+                }
+                Err(err) => {
+                    state.status = format!("Save failed: {err}");
+                }
+            },
             _ => {}
         },
         UiMode::Playback => match code {
@@ -764,6 +942,19 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                 state.status = "Stopped".into();
                 state.mode = UiMode::Browse;
             }
+            KeyCode::Left | KeyCode::Char('h') => state.cycle_content_prev(),
+            KeyCode::Right | KeyCode::Char('l') => state.cycle_content_next(),
+            KeyCode::Char('d') => match save_selected_content(state) {
+                Ok(Some(path)) => {
+                    state.status = format!("Saved {}", path.display());
+                }
+                Ok(None) => {
+                    state.status = "No downloadable content selected".into();
+                }
+                Err(err) => {
+                    state.status = format!("Save failed: {err}");
+                }
+            },
             _ => {}
         },
     }
@@ -868,8 +1059,8 @@ fn render_status_bar(f: &mut Frame, state: &AppState, area: Rect) {
     let help_text = match state.mode {
         UiMode::CountrySelect => " [↑↓/jk] Navigate  [Enter] Select  [Esc/q] Cancel ",
         UiMode::Browse if state.scan_state.is_some() => " Scanning… ",
-        UiMode::Browse => " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [c] Country  [q] Quit ",
-        UiMode::Playback => " [b] Browse  [s] Stop  [c] Country  [q] Quit ",
+        UiMode::Browse => " [↑↓/jk] Navigate  [Enter] Play  [←→/hl] Content  [d] Download  [s] Stop  [c] Country  [q] Quit ",
+        UiMode::Playback => " [b] Browse  [←→/hl] Content  [d] Download  [s] Stop  [c] Country  [q] Quit ",
     };
     let help = Span::styled(help_text, Style::default().fg(Color::DarkGray));
     let status = Span::styled(
@@ -947,6 +1138,75 @@ fn render_scan_log(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(list, area);
 }
 
+fn upsert_content_item(items: &mut Vec<ContentItem>, content: ContentItem) {
+    if let Some(existing) = items
+        .iter_mut()
+        .find(|item| item.filename == content.filename && item.content_type == content.content_type)
+    {
+        *existing = content;
+    } else {
+        items.push(content);
+    }
+}
+
+fn record_mot_content_type(types: &mut Vec<String>, content_type: &str) {
+    if !types.iter().any(|existing| existing == content_type) {
+        types.push(content_type.to_string());
+        types.sort();
+    }
+}
+
+fn is_new_now_playing_item(previous: Option<&NowPlaying>, next: &NowPlaying) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+
+    if previous.toggle.is_some() && next.toggle.is_some() && previous.toggle != next.toggle {
+        return true;
+    }
+    if previous.title != next.title && (previous.title.is_some() || next.title.is_some()) {
+        return true;
+    }
+    if previous.artist != next.artist && (previous.artist.is_some() || next.artist.is_some()) {
+        return true;
+    }
+    previous.raw_text != next.raw_text
+}
+
+fn save_selected_content(state: &AppState) -> io::Result<Option<PathBuf>> {
+    let Some(content) = state.selected_content_item() else {
+        return Ok(None);
+    };
+    let filename = sanitize_download_name(&content.filename, &content.content_type);
+    let path = PathBuf::from(filename);
+    std::fs::write(&path, &content.bytes)?;
+    Ok(Some(path))
+}
+
+fn sanitize_download_name(name: &str, content_type: &str) -> String {
+    let mut clean = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    if clean.is_empty() {
+        let ext = match content_type {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            other => other.rsplit('/').next().unwrap_or("bin"),
+        };
+        clean = format!("content.{ext}");
+    }
+    clean
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,15 +1247,25 @@ mod tests {
             }],
         });
 
-        let lines =
-            AppState::build_now_playing_lines(Some("Radio"), "Ensemble", Some(&service), None);
+        let lines = AppState::build_now_playing_lines(
+            Some("Radio"),
+            "Ensemble",
+            Some(&service),
+            None,
+            0,
+            Some("HE-AAC v2"),
+            Some(87),
+        );
         let rendered = lines
             .iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
+        assert!(rendered.contains("Codec: HE-AAC v2"));
+        assert!(rendered.contains("Reception: 87%"));
         assert!(rendered.contains("Slideshow: Signalled"));
+        assert!(rendered.contains("MOT Types: none received"));
     }
 
     #[test]
@@ -1023,5 +1293,88 @@ mod tests {
         handle_key(KeyCode::Char('b'), &mut state, &handle);
 
         assert_eq!(state.mode, UiMode::Browse);
+    }
+
+    #[test]
+    fn build_now_playing_lines_show_selected_content() {
+        let service = Service {
+            label: "Radio".into(),
+            mot_content_types: vec!["image/jpeg".into(), "image/png".into()],
+            content_items: vec![
+                ContentItem {
+                    content_type: "image/jpeg".into(),
+                    filename: "cover.jpg".into(),
+                    bytes: vec![1, 2, 3],
+                    updated_at_unix_ms: 0,
+                },
+                ContentItem {
+                    content_type: "image/png".into(),
+                    filename: "slide.png".into(),
+                    bytes: vec![4, 5, 6],
+                    updated_at_unix_ms: 0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let lines = AppState::build_now_playing_lines(
+            Some("Radio"),
+            "Ensemble",
+            Some(&service),
+            None,
+            1,
+            None,
+            None,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Content: image/jpeg, image/png"));
+        assert!(rendered.contains("MOT Types: image/jpeg, image/png"));
+        assert!(rendered.contains("Selected: 2/2  image/png  (slide.png)"));
+    }
+
+    #[test]
+    fn sanitize_download_name_keeps_transmitted_filename() {
+        assert_eq!(
+            sanitize_download_name("cover.art", "image/jpeg"),
+            "cover.art"
+        );
+        assert_eq!(sanitize_download_name("", "image/png"), "content.png");
+    }
+
+    #[test]
+    fn new_now_playing_item_clears_stale_mot() {
+        let old = NowPlaying {
+            raw_text: "Artist A - Song A".into(),
+            title: Some("Song A".into()),
+            artist: Some("Artist A".into()),
+            toggle: Some(false),
+            ..Default::default()
+        };
+        let new = NowPlaying {
+            raw_text: "Artist B - Song B".into(),
+            title: Some("Song B".into()),
+            artist: Some("Artist B".into()),
+            toggle: Some(true),
+            ..Default::default()
+        };
+
+        assert!(is_new_now_playing_item(Some(&old), &new));
+        assert!(!is_new_now_playing_item(None, &new));
+    }
+
+    #[test]
+    fn record_mot_content_type_keeps_unique_sorted_list() {
+        let mut types = vec!["image/png".to_string()];
+        record_mot_content_type(&mut types, "image/jpeg");
+        record_mot_content_type(&mut types, "image/png");
+        assert_eq!(
+            types,
+            vec!["image/jpeg".to_string(), "image/png".to_string()]
+        );
     }
 }

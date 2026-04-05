@@ -632,6 +632,27 @@ fn cmd_play(
                     metadata.artist
                 );
             }
+            PipelineUpdate::PlaybackMeta {
+                sid,
+                codec,
+                signal_quality_percent,
+            } => {
+                log::info!(
+                    "PlaybackMeta SId={:04X}: codec={} signal={}%",
+                    sid,
+                    codec,
+                    signal_quality_percent
+                );
+            }
+            PipelineUpdate::Content { sid, content } => {
+                log::info!(
+                    "Content SId={:04X}: type={} filename={} bytes={}",
+                    sid,
+                    content.content_type,
+                    content.filename,
+                    content.bytes.len()
+                );
+            }
         }
     }
 }

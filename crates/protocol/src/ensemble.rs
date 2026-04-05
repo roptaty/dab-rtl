@@ -6,6 +6,8 @@ pub enum MetadataSource {
     XPad,
     /// Metadata extracted from packet-mode DLS components.
     Packet,
+    /// Metadata extracted from slideshow / cover-art transport.
+    Slideshow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -22,6 +24,18 @@ pub struct NowPlaying {
     pub item_running: Option<bool>,
     /// Origin transport for this metadata update.
     pub source: Option<MetadataSource>,
+    /// Receiver timestamp in Unix milliseconds.
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContentItem {
+    /// MIME-like content type derived from the payload or signalling.
+    pub content_type: String,
+    /// Best available filename for saving the content.
+    pub filename: String,
+    /// Raw payload bytes.
+    pub bytes: Vec<u8>,
     /// Receiver timestamp in Unix milliseconds.
     pub updated_at_unix_ms: u64,
 }
@@ -73,6 +87,10 @@ pub struct Service {
     pub dls_text: Option<String>,
     /// Structured now-playing metadata (from X-PAD and/or packet DLS).
     pub now_playing: Option<NowPlaying>,
+    /// Downloadable slideshow / cover-art objects associated with this service.
+    pub content_items: Vec<ContentItem>,
+    /// Unique MOT content types observed for this service in the current session.
+    pub mot_content_types: Vec<String>,
 }
 
 impl Service {
