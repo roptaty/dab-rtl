@@ -38,16 +38,20 @@ enum Command {
     /// Scan for DAB stations on the given channel (no TUI)
     Scan {
         /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
-        #[arg(short = 'c', long, required_unless_present_any = ["country", "file"])]
+        #[arg(short = 'c', long, required_unless_present_any = ["country", "file", "tcp"])]
         channel: Option<String>,
 
         /// ISO 3166-1 alpha-2 country code (e.g. NO, GB, DE); scans all channels
-        #[arg(long, conflicts_with_all = ["channel", "file"])]
+        #[arg(long, conflicts_with_all = ["channel", "file", "tcp"])]
         country: Option<String>,
 
         /// Raw IQ file (u8 interleaved I/Q, e.g. from rtl_sdr) instead of live SDR
-        #[arg(short = 'f', long, conflicts_with = "country")]
+        #[arg(short = 'f', long, conflicts_with_all = ["country", "tcp"])]
         file: Option<PathBuf>,
+
+        /// rtl_tcp server address (host:port, default port 1234)
+        #[arg(short = 't', long, conflicts_with_all = ["country", "file"])]
+        tcp: Option<String>,
     },
 
     /// Tune to a channel and launch the interactive TUI
@@ -56,13 +60,13 @@ enum Command {
         #[arg(
             short = 'c',
             long,
-            required_unless_present_any = ["file", "country"]
+            required_unless_present_any = ["file", "country", "tcp"]
         )]
         channel: Option<String>,
 
         /// ISO 3166-1 alpha-2 country code (e.g. NO, GB, DE).
         /// Scans all channels for that country and lets you pick a station.
-        #[arg(long, conflicts_with_all = ["channel", "file"])]
+        #[arg(long, conflicts_with_all = ["channel", "file", "tcp"])]
         country: Option<String>,
 
         /// Audio output device name (default = system default)
@@ -70,14 +74,18 @@ enum Command {
         audio_device: Option<String>,
 
         /// Raw IQ file (u8 interleaved I/Q, e.g. from rtl_sdr) instead of live SDR
-        #[arg(short = 'f', long, conflicts_with = "country")]
+        #[arg(short = 'f', long, conflicts_with_all = ["country", "tcp"])]
         file: Option<PathBuf>,
+
+        /// rtl_tcp server address (host:port, default port 1234)
+        #[arg(short = 't', long, conflicts_with_all = ["country", "file"])]
+        tcp: Option<String>,
     },
 
     /// Play a specific station (non-interactive)
     Play {
         /// DAB Band III channel (e.g. 11C) or raw frequency in Hz
-        #[arg(short = 'c', long, required_unless_present = "file")]
+        #[arg(short = 'c', long, required_unless_present_any = ["file", "tcp"])]
         channel: Option<String>,
 
         /// Station name (case-insensitive substring match)
@@ -89,8 +97,12 @@ enum Command {
         audio_device: Option<String>,
 
         /// Raw IQ file (u8 interleaved I/Q, e.g. from rtl_sdr) instead of live SDR
-        #[arg(short = 'f', long)]
+        #[arg(short = 'f', long, conflicts_with = "tcp")]
         file: Option<PathBuf>,
+
+        /// rtl_tcp server address (host:port, default port 1234)
+        #[arg(short = 't', long, conflicts_with = "file")]
+        tcp: Option<String>,
     },
 }
 
@@ -149,9 +161,19 @@ fn resolve_channel(ch: &str) -> u32 {
     })
 }
 
-/// Open an IQ sample stream from either a raw file or a live RTL-SDR device.
+/// Normalise a `--tcp` address: append `:1234` if no port is given.
+fn normalise_tcp_addr(addr: &str) -> String {
+    if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:1234")
+    }
+}
+
+/// Open an IQ sample stream from a raw file, live RTL-SDR device, or rtl_tcp server.
 fn open_iq_source(
     file: Option<&PathBuf>,
+    tcp: Option<&str>,
     channel: Option<&str>,
     device_idx: u32,
     ppm: i32,
@@ -159,6 +181,22 @@ fn open_iq_source(
 ) -> sdr::SdrStream {
     if let Some(path) = file {
         match sdr::open_file_stream(path, 32_768) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(addr) = tcp {
+        let ch = channel.expect("channel required with --tcp");
+        let freq_hz = resolve_channel(ch);
+        let config = sdr::TcpConfig {
+            address: normalise_tcp_addr(addr),
+            center_freq_hz: freq_hz,
+            gain,
+            ppm_correction: ppm,
+        };
+        match sdr::open_tcp_stream(&config) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -185,9 +223,17 @@ fn open_iq_source(
 }
 
 /// Describe the IQ source for user-facing messages.
-fn source_label(file: Option<&PathBuf>, channel: Option<&str>) -> String {
+fn source_label(file: Option<&PathBuf>, tcp: Option<&str>, channel: Option<&str>) -> String {
     if let Some(path) = file {
         format!("file '{}'", path.display())
+    } else if let Some(addr) = tcp {
+        let ch = channel.expect("channel required with --tcp");
+        let freq_hz = resolve_channel(ch);
+        format!(
+            "rtl_tcp://{} channel {ch} at {:.3} MHz",
+            normalise_tcp_addr(addr),
+            freq_hz as f64 / 1e6
+        )
     } else {
         let ch = channel.expect("channel or file required");
         let freq_hz = resolve_channel(ch);
@@ -211,12 +257,14 @@ fn main() {
             channel,
             country,
             file,
-        } => cmd_scan(cli.device, cli.ppm, cli.gain, channel, country, file),
+            tcp,
+        } => cmd_scan(cli.device, cli.ppm, cli.gain, channel, country, file, tcp),
         Command::Tune {
             channel,
             country,
             audio_device,
             file,
+            tcp,
         } => cmd_tune(
             cli.device,
             cli.ppm,
@@ -225,12 +273,14 @@ fn main() {
             country,
             audio_device,
             file,
+            tcp,
         ),
         Command::Play {
             channel,
             station,
             audio_device,
             file,
+            tcp,
         } => cmd_play(
             cli.device,
             cli.ppm,
@@ -239,6 +289,7 @@ fn main() {
             station,
             audio_device,
             file,
+            tcp,
         ),
     }
 }
@@ -281,6 +332,7 @@ fn cmd_scan(
     channel: Option<String>,
     country: Option<String>,
     file: Option<PathBuf>,
+    tcp: Option<String>,
 ) {
     // Country mode: scan all channels for that country (file not supported).
     if let Some(code) = country {
@@ -292,12 +344,19 @@ fn cmd_scan(
             }
         };
         for ch in &channels {
-            scan_single(device_idx, ppm, gain, Some(ch.as_str()), None);
+            scan_single(device_idx, ppm, gain, Some(ch.as_str()), None, None);
         }
         return;
     }
 
-    scan_single(device_idx, ppm, gain, channel.as_deref(), file.as_ref());
+    scan_single(
+        device_idx,
+        ppm,
+        gain,
+        channel.as_deref(),
+        file.as_ref(),
+        tcp.as_deref(),
+    );
 }
 
 /// Scan a single IQ source for DAB services.
@@ -307,6 +366,7 @@ fn scan_single(
     gain: i32,
     channel: Option<&str>,
     file: Option<&PathBuf>,
+    tcp: Option<&str>,
 ) {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
@@ -317,10 +377,10 @@ fn scan_single(
     /// After the first service appears, wait this long for more to arrive.
     const SETTLE_SECS: u64 = 5;
 
-    let label = source_label(file, channel);
+    let label = source_label(file, tcp, channel);
     println!("Scanning {label}…");
 
-    let stream = open_iq_source(file, channel, device_idx, ppm, gain);
+    let stream = open_iq_source(file, tcp, channel, device_idx, ppm, gain);
 
     let mut ofdm = OfdmProcessor::new();
     let mut fic = FicDecoder::new();
@@ -387,6 +447,7 @@ fn scan_single(
 }
 
 /// Interactive TUI: tune to a specific channel, or scan all channels for a country.
+#[allow(clippy::too_many_arguments)]
 fn cmd_tune(
     device_idx: u32,
     ppm: i32,
@@ -395,6 +456,7 @@ fn cmd_tune(
     country: Option<String>,
     audio_device: Option<String>,
     file: Option<PathBuf>,
+    tcp: Option<String>,
 ) {
     // Country mode: scan all channels for that country in the TUI.
     if let Some(ref code) = country {
@@ -437,10 +499,50 @@ fn cmd_tune(
     }
 
     // Single-channel mode (or file mode).
-    let label = source_label(file.as_ref(), channel.as_deref());
+    let label = source_label(file.as_ref(), tcp.as_deref(), channel.as_deref());
     println!("Tuning to {label}…");
 
-    if file.is_none() {
+    if file.is_some() {
+        // File mode: retune not supported.
+        let stream = open_iq_source(
+            file.as_ref(),
+            None,
+            channel.as_deref(),
+            device_idx,
+            ppm,
+            gain,
+        );
+        let handle = match pipeline::start_with_stream(stream, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = tui::run(handle, vec![]) {
+            eprintln!("TUI error: {e}");
+        }
+    } else if let Some(ref addr) = tcp {
+        // TCP mode: retune supported via start_for_source.
+        let ch = channel.as_deref().expect("channel required with --tcp");
+        let freq_hz = resolve_channel(ch);
+        let config = sdr::SourceConfig::Tcp(sdr::TcpConfig {
+            address: normalise_tcp_addr(addr),
+            center_freq_hz: freq_hz,
+            gain,
+            ppm_correction: ppm,
+        });
+        let handle = match pipeline::start_for_source(config, audio_device) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = tui::run(handle, vec![]) {
+            eprintln!("TUI error: {e}");
+        }
+    } else {
         // Live SDR: use start_for_device so the TUI can retune via [c] → country select.
         let ch = channel.as_deref().expect("channel or file required");
         let freq_hz = resolve_channel(ch);
@@ -460,23 +562,11 @@ fn cmd_tune(
         if let Err(e) = tui::run(handle, vec![]) {
             eprintln!("TUI error: {e}");
         }
-    } else {
-        // File mode: retune not supported.
-        let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
-        let handle = match pipeline::start_with_stream(stream, audio_device) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = tui::run(handle, vec![]) {
-            eprintln!("TUI error: {e}");
-        }
     }
 }
 
 /// Non-interactive play: find the named station and start audio immediately.
+#[allow(clippy::too_many_arguments)]
 fn cmd_play(
     device_idx: u32,
     ppm: i32,
@@ -485,13 +575,21 @@ fn cmd_play(
     station: String,
     audio_device: Option<String>,
     file: Option<PathBuf>,
+    tcp: Option<String>,
 ) {
     use pipeline::{PipelineCmd, PipelineUpdate};
 
-    let label = source_label(file.as_ref(), channel.as_deref());
+    let label = source_label(file.as_ref(), tcp.as_deref(), channel.as_deref());
     println!("Searching for '{station}' on {label}…  Press Ctrl-C to stop.");
 
-    let stream = open_iq_source(file.as_ref(), channel.as_deref(), device_idx, ppm, gain);
+    let stream = open_iq_source(
+        file.as_ref(),
+        tcp.as_deref(),
+        channel.as_deref(),
+        device_idx,
+        ppm,
+        gain,
+    );
 
     let handle = match pipeline::start_with_stream(stream, audio_device) {
         Ok(h) => h,

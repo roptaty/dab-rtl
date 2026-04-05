@@ -113,7 +113,18 @@ pub fn start_for_device(
     config: sdr::DeviceConfig,
     audio_device: Option<String>,
 ) -> Result<PipelineHandle, String> {
-    let stream = sdr::open_stream(config.clone(), 32_768).map_err(|e| e.to_string())?;
+    start_for_source(sdr::SourceConfig::Device(config), audio_device)
+}
+
+/// Start the receive pipeline from any retuneable source (`SourceConfig`).
+///
+/// Supports `PipelineCmd::Retune` for both local RTL-SDR devices and remote
+/// `rtl_tcp` servers.
+pub fn start_for_source(
+    config: sdr::SourceConfig,
+    audio_device: Option<String>,
+) -> Result<PipelineHandle, String> {
+    let stream = sdr::open_source(&config, 32_768).map_err(|e| e.to_string())?;
 
     let (update_tx, update_rx) = mpsc::sync_channel::<PipelineUpdate>(32);
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipelineCmd>(8);
@@ -141,7 +152,7 @@ pub fn start_for_device(
 
 fn run_pipeline(
     initial_stream: sdr::SdrStream,
-    device_config: Option<sdr::DeviceConfig>,
+    source_config: Option<sdr::SourceConfig>,
     audio_out: Option<audio::AudioOutput>,
     update_tx: mpsc::SyncSender<PipelineUpdate>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<PipelineCmd>>>,
@@ -150,7 +161,7 @@ fn run_pipeline(
     // Currently selected SId (None = scan-only).  Preserved across retunes.
     let mut playing_sid: Option<u32> = None;
     // Track the current centre frequency so ensemble snapshots carry it.
-    let mut current_freq_hz: u32 = device_config.as_ref().map_or(0, |c| c.center_freq_hz);
+    let mut current_freq_hz: u32 = source_config.as_ref().map_or(0, |c| c.center_freq_hz());
 
     'pipeline: loop {
         let mut ofdm = OfdmProcessor::new();
@@ -521,20 +532,16 @@ fn run_pipeline(
 
         // Handle retune: drop the old stream and open a new one at the new frequency.
         match pending_retune.take() {
-            Some(freq_hz) if device_config.is_some() => {
-                let cfg = device_config.as_ref().unwrap();
-                let new_cfg = sdr::DeviceConfig {
-                    center_freq_hz: freq_hz,
-                    ..cfg.clone()
-                };
+            Some(freq_hz) if source_config.is_some() => {
+                let new_cfg = source_config.as_ref().unwrap().with_freq(freq_hz);
                 log::info!("pipeline: retuning to {:.3} MHz", freq_hz as f64 / 1e6);
                 let _ = update_tx.try_send(PipelineUpdate::Status(format!(
                     "Retuning to {:.3} MHz…",
                     freq_hz as f64 / 1e6
                 )));
-                // Drop the old stream so the USB device is released before reopening.
+                // Drop the old stream so the device/connection is released before reopening.
                 drop(stream);
-                match sdr::open_stream(new_cfg, 32_768) {
+                match sdr::open_source(&new_cfg, 32_768) {
                     Ok(new_stream) => {
                         stream = new_stream;
                         current_freq_hz = freq_hz;
