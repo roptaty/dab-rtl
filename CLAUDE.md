@@ -66,11 +66,18 @@ RTL-SDR IQ → [sdr] → Complex32 samples
 - `crates/sdr` — RTL-SDR acquisition via `rtlsdr_mt`, IQ→Complex32 conversion, mpsc channel streaming
 - `crates/ofdm` — DAB Mode I OFDM: null symbol frame sync, FFT (2048 pt), π/4-DQPSK differential product, frequency deinterleaver. Key type: `OfdmProcessor` (returns `OfdmFrame`)
 - `crates/fec` — Soft-decision Viterbi (K=7, rate 1/4, 64 states) + 24 EEP/UEP depuncturing vectors
-- `crates/protocol` — FIC/FIB/FIG parsing (`FicHandler`), ensemble/service/subchannel types, MSC scheduling (`MscHandler`)
-- `crates/audio` — cpal `AudioOutput` (ALSA default), symphonia `Mp2Decoder` for DAB audio, fdk-aac `DabPlusDecoder` for DAB+ HE-AAC v2 (960-sample frames, SBR/PS via RAW transport)
-- `crates/app` — Binary entry point. `pipeline.rs` wires the full threaded pipeline; `tui.rs` is the ratatui TUI; `countries.rs` maps country codes to Band III channels; `main.rs` has the Band III channel→frequency table (5A–13F)
+- `crates/protocol` — FIC/FIB/FIG parsing (`FicHandler`), ensemble/service/subchannel types, X-PAD/DLS/DL+ parsing, and user-application tracking from FIG 0/13
+- `crates/audio` — cpal `AudioOutput` (ALSA default), optional symphonia `Mp2Decoder` for DAB audio (`mp2` feature), fdk-aac `DabPlusDecoder` for DAB+ HE-AAC v2 (960-sample frames, SBR/PS via RAW transport)
+- `crates/app` — Binary entry point. `pipeline.rs` wires the full threaded pipeline, merges X-PAD and packet-mode metadata, and handles retune/playback state; `tui.rs` is the ratatui TUI with browse/playback modes; `countries.rs` maps country codes to Band III channels; `main.rs` has the Band III channel→frequency table (5A–13F)
 
 **Threading model:** `pipeline.rs` runs SDR→OFDM→FIC→MSC→audio in a background thread. `PipelineHandle` exposes `update_rx` (events from pipeline) and `cmd_tx` (Play/Stop commands) to the TUI/CLI.
+
+## Current behavior notes
+
+- `FIG 0/13` user-application signalling is implemented. Application declarations may arrive before `FIG 0/2`/`FIG 0/3`; the parser now queues and later attaches them when the matching component becomes known.
+- Metadata priority is X-PAD first, packet-mode DLS second. `pipeline.rs` merges both paths and prefers richer X-PAD metadata when both exist.
+- The TUI now has explicit browse and playback modes. Selecting a service switches to the playback-focused view; `b` returns to browse mode.
+- Slideshow support is only signalled/displayed as capability today. MOT reassembly and terminal image display are still not implemented.
 
 ## Dependency management and security
 
@@ -90,6 +97,9 @@ When adding a new dependency, work through every item in the checklist in
 `cargo audit` and `cargo deny check` on every push and weekly on a schedule.
 
 ## Known TODOs
+
+- Implement MOT slideshow / cover-art reassembly and display
+- Implement proper UEP multi-region depuncturing instead of the current approximation
 
 
 ## Soft bit layout (split, not interleaved)

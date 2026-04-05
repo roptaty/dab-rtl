@@ -103,10 +103,12 @@ impl ScanState {
 }
 
 /// Which top-level view is active.
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum UiMode {
-    /// Normal station-list and now-playing view.
-    Normal,
+    /// Station-list and browse-focused view.
+    Browse,
+    /// Playback-focused view for the selected service.
+    Playback,
     /// Country selection popup.
     CountrySelect,
 }
@@ -168,7 +170,7 @@ impl AppState {
             playing_sid: None,
             playing_label: None,
             status: "Waiting for signal…".into(),
-            mode: UiMode::Normal,
+            mode: UiMode::Browse,
             country_entries: crate::countries::country_list(),
             country_list_state,
             scan_state: None,
@@ -263,6 +265,12 @@ impl AppState {
                     lines.push(Line::from(vec![
                         Span::styled("Apps: ", Style::default().fg(Color::DarkGray)),
                         Span::raw(app_labels.join(", ")),
+                    ]));
+                }
+                if service.advertised_app_labels().contains(&"SlideShow") {
+                    lines.push(Line::from(vec![
+                        Span::styled("Slideshow: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw("Signalled"),
                     ]));
                 }
             }
@@ -514,6 +522,9 @@ fn run_loop(
                 PipelineUpdate::Playing { sid, label } => {
                     state.playing_sid = Some(sid);
                     state.playing_label = Some(label.clone());
+                    if state.scan_state.is_none() {
+                        state.mode = UiMode::Playback;
+                    }
                     state.status = format!("Playing: {label}");
                     state.rebuild_now_playing();
                     dirty = true;
@@ -568,15 +579,15 @@ fn run_loop(
                     return Ok(());
                 }
                 // Capture mode before handling the key (it may change inside).
-                let was_normal = matches!(state.mode, UiMode::Normal);
+                let was_browse = matches!(state.mode, UiMode::Browse);
                 handle_key(key.code, &mut state, &handle);
                 state.rebuild_now_playing();
                 state.rebuild_service_items();
                 dirty = true;
 
-                // Only quit if we were already in Normal mode with no active scan.
+                // Only quit if we were already in Browse mode with no active scan.
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                    && was_normal
+                    && was_browse
                     && state.scan_state.is_none()
                 {
                     return Ok(());
@@ -687,7 +698,7 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
     match state.mode {
         UiMode::CountrySelect => match code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                state.mode = UiMode::Normal;
+                state.mode = UiMode::Browse;
             }
             KeyCode::Up | KeyCode::Char('k') => state.country_scroll_up(),
             KeyCode::Down | KeyCode::Char('j') => state.country_scroll_down(),
@@ -700,14 +711,14 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                                 crate::channel_to_freq(ch).map(|f| (ch.to_string(), f))
                             })
                             .collect();
-                        state.mode = UiMode::Normal;
+                        state.mode = UiMode::Browse;
                         start_scan(state, handle, ch_list);
                     }
                 }
             }
             _ => {}
         },
-        UiMode::Normal => match code {
+        UiMode::Browse => match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 // Quit logic handled by the caller in run_loop.
             }
@@ -722,6 +733,9 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                         let _ = handle.cmd_tx.try_send(PipelineCmd::Retune(freq_hz));
                     }
                     let _ = handle.cmd_tx.try_send(PipelineCmd::Play(sid));
+                    if state.scan_state.is_none() {
+                        state.mode = UiMode::Playback;
+                    }
                 }
             }
             KeyCode::Char('s') => {
@@ -729,6 +743,26 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                 state.playing_sid = None;
                 state.playing_label = None;
                 state.status = "Stopped".into();
+                state.mode = UiMode::Browse;
+            }
+            _ => {}
+        },
+        UiMode::Playback => match code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                // Quit logic handled by the caller in run_loop.
+            }
+            KeyCode::Char('b') => {
+                state.mode = UiMode::Browse;
+            }
+            KeyCode::Char('c') => {
+                state.mode = UiMode::CountrySelect;
+            }
+            KeyCode::Char('s') => {
+                let _ = handle.cmd_tx.try_send(PipelineCmd::Stop);
+                state.playing_sid = None;
+                state.playing_label = None;
+                state.status = "Stopped".into();
+                state.mode = UiMode::Browse;
             }
             _ => {}
         },
@@ -762,14 +796,18 @@ fn render(f: &mut Frame, state: &mut AppState) {
         (outer[0], None, outer[1])
     };
 
-    // Main: horizontal split — service list / now playing.
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(content_area);
+    if matches!(state.mode, UiMode::Playback) && state.scan_state.is_none() {
+        render_now_playing(f, state, content_area);
+    } else {
+        // Main: horizontal split — service list / now playing.
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(content_area);
 
-    render_service_list(f, state, main[0]);
-    render_now_playing(f, state, main[1]);
+        render_service_list(f, state, main[0]);
+        render_now_playing(f, state, main[1]);
+    }
     if let Some(log) = log_area {
         render_scan_log(f, state, log);
     }
@@ -784,6 +822,8 @@ fn render(f: &mut Frame, state: &mut AppState) {
 fn render_service_list(f: &mut Frame, state: &mut AppState, area: Rect) {
     let title = if state.scan_state.is_some() {
         " Scanning… ".to_string()
+    } else if matches!(state.mode, UiMode::Playback) {
+        " Playback ".to_string()
     } else if !state.discovered.is_empty() {
         format!(" {} stations found ", state.discovered.len())
     } else if !state.ensemble.label.is_empty() {
@@ -812,12 +852,13 @@ fn render_service_list(f: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
+    let title = if matches!(state.mode, UiMode::Playback) && state.scan_state.is_none() {
+        " Selected Service "
+    } else {
+        " Now Playing "
+    };
     let para = Paragraph::new(state.now_playing_lines.clone())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Now Playing "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: true });
 
     f.render_widget(para, area);
@@ -826,8 +867,9 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
 fn render_status_bar(f: &mut Frame, state: &AppState, area: Rect) {
     let help_text = match state.mode {
         UiMode::CountrySelect => " [↑↓/jk] Navigate  [Enter] Select  [Esc/q] Cancel ",
-        UiMode::Normal if state.scan_state.is_some() => " Scanning… ",
-        UiMode::Normal => " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [c] Country  [q] Quit ",
+        UiMode::Browse if state.scan_state.is_some() => " Scanning… ",
+        UiMode::Browse => " [↑↓/jk] Navigate  [Enter] Play  [s] Stop  [c] Country  [q] Quit ",
+        UiMode::Playback => " [b] Browse  [s] Stop  [c] Country  [q] Quit ",
     };
     let help = Span::styled(help_text, Style::default().fg(Color::DarkGray));
     let status = Span::styled(
@@ -903,4 +945,83 @@ fn render_scan_log(f: &mut Frame, state: &AppState, area: Rect) {
     );
 
     f.render_widget(list, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    use protocol::{
+        ensemble::{Component, ProtectionLevel, ServiceType, UserApplication},
+        Service,
+    };
+
+    fn dummy_handle() -> PipelineHandle {
+        let (_update_tx, update_rx) = mpsc::sync_channel(1);
+        let (cmd_tx, _cmd_rx) = mpsc::sync_channel(4);
+        PipelineHandle { update_rx, cmd_tx }
+    }
+
+    #[test]
+    fn build_now_playing_lines_shows_slideshow_capability() {
+        let mut service = Service {
+            label: "Radio".into(),
+            ..Default::default()
+        };
+        service.components.push(Component {
+            subchannel_id: 1,
+            scids: Some(0),
+            service_type: ServiceType::Audio,
+            start_address: 0,
+            size: 0,
+            protection: ProtectionLevel::EepA(2),
+            packet_address: None,
+            user_applications: vec![UserApplication {
+                uatype: UserApplication::UATYPE_SLIDESHOW,
+                data: vec![],
+                xpad_app_type: Some(12),
+                dscty: Some(0x3C),
+                uses_msc_data_groups: Some(true),
+                ca_applies: Some(false),
+            }],
+        });
+
+        let lines =
+            AppState::build_now_playing_lines(Some("Radio"), "Ensemble", Some(&service), None);
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Slideshow: Signalled"));
+    }
+
+    #[test]
+    fn enter_switches_to_playback_mode() {
+        let handle = dummy_handle();
+        let mut state = AppState::new();
+        state.ensemble.services.push(Service {
+            id: 0x1234,
+            label: "Radio".into(),
+            ..Default::default()
+        });
+        state.rebuild_service_items();
+
+        handle_key(KeyCode::Enter, &mut state, &handle);
+
+        assert_eq!(state.mode, UiMode::Playback);
+    }
+
+    #[test]
+    fn playback_mode_can_return_to_browse() {
+        let handle = dummy_handle();
+        let mut state = AppState::new();
+        state.mode = UiMode::Playback;
+
+        handle_key(KeyCode::Char('b'), &mut state, &handle);
+
+        assert_eq!(state.mode, UiMode::Browse);
+    }
 }

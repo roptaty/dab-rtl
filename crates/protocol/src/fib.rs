@@ -107,6 +107,9 @@ pub struct FibParser {
     /// Subchannel parameters indexed by SubChId (0–63), populated by FIG 0/1.
     /// Stored separately so they are available regardless of FIG arrival order.
     subchannels: HashMap<u8, SubchannelInfo>,
+    /// User applications indexed by (SId, SCIdS) when FIG 0/13 arrives before
+    /// the corresponding FIG 0/2 or FIG 0/3 component mapping.
+    pending_user_applications: HashMap<(u32, u8), Vec<UserApplication>>,
 }
 
 impl FibParser {
@@ -114,6 +117,7 @@ impl FibParser {
         FibParser {
             ensemble: Ensemble::default(),
             subchannels: HashMap::new(),
+            pending_user_applications: HashMap::new(),
         }
     }
 
@@ -349,6 +353,12 @@ impl FibParser {
                         packet_address: None,
                         user_applications: Vec::new(),
                     });
+                    apply_pending_user_applications(
+                        &mut self.pending_user_applications,
+                        svc,
+                        svc.components.len() - 1,
+                        sid,
+                    );
                 }
                 log::debug!(
                     "FIG 0/2: SId={:04X} SubChId={} TMId={} ASCTy={:#04x}",
@@ -380,14 +390,21 @@ impl FibParser {
 
             let svc = self.ensemble.get_or_insert_service(sid);
             // Find the component with this subchannel and set its packet address.
-            if let Some(comp) = svc
+            if let Some(component_idx) = svc
                 .components
-                .iter_mut()
-                .find(|c| c.subchannel_id == sub_ch_id)
+                .iter()
+                .position(|c| c.subchannel_id == sub_ch_id)
             {
+                let comp = &mut svc.components[component_idx];
                 comp.scids = Some(scids);
                 comp.packet_address = Some(packet_address);
                 comp.service_type = crate::ensemble::ServiceType::Data;
+                apply_pending_user_applications(
+                    &mut self.pending_user_applications,
+                    svc,
+                    component_idx,
+                    sid,
+                );
             } else {
                 // FIG 0/3 may arrive before FIG 0/2; insert a skeleton component.
                 let (start_address, size, protection) =
@@ -406,6 +423,12 @@ impl FibParser {
                     packet_address: Some(packet_address),
                     user_applications: Vec::new(),
                 });
+                apply_pending_user_applications(
+                    &mut self.pending_user_applications,
+                    svc,
+                    svc.components.len() - 1,
+                    sid,
+                );
             }
 
             log::debug!(
@@ -475,11 +498,16 @@ impl FibParser {
                     comp.user_applications.len()
                 );
             } else {
+                let key = (sid, scids);
+                let pending = self.pending_user_applications.entry(key).or_default();
+                for app in parsed_apps {
+                    upsert_user_application(pending, app);
+                }
                 log::debug!(
-                    "FIG 0/13: SId={:04X} SCIdS={} has {} app(s) but no matching component yet",
+                    "FIG 0/13: SId={:04X} SCIdS={} queued {} app(s) until component mapping arrives",
                     sid,
                     scids,
-                    parsed_apps.len()
+                    pending.len()
                 );
             }
         }
@@ -593,6 +621,29 @@ fn upsert_user_application(apps: &mut Vec<UserApplication>, app: UserApplication
         *existing = app;
     } else {
         apps.push(app);
+    }
+}
+
+fn apply_pending_user_applications(
+    pending_user_applications: &mut HashMap<(u32, u8), Vec<UserApplication>>,
+    svc: &mut crate::ensemble::Service,
+    component_idx: usize,
+    sid: u32,
+) {
+    let Some(scids) = svc
+        .components
+        .get(component_idx)
+        .and_then(|comp| comp.scids)
+    else {
+        return;
+    };
+    let Some(pending) = pending_user_applications.remove(&(sid, scids)) else {
+        return;
+    };
+    if let Some(comp) = svc.components.get_mut(component_idx) {
+        for app in pending {
+            upsert_user_application(&mut comp.user_applications, app);
+        }
     }
 }
 
@@ -853,5 +904,51 @@ mod tests {
         assert_eq!(app.dscty, Some(0x3C));
         assert_eq!(app.uses_msc_data_groups, Some(true));
         assert_eq!(app.ca_applies, Some(false));
+    }
+
+    #[test]
+    fn parse_fig_0_13_is_queued_until_primary_component_exists() {
+        let mut parser = FibParser::new();
+
+        // FIG 0/13 arrives before FIG 0/2 creates the primary component.
+        let fig_0_13 = [0x12, 0x34, 0x01, 0x00, 0x82, 0x0C, 0xBC];
+        parser.parse_fig_0_13(&fig_0_13);
+
+        // FIG 0/2 later creates the audio component with inferred SCIdS=0.
+        parser.parse_fig_0_2(&[0x12, 0x34, 0x01, 0x00, 0x14]);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.user_applications.len(), 1);
+        assert_eq!(
+            comp.user_applications[0].uatype,
+            UserApplication::UATYPE_SLIDESHOW
+        );
+    }
+
+    #[test]
+    fn parse_fig_0_13_is_queued_until_packet_component_exists() {
+        let mut parser = FibParser::new();
+
+        // FIG 0/13 arrives before the packet-mode FIG 0/3 mapping.
+        let fig_0_13 = [0x12, 0x34, 0x91, 0x00, 0x42, 0x02, 0x3C];
+        parser.parse_fig_0_13(&fig_0_13);
+
+        // FIG 0/2 creates the component without SCIdS.
+        parser.parse_fig_0_2(&[0x12, 0x34, 0x01, 0x00, 0x14]);
+        assert!(parser.ensemble.services[0].components[0]
+            .user_applications
+            .is_empty());
+
+        // FIG 0/3 supplies SCIdS=9 and packet-mode mapping, which should attach
+        // the pending application immediately.
+        parser.parse_fig_0_3(&[0x12, 0x34, 0x90, 0x14, 0x05, 0x05 << 2]);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.scids, Some(9));
+        assert_eq!(comp.user_applications.len(), 1);
+        assert_eq!(
+            comp.user_applications[0].uatype,
+            UserApplication::UATYPE_DYNAMIC_LABEL
+        );
     }
 }

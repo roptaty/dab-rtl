@@ -49,6 +49,10 @@ Playback mode should:
 
 Playback mode should not keep scan details as the primary focus. The selected station is the main object in the UI.
 
+The current implementation now follows this model more closely: selecting a
+service switches the TUI into a playback-focused view, while browse mode
+remains available when the user wants to return to the station list.
+
 ## RF and OFDM Layer
 
 ### Frequencies
@@ -170,6 +174,11 @@ The receiver shall parse at least:
 To support metadata and slideshow properly, the receiver should also parse:
 
 - `FIG 0/13` user application signalling
+
+`FIG 0/13` may arrive before the matching component description from
+`FIG 0/2` or `FIG 0/3`. A robust receiver should preserve those
+application declarations and attach them once the corresponding component
+mapping becomes known, instead of dropping them.
 
 ### Required Discovery Output
 
@@ -428,10 +437,12 @@ The current repository already contains significant parts of the receive chain:
 - OFDM synchronization and demodulation
 - Frequency de-interleaving
 - FIC parsing for core service discovery
+- `FIG 0/13` user-application parsing with component capability tracking
 - MSC extraction and decoding
 - DAB+ audio decoding path
 - X-PAD DLS and DL+ parsing
 - Packet-mode DLS fallback handling
+- Playback-focused TUI mode with browse/playback switching
 - TUI-based service list and now-playing updates
 
 The spec in this document should stay aligned with that architecture.
@@ -442,11 +453,10 @@ The current codebase does not yet fully implement everything required by this sp
 
 Main gaps:
 
-1. `FIG 0/13` user application parsing
-2. Explicit capability mapping per service component
-3. MOT reassembly for slideshow / cover art
-4. Playback-first UI state after service selection
-5. Robust handling of all metadata transports and reconfiguration cases
+1. MOT reassembly for slideshow / cover art
+2. Actual image decode and display in the playback UI
+3. More complete handling of all metadata transports and reconfiguration cases
+4. Proper UEP multi-region depuncturing for legacy services
 
 ## Implementation Plan
 
@@ -471,11 +481,13 @@ Expected code areas:
 
 Goal: discover which metadata applications are present on which service components.
 
-Tasks:
+Status: implemented.
 
-1. Add `FIG 0/13` parsing to the FIC parser
-2. Extend ensemble/service/component data structures to store user applications
-3. Expose application capabilities in pipeline updates and UI state
+Notes:
+
+1. `FIG 0/13` parsing is present in the FIC parser
+2. Service components store user applications and expose known app labels
+3. Out-of-order `FIG 0/13` data is queued until `FIG 0/2` or `FIG 0/3` resolves the component
 
 Expected code areas:
 
@@ -488,17 +500,19 @@ Expected code areas:
 
 Goal: after a service is selected, make the app behave like a radio player, not a scanner.
 
-Tasks:
+Status: partially implemented.
 
-1. Add an explicit playback-focused UI mode
-2. Show:
-   - Service label
-   - Audio status
-   - DLS text
-   - DL+ title and artist
-   - Slideshow status or image
-3. Minimize scan and ensemble details while listening
-4. Preserve background monitoring without making it the primary view
+Current behavior:
+
+1. The TUI has explicit browse and playback modes
+2. Selecting a service switches to a playback-focused view
+3. The playback panel shows service metadata and signalled application capabilities
+4. Browse mode remains available on demand
+
+Remaining work:
+
+1. Show slideshow images rather than only capability/status text
+2. Expand playback-focused presentation further if richer audio/status metrics are desired
 
 Expected code areas:
 
