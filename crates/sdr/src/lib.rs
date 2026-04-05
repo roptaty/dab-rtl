@@ -158,14 +158,38 @@ pub fn open_stream(config: DeviceConfig, buf_size: u32) -> Result<SdrStream, Sdr
     ctl.set_center_freq(config.center_freq_hz)
         .map_err(|e| SdrError::Device(format!("set_center_freq: {e:?}")))?;
 
+    // Flush stale samples from the device buffer after configuration.
+    ctl.reset_buffer()
+        .map_err(|e| SdrError::Device(format!("reset_buffer: {e:?}")))?;
+
     let (tx, rx) = mpsc::sync_channel::<Vec<Complex32>>(8);
+
+    // Number of initial IQ sample pairs to discard while the PLL locks and
+    // AGC settles (~50 ms at 2.048 Msps ≈ 102 400 samples).
+    let discard_samples: usize = SAMPLE_RATE as usize / 20; // 50 ms
 
     let thread = std::thread::Builder::new()
         .name("rtlsdr-reader".into())
         .spawn(move || {
             let mut scratch = Vec::with_capacity(buf_size as usize / 2);
+            let mut discarded: usize = 0;
             let read_result = reader.read_async(4, buf_size, |bytes| {
                 iq_to_complex_into(bytes, &mut scratch);
+
+                // Discard initial samples while the RTL-SDR PLL and AGC settle.
+                if discarded < discard_samples {
+                    discarded += scratch.len();
+                    scratch.clear();
+                    if discarded >= discard_samples {
+                        log::info!(
+                            "rtlsdr-reader: discarded {} initial samples ({:.0} ms)",
+                            discarded,
+                            discarded as f64 / SAMPLE_RATE as f64 * 1000.0
+                        );
+                    }
+                    return;
+                }
+
                 let samples = std::mem::take(&mut scratch);
                 if tx.send(samples).is_err() {
                     log::info!("rtlsdr-reader: receiver dropped, stopping");
