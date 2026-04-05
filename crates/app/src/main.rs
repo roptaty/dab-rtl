@@ -430,8 +430,10 @@ fn scan_single(
     let ens = fic.handler.ensemble();
     if !ens.label.is_empty() {
         println!("Ensemble: {} (EId {:04X})", ens.label, ens.id);
-        for svc in &ens.services {
-            let tag = if svc.is_dab_plus { " [DAB+]" } else { "" };
+        let mut services: Vec<_> = ens.services.iter().collect();
+        services.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+        for svc in &services {
+            let tag = if svc.is_dab_plus { "" } else { " [DAB Legacy]" };
             println!(
                 "  [{:08X}]  {}{}",
                 svc.id,

@@ -184,7 +184,7 @@ impl AppState {
         self.service_items.clear();
         if !self.discovered.is_empty() {
             self.service_items.extend(self.discovered.iter().map(|s| {
-                let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
+                let tag = if s.is_dab_plus { "" } else { " [DAB Legacy]" };
                 format!("{}{tag}", s.label)
             }));
         } else {
@@ -195,10 +195,15 @@ impl AppState {
                     } else {
                         s.label.clone()
                     };
-                    let tag = if s.is_dab_plus { " [DAB+]" } else { "" };
+                    let tag = if s.is_dab_plus { "" } else { " [DAB Legacy]" };
                     format!("{label}{tag}")
                 }));
         }
+    }
+
+    fn sort_discovered(&mut self) {
+        self.discovered
+            .sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
     }
 
     fn rebuild_now_playing(&mut self) {
@@ -485,11 +490,14 @@ fn run_loop(
                             svc.now_playing = old.now_playing.clone();
                         }
                     }
+                    ens.services
+                        .sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
                     state.ensemble = ens;
                     state.rebuild_now_playing();
 
                     if state.scan_state.is_some() {
                         state.collect_from_ensemble();
+                        state.sort_discovered();
                         state.rebuild_service_items();
                         state.rebuild_scan_log_title();
                     } else if state.discovered.is_empty() {
@@ -656,6 +664,7 @@ fn advance_scan(state: &mut AppState, handle: &PipelineHandle) {
         let services = state.scan_state.take().unwrap().services;
         let count = services.len();
         state.discovered = services;
+        state.sort_discovered();
         state.rebuild_service_items();
         let msg = if count == 0 {
             "Scan complete — no stations found".to_string()
