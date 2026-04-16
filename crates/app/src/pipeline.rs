@@ -20,6 +20,7 @@ use std::collections::hash_map::DefaultHasher;
 ///   → EEP depuncture → Viterbi → pack bytes → audio decoder
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -78,6 +79,208 @@ pub enum PipelineCmd {
 pub struct PipelineHandle {
     pub update_rx: mpsc::Receiver<PipelineUpdate>,
     pub cmd_tx: mpsc::SyncSender<PipelineCmd>,
+}
+
+const METADATA_TASK_QUEUE_DEPTH: usize = 128;
+
+#[derive(Debug)]
+enum MetadataTask {
+    XPadDabPlus {
+        sid: u32,
+        generation: u64,
+        au_data: Vec<u8>,
+    },
+    #[cfg(feature = "mp2")]
+    XPadMp2 {
+        sid: u32,
+        generation: u64,
+        frame_data: Vec<u8>,
+    },
+    PacketDls {
+        sid: u32,
+        generation: u64,
+        cif_soft: Vec<f32>,
+        component: Component,
+        cif_idx: usize,
+    },
+    PacketMot {
+        sid: u32,
+        generation: u64,
+        cif_soft: Vec<f32>,
+        component: Component,
+        cif_idx: usize,
+    },
+}
+
+impl MetadataTask {
+    fn sid(&self) -> u32 {
+        match self {
+            Self::XPadDabPlus { sid, .. }
+            | Self::PacketDls { sid, .. }
+            | Self::PacketMot { sid, .. } => *sid,
+            #[cfg(feature = "mp2")]
+            Self::XPadMp2 { sid, .. } => *sid,
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        match self {
+            Self::XPadDabPlus { generation, .. }
+            | Self::PacketDls { generation, .. }
+            | Self::PacketMot { generation, .. } => *generation,
+            #[cfg(feature = "mp2")]
+            Self::XPadMp2 { generation, .. } => *generation,
+        }
+    }
+}
+
+struct MetadataWorker {
+    generation: Arc<AtomicU64>,
+    task_tx: mpsc::SyncSender<MetadataTask>,
+}
+
+impl MetadataWorker {
+    fn spawn(update_tx: mpsc::SyncSender<PipelineUpdate>) -> Result<Self, String> {
+        let (task_tx, task_rx) = mpsc::sync_channel::<MetadataTask>(METADATA_TASK_QUEUE_DEPTH);
+        let generation = Arc::new(AtomicU64::new(0));
+        let generation_for_thread = Arc::clone(&generation);
+        thread::Builder::new()
+            .name("metadata".into())
+            .spawn(move || run_metadata_worker(task_rx, update_tx, generation_for_thread))
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            generation,
+            task_tx,
+        })
+    }
+
+    fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn try_send(&self, task: MetadataTask) {
+        match self.task_tx.try_send(task) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(task)) => {
+                log::debug!(
+                    "metadata: dropping {:?} task for SId={:04X} because worker queue is full",
+                    metadata_task_kind(&task),
+                    task.sid()
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(task)) => {
+                log::warn!(
+                    "metadata: worker disconnected while queuing {:?} task for SId={:04X}",
+                    metadata_task_kind(&task),
+                    task.sid()
+                );
+            }
+        }
+    }
+}
+
+fn metadata_task_kind(task: &MetadataTask) -> &'static str {
+    match task {
+        MetadataTask::XPadDabPlus { .. } => "xpad_dabplus",
+        #[cfg(feature = "mp2")]
+        MetadataTask::XPadMp2 { .. } => "xpad_mp2",
+        MetadataTask::PacketDls { .. } => "packet_dls",
+        MetadataTask::PacketMot { .. } => "packet_mot",
+    }
+}
+
+fn run_metadata_worker(
+    task_rx: mpsc::Receiver<MetadataTask>,
+    update_tx: mpsc::SyncSender<PipelineUpdate>,
+    generation: Arc<AtomicU64>,
+) {
+    let mut xpad = XPadAssembler::new();
+    let mut dls_msc = MscDecoder::new();
+    let mut mot_msc = MscDecoder::new();
+    let mut packet_dls = PacketDlsAssembler::new();
+    let mut packet_mot = PacketMotAssembler::new();
+    let mut last_now_playing: Option<NowPlaying> = None;
+    let mut active_generation: Option<u64> = None;
+    let mut active_sid: Option<u32> = None;
+
+    while let Ok(task) = task_rx.recv() {
+        let task_generation = task.generation();
+        let task_sid = task.sid();
+        if generation.load(Ordering::SeqCst) != task_generation {
+            continue;
+        }
+
+        if active_generation != Some(task_generation) || active_sid != Some(task_sid) {
+            xpad.reset();
+            dls_msc.set_target_sid(task_sid);
+            mot_msc.set_target_sid(task_sid);
+            packet_dls.reset();
+            packet_mot.reset();
+            last_now_playing = None;
+            active_generation = Some(task_generation);
+            active_sid = Some(task_sid);
+        }
+
+        match task {
+            MetadataTask::XPadDabPlus { au_data, .. } => {
+                if let Some(meta) = xpad.push_dabplus_au_metadata(&au_data) {
+                    if generation.load(Ordering::SeqCst) == task_generation {
+                        maybe_emit_now_playing(&update_tx, task_sid, meta, &mut last_now_playing);
+                    }
+                }
+            }
+            #[cfg(feature = "mp2")]
+            MetadataTask::XPadMp2 { frame_data, .. } => {
+                if let Some(meta) = xpad.push_mp2_bytes_metadata(&frame_data) {
+                    if generation.load(Ordering::SeqCst) == task_generation {
+                        maybe_emit_now_playing(&update_tx, task_sid, meta, &mut last_now_playing);
+                    }
+                }
+            }
+            MetadataTask::PacketDls {
+                cif_soft,
+                component,
+                cif_idx,
+                ..
+            } => {
+                if let Some(frame) = dls_msc.process_cif(&cif_soft, &component, cif_idx) {
+                    if let Some(meta) =
+                        packet_dls.push_frame(&frame.data, component.packet_address.unwrap_or(0))
+                    {
+                        if generation.load(Ordering::SeqCst) == task_generation {
+                            maybe_emit_now_playing(
+                                &update_tx,
+                                task_sid,
+                                meta,
+                                &mut last_now_playing,
+                            );
+                        }
+                    }
+                }
+            }
+            MetadataTask::PacketMot {
+                cif_soft,
+                component,
+                cif_idx,
+                ..
+            } => {
+                if let Some(frame) = mot_msc.process_cif(&cif_soft, &component, cif_idx) {
+                    if generation.load(Ordering::SeqCst) == task_generation {
+                        for content in packet_mot
+                            .push_frame(&frame.data, component.packet_address.unwrap_or(0))
+                        {
+                            let _ = update_tx.try_send(PipelineUpdate::Content {
+                                sid: task_sid,
+                                content,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    log::info!("metadata: thread exiting");
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -171,6 +374,10 @@ fn run_pipeline(
     cmd_rx: Arc<Mutex<mpsc::Receiver<PipelineCmd>>>,
 ) {
     let mut stream = initial_stream;
+    let metadata_worker = MetadataWorker::spawn(update_tx.clone())
+        .map_err(|e| log::warn!("metadata worker spawn failed: {e}"))
+        .ok();
+    let mut metadata_generation = 0u64;
     // Currently selected SId (None = scan-only).  Preserved across retunes.
     let mut playing_sid: Option<u32> = None;
     // Track the current centre frequency so ensemble snapshots carry it.
@@ -191,14 +398,6 @@ fn run_pipeline(
         let mut pending_retune: Option<u32> = None;
         let mut last_playing_announced: Option<u32> = None;
         let mut cif_soft = Vec::<f32>::with_capacity(18 * 3072);
-        // DLS decoder: decodes the packet-mode DLS subchannel for the playing service.
-        let mut dls_msc = MscDecoder::new();
-        let mut mot_msc = MscDecoder::new();
-        // X-PAD DLS assembler: extracts DLS from the audio subchannel itself.
-        let mut xpad = XPadAssembler::new();
-        let mut packet_dls = PacketDlsAssembler::new();
-        let mut packet_mot = PacketMotAssembler::new();
-        let mut last_now_playing: Option<NowPlaying> = None;
         let mut last_signal_quality: Option<u8> = None;
         let mut signal_tracker = PlaybackSignalTracker::new();
         #[cfg(not(feature = "mp2"))]
@@ -209,7 +408,6 @@ fn run_pipeline(
         // Restore playing state if we re-tuned to the same channel.
         if let Some(sid) = playing_sid {
             msc.set_target_sid(sid);
-            dls_msc.set_target_sid(sid);
         }
 
         'stream: for iq_buf in stream.rx.iter() {
@@ -220,12 +418,10 @@ fn run_pipeline(
                         PipelineCmd::Play(sid) => {
                             playing_sid = Some(sid);
                             msc.set_target_sid(sid);
-                            dls_msc.set_target_sid(sid);
-                            mot_msc.set_target_sid(sid);
-                            xpad.reset();
-                            packet_dls.reset();
-                            packet_mot.reset();
-                            last_now_playing = None;
+                            metadata_generation = metadata_worker.as_ref().map_or(
+                                metadata_generation.wrapping_add(1),
+                                MetadataWorker::bump_generation,
+                            );
                             last_signal_quality = None;
                             signal_tracker.reset();
                             last_playing_announced = None;
@@ -237,12 +433,10 @@ fn run_pipeline(
                         PipelineCmd::Stop => {
                             playing_sid = None;
                             msc.clear_target();
-                            dls_msc.clear_target();
-                            mot_msc.clear_target();
-                            xpad.reset();
-                            packet_dls.reset();
-                            packet_mot.reset();
-                            last_now_playing = None;
+                            metadata_generation = metadata_worker.as_ref().map_or(
+                                metadata_generation.wrapping_add(1),
+                                MetadataWorker::bump_generation,
+                            );
                             last_signal_quality = None;
                             signal_tracker.reset();
                             last_playing_announced = None;
@@ -253,6 +447,10 @@ fn run_pipeline(
                         }
                         PipelineCmd::Retune(freq_hz) => {
                             pending_retune = Some(freq_hz);
+                            metadata_generation = metadata_worker.as_ref().map_or(
+                                metadata_generation.wrapping_add(1),
+                                MetadataWorker::bump_generation,
+                            );
                         }
                     }
                 }
@@ -419,7 +617,7 @@ fn run_pipeline(
                                     }
                                     let pcm = if frame.is_dab_plus {
                                         let pcm = dab_plus.push(&frame.data);
-                                        // Extract X-PAD DLS from each validated AU.
+                                        // Hand X-PAD metadata off to the worker so audio stays on the hot path.
                                         let n_aus = dab_plus.pad_aus.len();
                                         if cif_idx == 0 || n_aus > 0 {
                                             log::debug!(
@@ -430,15 +628,12 @@ fn run_pipeline(
                                             );
                                         }
                                         for au_data in dab_plus.pad_aus.drain(..) {
-                                            if let Some(meta) =
-                                                xpad.push_dabplus_au_metadata(&au_data)
-                                            {
-                                                maybe_emit_now_playing(
-                                                    &update_tx,
+                                            if let Some(worker) = &metadata_worker {
+                                                worker.try_send(MetadataTask::XPadDabPlus {
                                                     sid,
-                                                    meta,
-                                                    &mut last_now_playing,
-                                                );
+                                                    generation: metadata_generation,
+                                                    au_data,
+                                                });
                                             }
                                         }
                                         pcm
@@ -446,7 +641,7 @@ fn run_pipeline(
                                         #[cfg(feature = "mp2")]
                                         {
                                         let pcm = mp2.push(&frame.data);
-                                        // Extract X-PAD DLS from the MPEG Layer 2 frames.
+                                        // Offload X-PAD scanning so it cannot delay audio writes.
                                         log::debug!(
                                             "X-PAD DAB (MP2): CIF={} passing {} bytes to X-PAD scanner \
                                              (first {:02X} {:02X} {:02X} {:02X})",
@@ -457,15 +652,13 @@ fn run_pipeline(
                                             frame.data.get(2).copied().unwrap_or(0),
                                             frame.data.get(3).copied().unwrap_or(0),
                                         );
-                                        if let Some(meta) =
-                                            xpad.push_mp2_bytes_metadata(&frame.data)
-                                        {
-                                            maybe_emit_now_playing(
-                                                &update_tx,
+                                        #[cfg(feature = "mp2")]
+                                        if let Some(worker) = &metadata_worker {
+                                            worker.try_send(MetadataTask::XPadMp2 {
                                                 sid,
-                                                meta,
-                                                &mut last_now_playing,
-                                            );
+                                                generation: metadata_generation,
+                                                frame_data: frame.data.clone(),
+                                            });
                                         }
                                         pcm
                                         }
@@ -548,44 +741,14 @@ fn run_pipeline(
                                         dls_comp.subchannel_id,
                                         dls_comp.packet_address,
                                     );
-                                    match dls_msc.process_cif(&cif_soft, dls_comp, cif_idx) {
-                                        None => {
-                                            log::debug!("DLS: process_cif returned None (still accumulating)");
-                                        }
-                                        Some(frame) => {
-                                            log::debug!(
-                                                "DLS: decoded frame {} bytes, target_addr={}",
-                                                frame.data.len(),
-                                                dls_comp.packet_address.unwrap_or(0),
-                                            );
-                                            if log::log_enabled!(log::Level::Debug) {
-                                                log::debug!(
-                                                    "DLS: frame hex={}",
-                                                    frame
-                                                        .data
-                                                        .iter()
-                                                        .map(|b| format!("{b:02X}"))
-                                                        .collect::<Vec<_>>()
-                                                        .join(" ")
-                                                );
-                                            }
-                                            match packet_dls.push_frame(
-                                                &frame.data,
-                                                dls_comp.packet_address.unwrap_or(0),
-                                            ) {
-                                                None => {
-                                                    log::debug!("DLS: packet reassembly returned no complete item");
-                                                }
-                                                Some(meta) => {
-                                                    maybe_emit_now_playing(
-                                                        &update_tx,
-                                                        sid,
-                                                        meta,
-                                                        &mut last_now_playing,
-                                                    );
-                                                }
-                                            }
-                                        }
+                                    if let Some(worker) = &metadata_worker {
+                                        worker.try_send(MetadataTask::PacketDls {
+                                            sid,
+                                            generation: metadata_generation,
+                                            cif_soft: cif_soft.clone(),
+                                            component: dls_comp.clone(),
+                                            cif_idx,
+                                        });
                                     }
                                 }
                             }
@@ -600,16 +763,14 @@ fn run_pipeline(
                                         mot_comp.subchannel_id,
                                         mot_comp.packet_address,
                                     );
-                                    if let Some(frame) = mot_msc.process_cif(&cif_soft, mot_comp, cif_idx) {
-                                        for content in packet_mot.push_frame(
-                                            &frame.data,
-                                            mot_comp.packet_address.unwrap_or(0),
-                                        ) {
-                                            let _ = update_tx.try_send(PipelineUpdate::Content {
-                                                sid,
-                                                content,
-                                            });
-                                        }
+                                    if let Some(worker) = &metadata_worker {
+                                        worker.try_send(MetadataTask::PacketMot {
+                                            sid,
+                                            generation: metadata_generation,
+                                            cif_soft: cif_soft.clone(),
+                                            component: mot_comp.clone(),
+                                            cif_idx,
+                                        });
                                     }
                                 }
                             }
