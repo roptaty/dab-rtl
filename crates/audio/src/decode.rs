@@ -321,7 +321,7 @@ impl DabPlusDecoder {
             // Try every CIF boundary in the buffer.
             let cif = self.superframe_size;
             let max_offset = self.buf.len().saturating_sub(sf_size);
-            let num_offsets = if cif > 0 { max_offset / cif + 1 } else { 0 };
+            let num_offsets = (max_offset.checked_div(cif)).map_or(0, |q| q + 1);
             log::debug!(
                 "DAB+ sync search: buf={}, sf_size={}, max_offset={}, checking {} offsets",
                 self.buf.len(),
