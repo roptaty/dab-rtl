@@ -368,7 +368,8 @@ impl XPadAssembler {
             return None;
         }
         let payload = &chunk[2..2 + body_len];
-        let seg_num = if first { 0 } else { header1 >> 4 };
+        let field2 = header1 >> 4;
+        let seg_num = if first { 0 } else { (field2 & 0x07) + 1 };
 
         log::debug!(
             "X-PAD DLS: h0={:02X} h1={:02X} first={} last={} toggle={} command={} seg={} body_len={} chunk_len={}",
@@ -416,6 +417,17 @@ impl XPadAssembler {
             }
             if let Some(cmd_bytes) = self.try_assemble_command_segments() {
                 self.dl_plus = parse_dl_plus_command(&cmd_bytes);
+                if let Some(parsed) = self.try_assemble() {
+                    return Some(NowPlaying {
+                        raw_text: parsed.text,
+                        title: parsed.title,
+                        artist: parsed.artist,
+                        toggle: parsed.toggle,
+                        item_running: parsed.item_running,
+                        source: Some(MetadataSource::XPad),
+                        updated_at_unix_ms: unix_ms_now(),
+                    });
+                }
             }
             return None;
         }
@@ -748,16 +760,12 @@ fn apply_dl_plus_to_text(
         }
         match *ty {
             // DL+ content types commonly used for title-like fields.
-            0x01 | 0x1F => {
-                if title.is_none() {
-                    title = Some(val);
-                }
+            0x01 | 0x1F if title.is_none() => {
+                title = Some(val);
             }
             // DL+ content types commonly used for artist-like fields.
-            0x04 | 0x20 => {
-                if artist.is_none() {
-                    artist = Some(val);
-                }
+            0x04 | 0x20 if artist.is_none() => {
+                artist = Some(val);
             }
             _ => {}
         }
@@ -863,7 +871,7 @@ mod tests {
         let byte1 = if first {
             (charset & 0x0F) << 4
         } else {
-            (seg_num & 0x0F) << 4
+            ((seg_num.saturating_sub(1)) & 0x07) << 4
         };
         let mut logical = Vec::with_capacity(2 + text.len() + 2);
         logical.push(byte0);
@@ -1054,6 +1062,28 @@ mod tests {
     }
 
     #[test]
+    fn assembler_two_segment_label_uses_minus_one_segment_numbering() {
+        let mut asm = XPadAssembler::new();
+
+        let seg0 = build_dls_segment_physical(b"Te", false, true, false, 0, 0);
+        let seg1 = build_dls_segment_physical(b"xt", false, false, true, 0, 1);
+
+        let build_frame = |dls: &[u8]| {
+            let mut f = vec![0u8; 4];
+            f.extend_from_slice(dls);
+            f.push(0x00);
+            f.push(0x22);
+            f.push(0x20);
+            f.push(0x02);
+            f
+        };
+
+        assert!(asm.push_mp2_frame(&build_frame(&seg1)).is_none());
+        let result = asm.push_mp2_frame(&build_frame(&seg0));
+        assert_eq!(result, Some("Text".to_string()));
+    }
+
+    #[test]
     fn assembler_no_xpad_returns_none() {
         let mut asm = XPadAssembler::new();
         // F-PAD byte0 = 0x00: type=00 (no X-PAD)
@@ -1187,10 +1217,38 @@ mod tests {
 
         let mut logical_cmd = cmd_chunk.clone();
         logical_cmd.reverse();
-        assert!(asm.process_dls_chunk(&logical_cmd).is_none());
-        let parsed = asm.try_assemble().expect("expected assembled text");
-        assert_eq!(parsed.title.as_deref(), Some("Title"));
-        assert_eq!(parsed.artist.as_deref(), Some("Artist"));
+        let refreshed = asm
+            .process_dls_chunk(&logical_cmd)
+            .expect("expected refreshed metadata");
+        assert_eq!(refreshed.title.as_deref(), Some("Title"));
+        assert_eq!(refreshed.artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn dl_plus_command_emits_metadata_for_current_text() {
+        let mut asm = XPadAssembler::new();
+        let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
+        let cmd_payload = [0x11u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
+
+        let mut logical_text = text_chunk.clone();
+        logical_text.reverse();
+        let text_meta = asm
+            .process_dls_chunk(&logical_text)
+            .expect("expected text metadata");
+        assert_eq!(text_meta.raw_text, "TitleArtist");
+        assert_eq!(text_meta.title, None);
+        assert_eq!(text_meta.artist, None);
+
+        let mut logical_cmd = cmd_chunk.clone();
+        logical_cmd.reverse();
+        let cmd_meta = asm
+            .process_dls_chunk(&logical_cmd)
+            .expect("expected metadata refresh from DL+ command");
+        assert_eq!(cmd_meta.raw_text, "TitleArtist");
+        assert_eq!(cmd_meta.title.as_deref(), Some("Title"));
+        assert_eq!(cmd_meta.artist.as_deref(), Some("Artist"));
+        assert_eq!(cmd_meta.source, Some(MetadataSource::XPad));
     }
 
     #[test]
