@@ -570,7 +570,7 @@ fn diagnose_fic_decoding() {
             let d1 = deinterleaver.deinterleave(&ch1);
 
             let mut soft = Vec::with_capacity(NUM_CARRIERS * 2);
-            for (a, b) in d0.into_iter().zip(d1.into_iter()) {
+            for (a, b) in d0.into_iter().zip(d1) {
                 soft.push(a);
                 soft.push(b);
             }
@@ -801,7 +801,7 @@ fn diagnose_fic_decoding() {
                                     };
 
                                     let mut soft = Vec::with_capacity(NUM_CARRIERS * 2);
-                                    for (a, b) in d0.into_iter().zip(d1.into_iter()) {
+                                    for (a, b) in d0.into_iter().zip(d1) {
                                         soft.push(a);
                                         soft.push(b);
                                     }
