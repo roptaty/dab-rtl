@@ -218,8 +218,7 @@ impl AppState {
     }
 
     fn sort_discovered(&mut self) {
-        self.discovered
-            .sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+        self.discovered.sort_by_key(|a| a.label.to_lowercase());
     }
 
     fn rebuild_now_playing(&mut self) {
@@ -608,8 +607,7 @@ fn run_loop(
                             svc.mot_content_types = old.mot_content_types.clone();
                         }
                     }
-                    ens.services
-                        .sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+                    ens.services.sort_by_key(|a| a.label.to_lowercase());
                     state.ensemble = ens;
                     state.rebuild_now_playing();
 

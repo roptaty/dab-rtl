@@ -431,7 +431,7 @@ fn scan_single(
     if !ens.label.is_empty() {
         println!("Ensemble: {} (EId {:04X})", ens.label, ens.id);
         let mut services: Vec<_> = ens.services.iter().collect();
-        services.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+        services.sort_by_key(|a| a.label.to_lowercase());
         for svc in &services {
             let tag = if svc.is_dab_plus { "" } else { " [DAB Legacy]" };
             println!(

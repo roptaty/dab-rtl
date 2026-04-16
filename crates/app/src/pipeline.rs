@@ -1620,10 +1620,7 @@ impl PacketMotAssembler {
             state.buffer.drain(..keep_from);
         }
 
-        loop {
-            let Some((start, end, content_type, ext)) = find_embedded_object(&state.buffer) else {
-                break;
-            };
+        while let Some((start, end, content_type, ext)) = find_embedded_object(&state.buffer) {
             let payload = state.buffer[start..end].to_vec();
             let payload_hash = hash_bytes(&payload);
             if !state.seen_hashes.insert(payload_hash) {
