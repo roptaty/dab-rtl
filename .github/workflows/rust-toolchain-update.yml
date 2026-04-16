@@ -6,7 +6,8 @@ permissions:
 
 on:
   schedule:
-    # Check weekly on Thursday at 10:00 UTC (Rust releases on Thursdays)
+    # Rust releases on Thursdays; check the following Thursday to let new
+    # releases bake for 7 days before proposing an update.
     - cron: "0 10 * * 4"
   workflow_dispatch:
 
@@ -23,22 +24,37 @@ jobs:
           version=$(grep '^channel' rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Get latest stable version
+      - name: Get latest stable version and release date
         id: latest
         run: |
-          # Fetch the latest stable release version from the Rust release manifest
-          version=$(curl -sSf https://static.rust-lang.org/dist/channel-rust-stable.toml \
-            | grep -m1 '^version = ' | sed 's/.*"\(.*\)"/\1/' | cut -d' ' -f1)
+          manifest=$(curl -sSf https://static.rust-lang.org/dist/channel-rust-stable.toml)
+          version=$(echo "$manifest" | grep -m1 '^version = ' | sed 's/.*"\(.*\)"/\1/' | cut -d' ' -f1)
+          release_date=$(echo "$manifest" | grep -m1 '^date = ' | sed 's/.*"\(.*\)"/\1/')
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release_date=$release_date" >> "$GITHUB_OUTPUT"
+
+      - name: Check release is at least 7 days old
+        id: age
+        run: |
+          release_epoch=$(date -d "${{ steps.latest.outputs.release_date }}" +%s)
+          now_epoch=$(date +%s)
+          age_days=$(( (now_epoch - release_epoch) / 86400 ))
+          echo "days=$age_days" >> "$GITHUB_OUTPUT"
+          if [ "$age_days" -ge 7 ]; then
+            echo "old_enough=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "old_enough=false" >> "$GITHUB_OUTPUT"
+            echo "Rust ${{ steps.latest.outputs.version }} is only ${age_days} days old, skipping (waiting for 7 days)"
+          fi
 
       - name: Update toolchain if newer version available
-        if: steps.current.outputs.version != steps.latest.outputs.version
+        if: steps.current.outputs.version != steps.latest.outputs.version && steps.age.outputs.old_enough == 'true'
         run: |
           sed -i 's/channel = ".*"/channel = "${{ steps.latest.outputs.version }}"/' rust-toolchain.toml
           cat rust-toolchain.toml
 
       - name: Create pull request
-        if: steps.current.outputs.version != steps.latest.outputs.version
+        if: steps.current.outputs.version != steps.latest.outputs.version && steps.age.outputs.old_enough == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           branch: chore/rust-toolchain-${{ steps.latest.outputs.version }}
