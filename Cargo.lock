@@ -472,10 +472,6 @@ dependencies = [
 [[package]]
 name = "fec"
 version = "0.1.0"
-dependencies = [
- "log",
- "thiserror",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -983,9 +979,7 @@ dependencies = [
 name = "protocol"
 version = "0.1.0"
 dependencies = [
- "fec",
  "log",
- "thiserror",
 ]
 
 [[package]]
