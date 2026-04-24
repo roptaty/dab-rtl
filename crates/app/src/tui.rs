@@ -343,6 +343,17 @@ impl AppState {
             }
             if let Some(meta) = now_playing {
                 lines.push(Line::from(""));
+                let status = match meta.item_running {
+                    Some(true) => Some(("Playing", Color::Green)),
+                    Some(false) => Some(("Idle", Color::DarkGray)),
+                    None => None,
+                };
+                if let Some((label, colour)) = status {
+                    lines.push(Line::from(vec![
+                        Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(label.to_string(), Style::default().fg(colour)),
+                    ]));
+                }
                 lines.push(Line::from(vec![
                     Span::styled("Text: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(meta.raw_text.clone(), Style::default().fg(Color::Yellow)),

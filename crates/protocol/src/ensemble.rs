@@ -30,6 +30,10 @@ pub struct NowPlaying {
     pub genre: Option<String>,
     /// DLS toggle bit (changes when item changes), if signalled.
     pub toggle: Option<bool>,
+    /// DL+ Item Toggle (IT) bit from the DL+ command header
+    /// (TS 102 980 §7.3.2). Flipped by the broadcaster to mark a new
+    /// programme item; distinct from the cosmetic DLS segment toggle.
+    pub item_toggle: Option<bool>,
     /// Item running flag. `Some(false)` means the broadcaster has signalled
     /// that the current item has stopped; the UI should clear song details.
     pub item_running: Option<bool>,

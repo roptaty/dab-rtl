@@ -84,8 +84,8 @@ pub struct XPadAssembler {
 struct DlPlusFields {
     tags: Vec<(u8, usize, usize)>,
     /// Item Toggle bit from the DL+ command header (TS 102 980 §7.3).
-    /// Stored for future cross-checking against the DLS segment toggle.
-    #[allow(dead_code)]
+    /// Used for cross-checking against the DLS segment toggle and as the
+    /// authoritative "new item" signal surfaced to the UI.
     item_toggle: Option<bool>,
     /// Item Running bit from the DL+ command header.  `Some(false)` tells the
     /// receiver to clear any displayed title/artist/etc. for the service.
@@ -108,6 +108,7 @@ struct ParsedDls {
     text: String,
     values: DlPlusValues,
     toggle: Option<bool>,
+    item_toggle: Option<bool>,
     item_running: Option<bool>,
 }
 
@@ -402,17 +403,26 @@ impl XPadAssembler {
         );
 
         // Detect item change via toggle bit and reset in-progress buffers.
+        // The DLS segment toggle flips whenever the displayed label refreshes
+        // (cosmetic scroll, programme-intro change, etc.), while the DL+ IT
+        // bit only flips on a real item change. When we have a cached DL+ IT
+        // we keep the previous DL+ tags alive across DLS toggle flips so the
+        // title/artist don't blink until the next DL+ command arrives.
         if let Some(prev) = self.toggle {
             if toggle != prev {
                 self.segments.clear();
                 self.last_seg_num = None;
                 self.command_segments.clear();
                 self.command_last_seg_num = None;
-                self.dl_plus = None;
+                let cached_it = self.dl_plus.as_ref().and_then(|d| d.item_toggle);
+                if cached_it.is_none() {
+                    self.dl_plus = None;
+                }
                 log::debug!(
-                    "X-PAD DLS: toggle changed ({} → {}) — new label",
+                    "X-PAD DLS: toggle changed ({} → {}) — new label (dl_plus kept={})",
                     prev,
-                    toggle
+                    toggle,
+                    cached_it.is_some(),
                 );
             }
         }
@@ -476,11 +486,13 @@ impl XPadAssembler {
             return None;
         }
         let values = apply_dl_plus_to_text(&text, self.dl_plus.as_ref());
+        let item_toggle = self.dl_plus.as_ref().and_then(|d| d.item_toggle);
         let item_running = self.dl_plus.as_ref().and_then(|d| d.item_running);
         Some(ParsedDls {
             text,
             values,
             toggle: self.toggle,
+            item_toggle,
             item_running,
         })
     }
@@ -799,6 +811,7 @@ fn now_playing_from_parsed(parsed: ParsedDls) -> NowPlaying {
         band: values.band,
         genre: values.genre,
         toggle: parsed.toggle,
+        item_toggle: parsed.item_toggle,
         item_running: parsed.item_running,
         source: Some(MetadataSource::XPad),
         updated_at_unix_ms: unix_ms_now(),
@@ -1388,5 +1401,97 @@ mod tests {
             .expect("expected metadata");
         assert_eq!(meta.raw_text, "Hi");
         assert_eq!(meta.source, Some(MetadataSource::XPad));
+    }
+
+    #[test]
+    fn dl_plus_item_toggle_surfaces_on_now_playing() {
+        let mut asm = XPadAssembler::new();
+        let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
+        // IT=1, IR=1, 2 tags.
+        let cmd = [0x1Du8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
+
+        let mut frame = vec![0u8; 8];
+        frame.extend_from_slice(&text_chunk);
+        frame.push(0x00);
+        frame.push(0x82);
+        frame.push(0x20);
+        frame.push(0x02);
+        asm.push_mp2_frame_metadata(&frame).expect("text");
+
+        let mut logical_cmd = cmd_chunk.clone();
+        logical_cmd.reverse();
+        let meta = asm
+            .process_dls_chunk(&logical_cmd)
+            .expect("expected metadata");
+        assert_eq!(meta.item_toggle, Some(true));
+        assert_eq!(meta.item_running, Some(true));
+    }
+
+    #[test]
+    fn dls_toggle_flip_preserves_dl_plus_when_it_is_known() {
+        // When the DLS segment toggle flips (cosmetic label refresh) but we
+        // already have a cached DL+ IT, the DL+ tags should persist across
+        // the reset so the title/artist don't blink.
+        let mut asm = XPadAssembler::new();
+
+        // Seed the cache: text + DL+ command with IT=0, IR=1.
+        let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
+        let cmd = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
+
+        let mut frame1 = vec![0u8; 8];
+        frame1.extend_from_slice(&text_chunk);
+        frame1.push(0x00);
+        frame1.push(0x82);
+        frame1.push(0x20);
+        frame1.push(0x02);
+        asm.push_mp2_frame_metadata(&frame1).expect("text");
+        let mut logical_cmd = cmd_chunk.clone();
+        logical_cmd.reverse();
+        asm.process_dls_chunk(&logical_cmd)
+            .expect("expected metadata");
+        assert!(asm.dl_plus.is_some());
+
+        // Now a new DLS segment arrives with the toggle flipped. The DL+
+        // cache should survive so subsequent assemblies can keep tagging.
+        let refreshed = build_dls_segment_physical(b"TitleArtist", true, true, true, 0, 0);
+        let mut frame2 = vec![0u8; 8];
+        frame2.extend_from_slice(&refreshed);
+        frame2.push(0x00);
+        frame2.push(0x82);
+        frame2.push(0x20);
+        frame2.push(0x02);
+        let meta2 = asm.push_mp2_frame_metadata(&frame2).expect("refresh");
+        assert!(asm.dl_plus.is_some(), "dl_plus must survive toggle flip");
+        assert_eq!(meta2.title.as_deref(), Some("Title"));
+        assert_eq!(meta2.artist.as_deref(), Some("Artist"));
+        assert_eq!(meta2.item_toggle, Some(false));
+    }
+
+    #[test]
+    fn dls_toggle_flip_clears_cache_when_it_is_unknown() {
+        // Without a DL+ command seen yet, there's no IT to rely on, so a DLS
+        // toggle flip must still clear all state (old behaviour preserved).
+        let mut asm = XPadAssembler::new();
+        let text_chunk = build_dls_segment_physical(b"AA", false, true, true, 0, 0);
+        let mut frame1 = vec![0u8; 8];
+        frame1.extend_from_slice(&text_chunk);
+        frame1.push(0x00);
+        frame1.push(0x22);
+        frame1.push(0x20);
+        frame1.push(0x02);
+        asm.push_mp2_frame(&frame1).expect("text");
+        assert!(asm.dl_plus.is_none());
+
+        let flipped = build_dls_segment_physical(b"BB", true, true, true, 0, 0);
+        let mut frame2 = vec![0u8; 8];
+        frame2.extend_from_slice(&flipped);
+        frame2.push(0x00);
+        frame2.push(0x22);
+        frame2.push(0x20);
+        frame2.push(0x02);
+        asm.push_mp2_frame(&frame2).expect("flipped");
+        assert!(asm.dl_plus.is_none(), "no cached IT → still clears");
     }
 }

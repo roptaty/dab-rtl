@@ -1362,6 +1362,7 @@ fn maybe_emit_now_playing(
                 || prev.band != merged.band
                 || prev.genre != merged.genre
                 || prev.toggle != merged.toggle
+                || prev.item_toggle != merged.item_toggle
                 || prev.item_running != merged.item_running
                 || prev.source != merged.source
         }
@@ -1392,7 +1393,22 @@ fn merge_metadata(current: Option<NowPlaying>, mut incoming: NowPlaying) -> NowP
         return incoming;
     };
 
-    if incoming.toggle.is_some() && incoming.toggle != existing.toggle {
+    // A DL+ Item Toggle flip is the authoritative "new item" signal
+    // (TS 102 980 §7.3.2). When IT is known on both sides and has changed,
+    // accept the incoming metadata as a fresh item without backfilling.
+    if incoming.item_toggle.is_some()
+        && existing.item_toggle.is_some()
+        && incoming.item_toggle != existing.item_toggle
+    {
+        return incoming;
+    }
+    // Fall back to the DLS segment toggle for sources that don't provide
+    // DL+ IT (e.g. packet-mode DLS with only the control-byte toggle).
+    if incoming.item_toggle.is_none()
+        && existing.item_toggle.is_none()
+        && incoming.toggle.is_some()
+        && incoming.toggle != existing.toggle
+    {
         return incoming;
     }
     // When the broadcaster explicitly signals the item has stopped, drop
@@ -1424,6 +1440,9 @@ fn merge_metadata(current: Option<NowPlaying>, mut incoming: NowPlaying) -> NowP
     backfill_if_empty(&mut merged.genre, incoming.genre);
     if merged.item_running.is_none() {
         merged.item_running = incoming.item_running;
+    }
+    if merged.item_toggle.is_none() {
+        merged.item_toggle = incoming.item_toggle;
     }
     merged.updated_at_unix_ms = incoming.updated_at_unix_ms;
     merged
@@ -1846,6 +1865,67 @@ mod tests {
         let merged = merge_metadata(Some(existing.clone()), incoming);
         assert_eq!(merged.source, existing.source);
         assert_eq!(merged.raw_text, "Track A");
+    }
+
+    #[test]
+    fn merge_metadata_item_toggle_flip_resets_song() {
+        let existing = NowPlaying {
+            raw_text: "Old".into(),
+            title: Some("Old title".into()),
+            artist: Some("Old artist".into()),
+            toggle: Some(false),
+            item_toggle: Some(false),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 100,
+            ..Default::default()
+        };
+        let incoming = NowPlaying {
+            raw_text: "New".into(),
+            title: Some("New title".into()),
+            toggle: Some(false),
+            item_toggle: Some(true),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 200,
+            ..Default::default()
+        };
+        let merged = merge_metadata(Some(existing), incoming);
+        // IT flipped → accept incoming wholesale, no backfill of stale artist.
+        assert_eq!(merged.title.as_deref(), Some("New title"));
+        assert_eq!(merged.artist, None);
+        assert_eq!(merged.item_toggle, Some(true));
+    }
+
+    #[test]
+    fn merge_metadata_same_it_backfills_empty_fields() {
+        let existing = NowPlaying {
+            raw_text: "Same".into(),
+            title: Some("Song".into()),
+            artist: Some("Artist".into()),
+            album: Some("Album".into()),
+            toggle: Some(false),
+            item_toggle: Some(true),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 100,
+            ..Default::default()
+        };
+        let incoming = NowPlaying {
+            raw_text: "Same".into(),
+            genre: Some("Rock".into()),
+            toggle: Some(false),
+            item_toggle: Some(true),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 200,
+            ..Default::default()
+        };
+        let merged = merge_metadata(Some(existing), incoming);
+        assert_eq!(merged.title.as_deref(), Some("Song"));
+        assert_eq!(merged.artist.as_deref(), Some("Artist"));
+        assert_eq!(merged.album.as_deref(), Some("Album"));
+        assert_eq!(merged.genre.as_deref(), Some("Rock"));
     }
 
     #[test]
