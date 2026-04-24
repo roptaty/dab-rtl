@@ -1356,6 +1356,11 @@ fn maybe_emit_now_playing(
             prev.raw_text != merged.raw_text
                 || prev.title != merged.title
                 || prev.artist != merged.artist
+                || prev.album != merged.album
+                || prev.track != merged.track
+                || prev.composer != merged.composer
+                || prev.band != merged.band
+                || prev.genre != merged.genre
                 || prev.toggle != merged.toggle
                 || prev.item_running != merged.item_running
                 || prev.source != merged.source
@@ -1390,8 +1395,13 @@ fn merge_metadata(current: Option<NowPlaying>, mut incoming: NowPlaying) -> NowP
     if incoming.toggle.is_some() && incoming.toggle != existing.toggle {
         return incoming;
     }
-    let incoming_structured = incoming.title.is_some() || incoming.artist.is_some();
-    let existing_structured = existing.title.is_some() || existing.artist.is_some();
+    // When the broadcaster explicitly signals the item has stopped, drop
+    // any stale song details rather than backfilling from `existing`.
+    if incoming.item_running == Some(false) {
+        return incoming;
+    }
+    let incoming_structured = has_structured_metadata(&incoming);
+    let existing_structured = has_structured_metadata(&existing);
     if incoming_structured && !existing_structured {
         return incoming;
     }
@@ -1405,17 +1415,34 @@ fn merge_metadata(current: Option<NowPlaying>, mut incoming: NowPlaying) -> NowP
         return incoming;
     }
     let mut merged = existing;
-    if merged.title.is_none() {
-        merged.title = incoming.title;
-    }
-    if merged.artist.is_none() {
-        merged.artist = incoming.artist;
-    }
+    backfill_if_empty(&mut merged.title, incoming.title);
+    backfill_if_empty(&mut merged.artist, incoming.artist);
+    backfill_if_empty(&mut merged.album, incoming.album);
+    backfill_if_empty(&mut merged.track, incoming.track);
+    backfill_if_empty(&mut merged.composer, incoming.composer);
+    backfill_if_empty(&mut merged.band, incoming.band);
+    backfill_if_empty(&mut merged.genre, incoming.genre);
     if merged.item_running.is_none() {
         merged.item_running = incoming.item_running;
     }
     merged.updated_at_unix_ms = incoming.updated_at_unix_ms;
     merged
+}
+
+fn has_structured_metadata(m: &NowPlaying) -> bool {
+    m.title.is_some()
+        || m.artist.is_some()
+        || m.album.is_some()
+        || m.track.is_some()
+        || m.composer.is_some()
+        || m.band.is_some()
+        || m.genre.is_some()
+}
+
+fn backfill_if_empty(dst: &mut Option<String>, src: Option<String>) {
+    if dst.is_none() {
+        *dst = src;
+    }
 }
 
 #[derive(Default)]
@@ -1729,12 +1756,11 @@ fn parse_packet_dls_bytes(bytes: &[u8]) -> Option<NowPlaying> {
     }
     Some(NowPlaying {
         raw_text,
-        title: None,
-        artist: None,
         toggle,
         item_running,
         source: Some(MetadataSource::Packet),
         updated_at_unix_ms: unix_ms_now(),
+        ..Default::default()
     })
 }
 
@@ -1803,21 +1829,19 @@ mod tests {
     fn merge_metadata_prefers_xpad_over_plain_packet() {
         let existing = NowPlaying {
             raw_text: "Track A".into(),
-            title: None,
-            artist: None,
             toggle: Some(false),
             item_running: Some(true),
             source: Some(MetadataSource::XPad),
             updated_at_unix_ms: 100,
+            ..Default::default()
         };
         let incoming = NowPlaying {
             raw_text: "Track A".into(),
-            title: None,
-            artist: None,
             toggle: Some(false),
             item_running: Some(true),
             source: Some(MetadataSource::Packet),
             updated_at_unix_ms: 200,
+            ..Default::default()
         };
         let merged = merge_metadata(Some(existing.clone()), incoming);
         assert_eq!(merged.source, existing.source);

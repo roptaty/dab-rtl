@@ -359,6 +359,36 @@ impl AppState {
                         Span::raw(artist.clone()),
                     ]));
                 }
+                if let Some(album) = &meta.album {
+                    lines.push(Line::from(vec![
+                        Span::styled("Album: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(album.clone()),
+                    ]));
+                }
+                if let Some(track) = &meta.track {
+                    lines.push(Line::from(vec![
+                        Span::styled("Track: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(track.clone()),
+                    ]));
+                }
+                if let Some(composer) = &meta.composer {
+                    lines.push(Line::from(vec![
+                        Span::styled("Composer: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(composer.clone()),
+                    ]));
+                }
+                if let Some(band) = &meta.band {
+                    lines.push(Line::from(vec![
+                        Span::styled("Band: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(band.clone()),
+                    ]));
+                }
+                if let Some(genre) = &meta.genre {
+                    lines.push(Line::from(vec![
+                        Span::styled("Genre: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(genre.clone()),
+                    ]));
+                }
             }
             lines
         } else {

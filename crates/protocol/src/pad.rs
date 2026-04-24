@@ -83,13 +83,30 @@ pub struct XPadAssembler {
 #[derive(Debug, Clone, Default)]
 struct DlPlusFields {
     tags: Vec<(u8, usize, usize)>,
+    /// Item Toggle bit from the DL+ command header (TS 102 980 §7.3).
+    /// Stored for future cross-checking against the DLS segment toggle.
+    #[allow(dead_code)]
+    item_toggle: Option<bool>,
+    /// Item Running bit from the DL+ command header.  `Some(false)` tells the
+    /// receiver to clear any displayed title/artist/etc. for the service.
+    item_running: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DlPlusValues {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    track: Option<String>,
+    composer: Option<String>,
+    band: Option<String>,
+    genre: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ParsedDls {
     text: String,
-    title: Option<String>,
-    artist: Option<String>,
+    values: DlPlusValues,
     toggle: Option<bool>,
     item_running: Option<bool>,
 }
@@ -418,15 +435,7 @@ impl XPadAssembler {
             if let Some(cmd_bytes) = self.try_assemble_command_segments() {
                 self.dl_plus = parse_dl_plus_command(&cmd_bytes);
                 if let Some(parsed) = self.try_assemble() {
-                    return Some(NowPlaying {
-                        raw_text: parsed.text,
-                        title: parsed.title,
-                        artist: parsed.artist,
-                        toggle: parsed.toggle,
-                        item_running: parsed.item_running,
-                        source: Some(MetadataSource::XPad),
-                        updated_at_unix_ms: unix_ms_now(),
-                    });
+                    return Some(now_playing_from_parsed(parsed));
                 }
             }
             return None;
@@ -449,15 +458,7 @@ impl XPadAssembler {
         }
 
         let parsed = self.try_assemble()?;
-        Some(NowPlaying {
-            raw_text: parsed.text,
-            title: parsed.title,
-            artist: parsed.artist,
-            toggle: parsed.toggle,
-            item_running: parsed.item_running,
-            source: Some(MetadataSource::XPad),
-            updated_at_unix_ms: unix_ms_now(),
-        })
+        Some(now_playing_from_parsed(parsed))
     }
 
     /// Try to produce a complete label from accumulated segments.
@@ -474,13 +475,13 @@ impl XPadAssembler {
         if text.is_empty() {
             return None;
         }
-        let (title, artist) = apply_dl_plus_to_text(&text, self.dl_plus.as_ref());
+        let values = apply_dl_plus_to_text(&text, self.dl_plus.as_ref());
+        let item_running = self.dl_plus.as_ref().and_then(|d| d.item_running);
         Some(ParsedDls {
             text,
-            title,
-            artist,
+            values,
             toggle: self.toggle,
-            item_running: None,
+            item_running,
         })
     }
 
@@ -690,59 +691,61 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
     if bytes.is_empty() {
         return None;
     }
-    // ODR-PadEnc / ETSI DL+ payload:
-    //   [0]      command control nibble + item flags + num_tags_minus_1
-    //   [1..]    tag triplets [content_type, start_char, length_char]
+    // DL+ command payload per ETSI TS 102 980 §7.3:
+    //   byte 0: [link:4 = 0001 | IT:1 | IR:1 | NUM_TAGS-1:2]
+    //   byte 1+: tag triplets [content_type, start_char, length_char]
     //
-    // Some packet-mode paths prepend a command id 0x02 before the control
-    // byte; continue to accept that variant too.
-    let (start, expected_tags) = if bytes[0] == 0x02 && bytes.len() >= 2 {
+    // Some packet-mode paths prepend a legacy command id 0x02 before the
+    // control byte; the control byte there is just NUM_TAGS-1 in bits 1-0
+    // and we have no IT/IR in that variant.
+    let (start, expected_tags, header_flags) = if bytes[0] == 0x02 && bytes.len() >= 2 {
         let control = bytes[1];
         let n = (control & 0x03) as usize + 1;
-        (2, Some(n))
+        (2, Some(n), None)
     } else if (bytes[0] >> 4) == 0x01 {
-        let n = (bytes[0] & 0x03) as usize + 1;
-        (1, Some(n))
+        let b0 = bytes[0];
+        let it = (b0 & 0x08) != 0;
+        let ir = (b0 & 0x04) != 0;
+        let n = (b0 & 0x03) as usize + 1;
+        (1, Some(n), Some((it, ir)))
     } else {
-        (0, None)
+        (0, None, None)
     };
-    if start >= bytes.len() {
+    if start > bytes.len() {
         return None;
     }
     let mut tags: Vec<(u8, usize, usize)> = Vec::new();
     let mut i = start;
-    while i + 2 < bytes.len() {
+    while i + 3 <= bytes.len() {
         tags.push((bytes[i], bytes[i + 1] as usize, bytes[i + 2] as usize));
         i += 3;
     }
     if let Some(expected) = expected_tags {
         tags.truncate(expected);
     }
-    if tags.is_empty() {
-        None
-    } else {
-        Some(DlPlusFields::from_tags(&tags))
+    let (item_toggle, item_running) = match header_flags {
+        Some((it, ir)) => (Some(it), Some(ir)),
+        None => (None, None),
+    };
+    // A DL+ command can legitimately carry zero tags when the broadcaster
+    // only wants to toggle IT/IR (e.g. to clear the displayed item).  Only
+    // return None when we have neither tags nor header flags.
+    if tags.is_empty() && item_toggle.is_none() && item_running.is_none() {
+        return None;
     }
+    Some(DlPlusFields {
+        tags,
+        item_toggle,
+        item_running,
+    })
 }
 
-impl DlPlusFields {
-    fn from_tags(tags: &[(u8, usize, usize)]) -> Self {
-        DlPlusFields {
-            tags: tags.to_vec(),
-        }
-    }
-}
-
-fn apply_dl_plus_to_text(
-    text: &str,
-    dl_plus: Option<&DlPlusFields>,
-) -> (Option<String>, Option<String>) {
+fn apply_dl_plus_to_text(text: &str, dl_plus: Option<&DlPlusFields>) -> DlPlusValues {
+    let mut out = DlPlusValues::default();
     let Some(dl_plus) = dl_plus else {
-        return (None, None);
+        return out;
     };
     let chars: Vec<char> = text.chars().collect();
-    let mut title = None;
-    let mut artist = None;
     for (ty, start, len) in &dl_plus.tags {
         let start = *start;
         let len = *len;
@@ -758,19 +761,48 @@ fn apply_dl_plus_to_text(
         if val.is_empty() {
             continue;
         }
-        match *ty {
-            // DL+ content types commonly used for title-like fields.
-            0x01 | 0x1F if title.is_none() => {
-                title = Some(val);
-            }
-            // DL+ content types commonly used for artist-like fields.
-            0x04 | 0x20 if artist.is_none() => {
-                artist = Some(val);
-            }
-            _ => {}
+        // ETSI TS 102 980 Annex A, Table 9 — item.* content type codes.
+        let slot = match *ty {
+            0x01 => &mut out.title,
+            0x02 => &mut out.album,
+            0x03 => &mut out.track,
+            0x04 => &mut out.artist,
+            0x08 => &mut out.composer,
+            0x09 => &mut out.band,
+            0x0B => &mut out.genre,
+            _ => continue,
+        };
+        if slot.is_none() {
+            *slot = Some(val);
         }
     }
-    (title, artist)
+    out
+}
+
+fn now_playing_from_parsed(parsed: ParsedDls) -> NowPlaying {
+    // When the broadcaster signals the item has stopped (IR=false), drop any
+    // per-item fields so the UI can clear stale song details. The raw DLS
+    // text is kept — it often carries a station slogan while idle.
+    let item_stopped = matches!(parsed.item_running, Some(false));
+    let values = if item_stopped {
+        DlPlusValues::default()
+    } else {
+        parsed.values
+    };
+    NowPlaying {
+        raw_text: parsed.text,
+        title: values.title,
+        artist: values.artist,
+        album: values.album,
+        track: values.track,
+        composer: values.composer,
+        band: values.band,
+        genre: values.genre,
+        toggle: parsed.toggle,
+        item_running: parsed.item_running,
+        source: Some(MetadataSource::XPad),
+        updated_at_unix_ms: unix_ms_now(),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -1194,16 +1226,105 @@ mod tests {
         // title type 0x01 at chars 0..4, artist type 0x04 at chars 8..13.
         let cmd = [0x11u8, 0x01, 0, 5, 0x04, 8, 6];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
-        let (title, artist) = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
-        assert_eq!(title.as_deref(), Some("Title"));
-        assert_eq!(artist.as_deref(), Some("Artist"));
+        let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
+        assert_eq!(values.title.as_deref(), Some("Title"));
+        assert_eq!(values.artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn dl_plus_tags_extract_album_track_genre() {
+        // Tag layout against "Song 03 Album Rock":
+        //   0x01 title      offset  0 len 4  → "Song"
+        //   0x03 track      offset  5 len 2  → "03"
+        //   0x02 album      offset  8 len 5  → "Album"
+        //   0x0B genre      offset 14 len 4  → "Rock"
+        // NUM_TAGS-1 is a 2-bit field so we split the tags across two DL+
+        // command payloads with IR=1 to smoke-test merge semantics.
+        let cmd_a = [0x16u8, 0x01, 0, 4, 0x03, 5, 2, 0x02, 8, 5];
+        let cmd_b = [0x14u8, 0x0B, 14, 4];
+        let dlp_a = parse_dl_plus_command(&cmd_a).expect("expected tags");
+        let dlp_b = parse_dl_plus_command(&cmd_b).expect("expected genre tag");
+        let values_a = apply_dl_plus_to_text("Song 03 Album Rock", Some(&dlp_a));
+        assert_eq!(values_a.title.as_deref(), Some("Song"));
+        assert_eq!(values_a.track.as_deref(), Some("03"));
+        assert_eq!(values_a.album.as_deref(), Some("Album"));
+        let values_b = apply_dl_plus_to_text("Song 03 Album Rock", Some(&dlp_b));
+        assert_eq!(values_b.genre.as_deref(), Some("Rock"));
+    }
+
+    #[test]
+    fn dl_plus_drops_non_standard_content_types() {
+        // 0x1F/0x20 used to map to title/artist — no longer per TS 102 980.
+        let cmd = [0x12u8, 0x1F, 0, 5, 0x20, 6, 6];
+        let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
+        let values = apply_dl_plus_to_text("XXXXX YYYYYY", Some(&dlp));
+        assert_eq!(values.title, None);
+        assert_eq!(values.artist, None);
+    }
+
+    #[test]
+    fn dl_plus_header_extracts_item_running_and_toggle() {
+        // byte 0 = 0x1D = 0001_1101 → link=1, IT=1, IR=1, num_tags-1=1.
+        let cmd = [0x1Du8, 0x01, 0, 5, 0x04, 8, 6];
+        let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
+        assert_eq!(dlp.item_toggle, Some(true));
+        assert_eq!(dlp.item_running, Some(true));
+        assert_eq!(dlp.tags.len(), 2);
+
+        // byte 0 = 0x10 = 0001_0000 → IT=0, IR=0, num_tags-1=0 (1 tag).
+        let cmd2 = [0x10u8, 0x01, 0, 5];
+        let dlp2 = parse_dl_plus_command(&cmd2).expect("expected tags");
+        assert_eq!(dlp2.item_toggle, Some(false));
+        assert_eq!(dlp2.item_running, Some(false));
+    }
+
+    #[test]
+    fn dl_plus_item_running_false_clears_song_fields() {
+        let mut asm = XPadAssembler::new();
+        let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
+        // IR=1 first — title/artist should populate.
+        let cmd_running = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_running_chunk = build_dl_plus_command_physical(&cmd_running, false);
+
+        let mut frame1 = vec![0u8; 8];
+        frame1.extend_from_slice(&text_chunk);
+        frame1.push(0x00);
+        frame1.push(0x82);
+        frame1.push(0x20);
+        frame1.push(0x02);
+        asm.push_mp2_frame_metadata(&frame1).expect("text");
+
+        let mut logical_running = cmd_running_chunk.clone();
+        logical_running.reverse();
+        let running = asm
+            .process_dls_chunk(&logical_running)
+            .expect("expected IR=1 metadata");
+        assert_eq!(running.title.as_deref(), Some("Title"));
+        assert_eq!(running.artist.as_deref(), Some("Artist"));
+        assert_eq!(running.item_running, Some(true));
+
+        // Now the broadcaster signals IR=0 — song fields should be cleared
+        // even though the tags still identify character ranges.
+        let cmd_stopped = [0x11u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_stopped_chunk = build_dl_plus_command_physical(&cmd_stopped, false);
+        let mut logical_stopped = cmd_stopped_chunk.clone();
+        logical_stopped.reverse();
+        let stopped = asm
+            .process_dls_chunk(&logical_stopped)
+            .expect("expected IR=0 metadata");
+        assert_eq!(stopped.item_running, Some(false));
+        assert_eq!(stopped.title, None);
+        assert_eq!(stopped.artist, None);
+        // raw_text survives — stations often broadcast a slogan while idle.
+        assert_eq!(stopped.raw_text, "TitleArtist");
     }
 
     #[test]
     fn assembler_text_then_dl_plus_command_extracts_artist_title() {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
-        let cmd_payload = [0x11u8, 0x01, 0, 5, 0x04, 5, 6];
+        // 0x15 = 0001_0101 → link=1, IT=0, IR=1, num_tags-1=1 (2 tags).
+        let cmd_payload = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
         let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
 
         let mut frame1 = vec![0u8; 8];
@@ -1228,7 +1349,8 @@ mod tests {
     fn dl_plus_command_emits_metadata_for_current_text() {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
-        let cmd_payload = [0x11u8, 0x01, 0, 5, 0x04, 5, 6];
+        // 0x15 = 0001_0101 → link=1, IT=0, IR=1, num_tags-1=1 (2 tags).
+        let cmd_payload = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
         let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
 
         let mut logical_text = text_chunk.clone();

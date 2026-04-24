@@ -14,13 +14,24 @@ pub enum MetadataSource {
 pub struct NowPlaying {
     /// Full unstructured text as carried by DLS (fallback for display).
     pub raw_text: String,
-    /// Song title extracted from DL+ tags when available.
+    /// Song title (DL+ Item.Title, content type 0x01).
     pub title: Option<String>,
-    /// Artist extracted from DL+ tags when available.
+    /// Artist (DL+ Item.Artist, content type 0x04).
     pub artist: Option<String>,
+    /// Album (DL+ Item.Album, content type 0x02).
+    pub album: Option<String>,
+    /// Track number or name (DL+ Item.TrackNumber, content type 0x03).
+    pub track: Option<String>,
+    /// Composer (DL+ Item.Composer, content type 0x08).
+    pub composer: Option<String>,
+    /// Band (DL+ Item.Band, content type 0x09).
+    pub band: Option<String>,
+    /// Genre (DL+ Item.Genre, content type 0x0B).
+    pub genre: Option<String>,
     /// DLS toggle bit (changes when item changes), if signalled.
     pub toggle: Option<bool>,
-    /// Item running flag, if signalled by the broadcaster.
+    /// Item running flag. `Some(false)` means the broadcaster has signalled
+    /// that the current item has stopped; the UI should clear song details.
     pub item_running: Option<bool>,
     /// Origin transport for this metadata update.
     pub source: Option<MetadataSource>,
