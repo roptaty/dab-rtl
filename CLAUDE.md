@@ -77,7 +77,7 @@ RTL-SDR IQ → [sdr] → Complex32 samples
 - `FIG 0/13` user-application signalling is implemented. Application declarations may arrive before `FIG 0/2`/`FIG 0/3`; the parser now queues and later attaches them when the matching component becomes known.
 - Metadata priority is X-PAD first, packet-mode DLS second. `pipeline.rs` merges both paths and prefers richer X-PAD metadata when both exist.
 - The TUI now has explicit browse and playback modes. Selecting a service switches to the playback-focused view; `b` returns to browse mode.
-- Slideshow content arrives via the packet-mode MOT path: `crates/protocol/src/mot.rs` parses MSC Data Groups (EN 300 401 §5.3.3.1) and reassembles MOT objects by Transport Id (EN 301 234 §6). The pipeline falls back to a PNG/JPEG byte-signature scan for streams that don't conform to EN 301 234. Terminal image display is still not implemented (Phase 5 of `improvements.md`).
+- Slideshow content arrives via two MOT paths, both feeding `crates/protocol/src/mot.rs` (MSC Data Group parsing per EN 300 401 §5.3.3.1; MOT header parsing per EN 301 234 §6). The packet-mode path (`PacketMotAssembler`) is the legacy transport; a PNG/JPEG byte-signature fallback still runs for non-conformant streams. The X-PAD path (`XPadAssembler::take_mot_objects`) handles AppTy 12/13 sub-fields carried alongside audio and is the dominant transport for modern cover art. Terminal image display is still not implemented (Phase 5 of `improvements.md`).
 
 ## Dependency management and security
 
@@ -98,8 +98,7 @@ When adding a new dependency, work through every item in the checklist in
 
 ## Known TODOs
 
-- Implement terminal image display for MOT slideshow content (reassembly is done in `crates/protocol/src/mot.rs`)
-- Implement X-PAD MOT transport (AppTy 12/13) for cover-art carried in-band with audio
+- Implement terminal image display for MOT slideshow content (reassembly is done in `crates/protocol/src/mot.rs`; both packet-mode and X-PAD paths deliver `MotObject`s)
 - Implement proper UEP multi-region depuncturing instead of the current approximation
 
 

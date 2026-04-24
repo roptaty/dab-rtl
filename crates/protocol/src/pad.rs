@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ensemble::{MetadataSource, NowPlaying};
+use crate::mot::{MotAssembler, MotObject};
 use crate::text::decode_dab_text;
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -30,6 +31,17 @@ const APP_TYPE_DLS_START: u8 = 2;
 
 /// X-PAD Application Type 3 = DLS continuation.
 const APP_TYPE_DLS_CONT: u8 = 3;
+
+/// X-PAD Application Type 12 = MOT, start of X-PAD data group.
+const APP_TYPE_MOT_START: u8 = 12;
+
+/// X-PAD Application Type 13 = MOT, continuation of X-PAD data group.
+const APP_TYPE_MOT_CONT: u8 = 13;
+
+/// Upper bound on the in-progress X-PAD MOT buffer. Prevents runaway memory
+/// use when a broadcaster streams a very long MOT data group without a
+/// matching start marker.
+const MAX_MOT_BUFFER: usize = 1024 * 1024;
 
 /// Map CI sub-field length indicator (upper 3 bits of a Content Indicator byte)
 /// to byte count.
@@ -78,6 +90,14 @@ pub struct XPadAssembler {
     command_last_seg_num: Option<u8>,
     /// Most recently decoded DL+ tags.
     dl_plus: Option<DlPlusFields>,
+    /// MSC Data Group + MOT reassembler for X-PAD slideshow transport.
+    mot: MotAssembler,
+    /// In-progress MSC Data Group bytes reassembled from AppTy 12/13 X-PAD
+    /// sub-fields. Finalised (parsed + fed to `mot`) on the next AppTy-12
+    /// start marker or when `reset` is called.
+    mot_buffer: Vec<u8>,
+    /// MOT objects completed since the last `take_mot_objects` call.
+    mot_pending: Vec<MotObject>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -123,6 +143,9 @@ impl XPadAssembler {
             command_segments: BTreeMap::new(),
             command_last_seg_num: None,
             dl_plus: None,
+            mot: MotAssembler::new(),
+            mot_buffer: Vec::new(),
+            mot_pending: Vec::new(),
         }
     }
 
@@ -136,6 +159,15 @@ impl XPadAssembler {
         self.command_segments.clear();
         self.command_last_seg_num = None;
         self.dl_plus = None;
+        self.mot.reset();
+        self.mot_buffer.clear();
+        self.mot_pending.clear();
+    }
+
+    /// Drain any MOT objects completed since the last call. Consumed by the
+    /// pipeline layer to surface slideshow / cover-art updates to the UI.
+    pub fn take_mot_objects(&mut self) -> Vec<MotObject> {
+        std::mem::take(&mut self.mot_pending)
     }
 
     /// Process one MPEG Layer 2 frame and return DLS text if a complete label
@@ -290,41 +322,48 @@ impl XPadAssembler {
 
         // Short X-PAD (xpad_type=01): 4 bytes immediately before F-PAD.
         // Layout: [data[0], data[1], data[2], app_type_byte] (left to right).
-        // app_type_byte (rightmost) carries the application type (bits 3-0).
-        // Data is 3 bytes; we only process it if app_type == DLS (2).
+        // app_type_byte (rightmost) carries the application type (bits 4-0).
+        // We handle DLS (AppTy 2) and MOT (AppTy 12/13). Everything else is
+        // dropped.
         if xpad_type == 0b01 {
             if xpad_area.len() < 4 {
                 log::debug!("X-PAD: short X-PAD too short ({} bytes)", xpad_area.len());
                 return None;
             }
             let type_byte = xpad_area[xpad_area.len() - 1];
-            let app_type = type_byte & 0x0F;
-            if app_type != APP_TYPE_DLS_START {
-                log::debug!(
-                    "X-PAD: short X-PAD app_type={} (not DLS) — skipping",
-                    app_type
-                );
-                return None;
-            }
-            // Short X-PAD data is also stored right-to-left; reverse for logical order.
-            let mut dls_chunk = xpad_area[xpad_area.len() - 4..xpad_area.len() - 1].to_vec();
-            dls_chunk.reverse();
-            log::debug!("X-PAD: short X-PAD DLS chunk: {:02X?}", &dls_chunk);
-            return self.process_dls_chunk(&dls_chunk);
+            let app_type = type_byte & 0x1F;
+            // Short X-PAD data is stored right-to-left; reverse for logical order.
+            let mut chunk = xpad_area[xpad_area.len() - 4..xpad_area.len() - 1].to_vec();
+            chunk.reverse();
+            return match app_type {
+                APP_TYPE_DLS_START | APP_TYPE_DLS_CONT => self.process_dls_chunk(&chunk),
+                APP_TYPE_MOT_START => {
+                    self.process_mot_chunk(&chunk, true);
+                    None
+                }
+                APP_TYPE_MOT_CONT => {
+                    self.process_mot_chunk(&chunk, false);
+                    None
+                }
+                _ => {
+                    log::debug!("X-PAD: short X-PAD app_type={} ignored", app_type);
+                    None
+                }
+            };
         }
 
         if xpad_type != 0b10 {
-            // No X-PAD or end marker — DLS is not carried here.
+            // No X-PAD or end marker — no data carried here.
             return None;
         }
 
-        let dls_chunk = if ci_flag {
-            // New CI list present: parse it, cache it, extract DLS data.
+        let (chunks, ci_fresh) = if ci_flag {
+            // New CI list present: parse it, cache it, extract all chunks.
             let (ci_entries, data_right) = parse_ci_list(xpad_area);
             if !ci_entries.is_empty() {
                 self.last_ci = ci_entries.clone();
             }
-            extract_dls_with_ci(xpad_area, &ci_entries, data_right)
+            (extract_app_chunks(xpad_area, &ci_entries, data_right), true)
         } else {
             // Continuation mode: no CI list in this frame; use the cached one.
             // The entire xpad_area is application data (no CI bytes present).
@@ -332,20 +371,74 @@ impl XPadAssembler {
                 log::debug!("X-PAD: continuation frame but no cached CI list — skipping");
                 return None;
             }
-            log::debug!(
-                "X-PAD: continuation frame, using cached CI ({} entr{})",
-                self.last_ci.len(),
-                if self.last_ci.len() == 1 { "y" } else { "ies" }
-            );
-            extract_dls_with_ci(xpad_area, &self.last_ci, xpad_area.len())
-        }?;
+            (
+                extract_app_chunks(xpad_area, &self.last_ci, xpad_area.len()),
+                false,
+            )
+        };
 
-        log::debug!(
-            "X-PAD: DLS chunk {} bytes: {:02X?}",
-            dls_chunk.len(),
-            &dls_chunk[..dls_chunk.len().min(8)]
-        );
-        self.process_dls_chunk(&dls_chunk)
+        let mut metadata = None;
+        for (app_type, chunk) in chunks {
+            match app_type {
+                APP_TYPE_DLS_START | APP_TYPE_DLS_CONT => {
+                    if let Some(m) = self.process_dls_chunk(&chunk) {
+                        metadata = Some(m);
+                    }
+                }
+                APP_TYPE_MOT_START => {
+                    // A fresh CI list with an AppTy-12 sub-field marks the
+                    // real start of a new MOT data group. When the CI list
+                    // is being reused on a continuation frame, the same
+                    // sub-field is just further bytes of the current group.
+                    self.process_mot_chunk(&chunk, ci_fresh);
+                }
+                APP_TYPE_MOT_CONT => {
+                    self.process_mot_chunk(&chunk, false);
+                }
+                _ => { /* unknown / unhandled app type */ }
+            }
+        }
+        metadata
+    }
+
+    /// Incorporate one X-PAD MOT sub-field into the in-progress MSC Data
+    /// Group buffer. When `is_start` is set, any existing buffer is first
+    /// finalised (parsed as an MSC-DG and fed to the MOT assembler) before
+    /// the new chunk is accumulated.
+    fn process_mot_chunk(&mut self, chunk: &[u8], is_start: bool) {
+        if is_start {
+            self.finalise_mot_buffer();
+        }
+        if self.mot_buffer.len() + chunk.len() > MAX_MOT_BUFFER {
+            // Protect against runaway streams; drop the in-progress group.
+            log::debug!(
+                "X-PAD MOT: buffer overflow ({}+{} > {}), discarding",
+                self.mot_buffer.len(),
+                chunk.len(),
+                MAX_MOT_BUFFER
+            );
+            self.mot_buffer.clear();
+            return;
+        }
+        self.mot_buffer.extend_from_slice(chunk);
+    }
+
+    fn finalise_mot_buffer(&mut self) {
+        if self.mot_buffer.is_empty() {
+            return;
+        }
+        let bytes = std::mem::take(&mut self.mot_buffer);
+        if let Some(obj) = self.mot.push_msc_data_group(&bytes) {
+            log::info!(
+                "X-PAD MOT: transport_id={:04X} body={}B content_type={}/{} name={:?}",
+                obj.transport_id,
+                obj.body.len(),
+                obj.header.content_type,
+                obj.header.content_subtype,
+                obj.header.content_name
+            );
+            self.mot_pending.push(obj);
+        }
     }
 
     /// Incorporate one DLS data chunk and return a complete label if ready.
@@ -650,17 +743,21 @@ fn parse_ci_list(xpad_area: &[u8]) -> (Vec<(usize, u8)>, usize) {
     (ci_entries, pos)
 }
 
-/// Extract DLS data from `xpad_area` using a given CI list.
+/// Extract every data sub-field described by `ci_entries` from `xpad_area`.
+/// Returns `(app_type, data)` pairs in CI-list order, where each `data`
+/// vector is already reversed from the physical right-to-left layout back
+/// into logical byte order (per EN 300 401 §7.4.2.2.2).
 ///
-/// `data_right` is the exclusive right boundary of the app-data area.
-/// In frames with a CI list present, this is the index just left of the CI
-/// bytes.  In continuation frames, pass `xpad_area.len()` (whole area is data).
-fn extract_dls_with_ci(
+/// `data_right` is the exclusive right boundary of the app-data area: in
+/// frames with a CI list present, the index just left of the CI bytes; in
+/// continuation frames, `xpad_area.len()`.
+fn extract_app_chunks(
     xpad_area: &[u8],
     ci_entries: &[(usize, u8)],
     data_right: usize,
-) -> Option<Vec<u8>> {
+) -> Vec<(u8, Vec<u8>)> {
     let mut data_right = data_right;
+    let mut out = Vec::with_capacity(ci_entries.len());
     for (length, app_type) in ci_entries {
         if data_right < *length {
             log::debug!(
@@ -672,24 +769,19 @@ fn extract_dls_with_ci(
             break;
         }
         let data_left = data_right - length;
+        let mut chunk = xpad_area[data_left..data_right].to_vec();
+        chunk.reverse();
         log::debug!(
-            "X-PAD CI: app_type={} data[{}..{}]",
+            "X-PAD CI: app_type={} data[{}..{}] ({} bytes)",
             app_type,
             data_left,
-            data_right
+            data_right,
+            length
         );
-        if *app_type == APP_TYPE_DLS_START || *app_type == APP_TYPE_DLS_CONT {
-            // Per ETSI EN 300 401 §7.4.2.2.2, byte 0 of each data subfield is
-            // physically adjacent to the CI list (rightmost), so bytes appear in
-            // reverse logical order.  Reverse to restore cmd-byte-first order.
-            let mut chunk = xpad_area[data_left..data_right].to_vec();
-            chunk.reverse();
-            return Some(chunk);
-        }
+        out.push((*app_type, chunk));
         data_right = data_left;
     }
-    log::debug!("X-PAD CI: no DLS (app_type=2) in CI list");
-    None
+    out
 }
 
 fn unix_ms_now() -> u64 {
@@ -990,10 +1082,11 @@ mod tests {
         let ci = 0x02u8; // CI: length_code=0 (4 bytes), app_type=2 (right, closest to F-PAD)
         let xpad_area: Vec<u8> = dls_data_physical.iter().copied().chain([end, ci]).collect();
         let (ci_entries, data_right) = parse_ci_list(&xpad_area);
-        let chunk = extract_dls_with_ci(&xpad_area, &ci_entries, data_right)
-            .expect("should find DLS chunk");
-        // extract_dls_with_ci reverses physical→logical; expect logical order
-        assert_eq!(chunk, [0xC0u8, 0x00, 0x41, 0x42]);
+        let chunks = extract_app_chunks(&xpad_area, &ci_entries, data_right);
+        assert_eq!(chunks.len(), 1, "should find one sub-field");
+        assert_eq!(chunks[0].0, APP_TYPE_DLS_START);
+        // extract_app_chunks reverses physical→logical; expect logical order
+        assert_eq!(chunks[0].1, [0xC0u8, 0x00, 0x41, 0x42]);
     }
 
     #[test]
@@ -1004,7 +1097,12 @@ mod tests {
         xpad.push(0x00); // end marker: app_type=0 (left of CI)
         xpad.push(0x05); // CI (3+5): length_code=0 (4 bytes), app_type=5
         let (ci_entries, data_right) = parse_ci_list(&xpad);
-        assert!(extract_dls_with_ci(&xpad, &ci_entries, data_right).is_none());
+        let chunks = extract_app_chunks(&xpad, &ci_entries, data_right);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].0, 5,
+            "CI sub-field is extracted but caller dispatches"
+        );
     }
 
     // ── XPadAssembler ────────────────────────────────────────────────────── //
@@ -1493,5 +1591,228 @@ mod tests {
         frame2.push(0x02);
         asm.push_mp2_frame(&frame2).expect("flipped");
         assert!(asm.dl_plus.is_none(), "no cached IT → still clears");
+    }
+
+    // ── X-PAD MOT (Phase 4) ──────────────────────────────────────────────── //
+
+    /// Minimal MSC Data Group builder used by the X-PAD MOT tests below. CRC
+    /// is computed and appended so the assembler accepts the group.
+    fn build_msc_dg_test(
+        dg_type: u8,
+        seg_num: u16,
+        last: bool,
+        tid: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        // CRC=1, SegFlag=1, UAFlag=1, type in low 4 bits.
+        let b0 = (1u8 << 6) | (1u8 << 5) | (1u8 << 4) | (dg_type & 0x0F);
+        out.push(b0);
+        out.push(0); // continuity=0, repetition=0
+        let hi = ((last as u8) << 7) | ((seg_num >> 8) as u8 & 0x7F);
+        let lo = (seg_num & 0xFF) as u8;
+        out.push(hi);
+        out.push(lo);
+        // User access: Rfa=0, TIdFlag=1, LengthIndicator=2 (just Transport Id).
+        out.push((1 << 4) | 0x02);
+        out.push((tid >> 8) as u8);
+        out.push((tid & 0xFF) as u8);
+        // Segmentation header: repetition=0, size = payload.len() (13 bits).
+        let size = payload.len() as u16;
+        out.push(((size >> 8) & 0x1F) as u8);
+        out.push((size & 0xFF) as u8);
+        out.extend_from_slice(payload);
+        // CRC-16/CCITT complemented (same variant as FIB/MSC).
+        let mut crc: u16 = 0xFFFF;
+        for &b in &out {
+            crc ^= (b as u16) << 8;
+            for _ in 0..8 {
+                if (crc & 0x8000) != 0 {
+                    crc = (crc << 1) ^ 0x1021;
+                } else {
+                    crc <<= 1;
+                }
+            }
+        }
+        let crc = !crc;
+        out.push((crc >> 8) as u8);
+        out.push((crc & 0xFF) as u8);
+        out
+    }
+
+    fn build_mot_header_test(
+        body_size: u32,
+        content_type: u8,
+        content_subtype: u16,
+        name: &[u8],
+    ) -> Vec<u8> {
+        // Parameter list: ContentName PLI=11, short-form length.
+        let mut params = Vec::new();
+        params.push((0b11 << 6) | 0x0C);
+        params.push((1 + name.len()) as u8);
+        params.push(0x0F << 4);
+        params.extend_from_slice(name);
+        let header_size = (7 + params.len()) as u16;
+        let w: u64 = ((body_size as u64 & 0x0FFF_FFFF) << 28)
+            | ((header_size as u64 & 0x1FFF) << 15)
+            | ((content_type as u64 & 0x3F) << 9)
+            | (content_subtype as u64 & 0x1FF);
+        let mut bytes = Vec::with_capacity(header_size as usize);
+        bytes.push(((w >> 48) & 0xFF) as u8);
+        bytes.push(((w >> 40) & 0xFF) as u8);
+        bytes.push(((w >> 32) & 0xFF) as u8);
+        bytes.push(((w >> 24) & 0xFF) as u8);
+        bytes.push(((w >> 16) & 0xFF) as u8);
+        bytes.push(((w >> 8) & 0xFF) as u8);
+        bytes.push((w & 0xFF) as u8);
+        bytes.extend_from_slice(&params);
+        bytes
+    }
+
+    /// Build an X-PAD MPEG frame carrying `chunk` as a variable X-PAD
+    /// sub-field with `app_type`. Sub-field length is inferred from `chunk`
+    /// (must match a CI length code — 4/6/8/12/16/24/32/48 bytes).
+    fn build_xpad_frame(chunk: &[u8], app_type: u8) -> Vec<u8> {
+        let length_code = match chunk.len() {
+            4 => 0u8,
+            6 => 1,
+            8 => 2,
+            12 => 3,
+            16 => 4,
+            24 => 5,
+            32 => 6,
+            48 => 7,
+            other => panic!("unsupported CI chunk length {other}"),
+        };
+        let ci = (length_code << 5) | (app_type & 0x1F);
+        let end_marker = 0x00u8; // CI end: app_type=0
+                                 // Physical storage: sub-field bytes are reversed vs logical, then
+                                 // followed by end marker, then CI byte, then F-PAD [0x20, 0x02].
+        let mut physical = chunk.to_vec();
+        physical.reverse();
+        let mut frame = vec![0u8; 4]; // fake audio
+        frame.extend_from_slice(&physical);
+        frame.push(end_marker);
+        frame.push(ci);
+        frame.push(0x20); // F-PAD byte 0: standard F-PAD, variable X-PAD
+        frame.push(0x02); // F-PAD byte 1: CI flag set
+        frame
+    }
+
+    #[test]
+    fn xpad_mot_single_frame_header_and_body_emit_object() {
+        // Ship one MSC-DG (header) in one AppTy-12 frame and one MSC-DG (body)
+        // in a second AppTy-12 frame. A third AppTy-12 frame flushes the
+        // second buffer so the MOT object completes and can be drained.
+        let body = vec![0x55u8; 8];
+        let name = b"hi.png";
+        let mot_header = build_mot_header_test(body.len() as u32, 2, 3, name);
+        let header_dg = build_msc_dg_test(3, 0, true, 0x00A1, &mot_header);
+        let body_dg = build_msc_dg_test(4, 0, true, 0x00A1, &body);
+
+        // Pad each DG out to the nearest CI length code so build_xpad_frame
+        // accepts it. Trailing zeros are harmless — parse_msc_data_group
+        // stops at `data_end` derived from the CRC position.
+        let to_len = |data: &[u8]| -> Vec<u8> {
+            for &target in &[4usize, 6, 8, 12, 16, 24, 32, 48] {
+                if data.len() <= target {
+                    let mut v = data.to_vec();
+                    v.resize(target, 0);
+                    return v;
+                }
+            }
+            panic!(
+                "MSC-DG too large for single X-PAD sub-field: {}",
+                data.len()
+            );
+        };
+        let header_chunk = to_len(&header_dg);
+        let body_chunk = to_len(&body_dg);
+        // Flush chunk: anything harmless; the smallest valid CI length is 4.
+        let flush_chunk = vec![0u8; 4];
+
+        let mut asm = XPadAssembler::new();
+        // Header frame (AppTy 12) — starts a new MOT buffer.
+        let f_header = build_xpad_frame(&header_chunk, APP_TYPE_MOT_START);
+        asm.push_mp2_frame(&f_header);
+        assert!(asm.take_mot_objects().is_empty());
+
+        // Body frame (AppTy 12) — finalises the header DG into the MOT
+        // assembler, then buffers the body DG.
+        let f_body = build_xpad_frame(&body_chunk, APP_TYPE_MOT_START);
+        asm.push_mp2_frame(&f_body);
+        assert!(asm.take_mot_objects().is_empty());
+
+        // Flush frame (AppTy 12) — finalises the body DG; MotAssembler has
+        // both header + body, so a MotObject pops out.
+        let f_flush = build_xpad_frame(&flush_chunk, APP_TYPE_MOT_START);
+        asm.push_mp2_frame(&f_flush);
+        let objects = asm.take_mot_objects();
+        assert_eq!(objects.len(), 1, "expected exactly one MOT object");
+        let obj = &objects[0];
+        assert_eq!(obj.transport_id, 0x00A1);
+        assert_eq!(obj.body, body);
+        assert_eq!(obj.header.content_name.as_deref(), Some("hi.png"));
+    }
+
+    #[test]
+    fn xpad_mot_continuation_frame_extends_group() {
+        // Split a single MSC-DG across two frames: the first with AppTy-12
+        // (start) carrying the first half, the second with AppTy-13 (cont)
+        // carrying the rest. The group only finalises on the next AppTy-12
+        // frame.
+        let body = vec![0x77u8; 4];
+        let mot_header = build_mot_header_test(body.len() as u32, 2, 3, b"c.png");
+        let header_dg = build_msc_dg_test(3, 0, true, 0x00B2, &mot_header);
+        let body_dg = build_msc_dg_test(4, 0, true, 0x00B2, &body);
+
+        // Split header_dg into two 16-byte pieces.
+        let len = 16;
+        let mut head_a = header_dg[..header_dg.len().min(len)].to_vec();
+        head_a.resize(len, 0);
+        let mut head_b_src = if header_dg.len() > len {
+            header_dg[len..].to_vec()
+        } else {
+            Vec::new()
+        };
+        head_b_src.resize(len, 0);
+        // Body fits in a single 16-byte sub-field.
+        let mut body_chunk = body_dg.clone();
+        body_chunk.resize(16, 0);
+        let flush_chunk = vec![0u8; 4];
+
+        let mut asm = XPadAssembler::new();
+        // Frame 1: AppTy 12 (start), first half of header DG.
+        asm.push_mp2_frame(&build_xpad_frame(&head_a, APP_TYPE_MOT_START));
+        // Frame 2: AppTy 13 (cont), second half of header DG — extends buffer.
+        asm.push_mp2_frame(&build_xpad_frame(&head_b_src, APP_TYPE_MOT_CONT));
+        // Frame 3: AppTy 12 finalises header DG and starts body DG buffer.
+        asm.push_mp2_frame(&build_xpad_frame(&body_chunk, APP_TYPE_MOT_START));
+        // Frame 4: AppTy 12 flushes the body DG.
+        asm.push_mp2_frame(&build_xpad_frame(&flush_chunk, APP_TYPE_MOT_START));
+
+        let objects = asm.take_mot_objects();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].transport_id, 0x00B2);
+        assert_eq!(objects[0].body, body);
+    }
+
+    #[test]
+    fn xpad_mot_reset_clears_buffer_and_pending() {
+        let header_dg = build_msc_dg_test(
+            3,
+            0,
+            true,
+            0x00C3,
+            &build_mot_header_test(4, 2, 3, b"x.png"),
+        );
+        let mut asm = XPadAssembler::new();
+        let mut chunk = header_dg.clone();
+        chunk.resize(32, 0);
+        asm.push_mp2_frame(&build_xpad_frame(&chunk, APP_TYPE_MOT_START));
+        assert!(!asm.mot_buffer.is_empty());
+        asm.reset();
+        assert!(asm.mot_buffer.is_empty());
+        assert!(asm.take_mot_objects().is_empty());
     }
 }

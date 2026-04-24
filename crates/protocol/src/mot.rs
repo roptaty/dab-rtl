@@ -108,40 +108,52 @@ pub fn parse_msc_data_group(bytes: &[u8]) -> Option<MscDataGroup<'_>> {
         idx += length_indicator;
     }
 
-    // Everything between idx and the (optional) trailing CRC is the data
-    // field. When segment_flag is set the first two bytes are a segmentation
-    // header: [repetition_count(3) | size(13)].
-    let data_end_inclusive = bytes.len();
-    let (data_start, data_end, crc_ok) = if crc_present {
-        if data_end_inclusive < idx + 2 {
+    // When segment_flag is set the first two bytes of the data field are a
+    // segmentation header [repetition_count(3) | size(13)], which tells us
+    // exactly how long the payload is. We use that to pin down where the DG
+    // ends (and where the trailing CRC lives) instead of blindly trusting
+    // the buffer length — the buffer may carry trailing padding, e.g. when
+    // the DG is embedded in a variable X-PAD sub-field whose length is
+    // dictated by a CI length code rather than the DG.
+    //
+    // When segment_flag is unset, fall back to the full buffer (the caller
+    // is expected to pass exactly one DG).
+    let (payload, crc_end): (&[u8], usize) = if segment_flag {
+        if bytes.len() < idx + 2 {
             return None;
         }
-        let crc_idx = data_end_inclusive - 2;
-        let data_crc = ((bytes[crc_idx] as u16) << 8) | bytes[crc_idx + 1] as u16;
-        let computed = crc16_ccitt(&bytes[..crc_idx]);
-        (idx, crc_idx, computed == data_crc)
-    } else {
-        (idx, data_end_inclusive, true)
-    };
-
-    if data_end < data_start {
-        return None;
-    }
-
-    let raw_data = &bytes[data_start..data_end];
-    let payload = if segment_flag {
-        if raw_data.len() < 2 {
-            return None;
-        }
-        let size = (((raw_data[0] & 0x1F) as usize) << 8) | raw_data[1] as usize;
-        let body = &raw_data[2..];
-        if size > body.len() {
+        let size = (((bytes[idx] & 0x1F) as usize) << 8) | bytes[idx + 1] as usize;
+        let payload_start = idx + 2;
+        let payload_end = payload_start.checked_add(size)?;
+        let expected_end = payload_end + if crc_present { 2 } else { 0 };
+        if bytes.len() < expected_end {
             // Claimed segment size exceeds available bytes — reject.
             return None;
         }
-        &body[..size]
+        (&bytes[payload_start..payload_end], expected_end)
     } else {
-        raw_data
+        let end = bytes.len();
+        let payload_end = if crc_present {
+            end.checked_sub(2)?
+        } else {
+            end
+        };
+        if payload_end < idx {
+            return None;
+        }
+        (&bytes[idx..payload_end], end)
+    };
+
+    let crc_ok = if crc_present {
+        if crc_end < 2 {
+            return None;
+        }
+        let crc_idx = crc_end - 2;
+        let data_crc = ((bytes[crc_idx] as u16) << 8) | bytes[crc_idx + 1] as u16;
+        let computed = crc16_ccitt(&bytes[..crc_idx]);
+        computed == data_crc
+    } else {
+        true
     };
 
     Some(MscDataGroup {
@@ -378,7 +390,6 @@ struct TransportState {
     header_last: Option<u16>,
     body_segments: Vec<Option<Vec<u8>>>,
     body_last: Option<u16>,
-    emitted: bool,
 }
 
 impl TransportState {
@@ -455,9 +466,6 @@ impl MotAssembler {
             return None;
         }
         let state = self.by_transport.entry(transport_id).or_default();
-        if state.emitted {
-            return None;
-        }
 
         let seg_idx = seg_num as usize;
         match dg.data_group_type {
@@ -486,11 +494,16 @@ impl MotAssembler {
                 header.body_size,
                 MAX_BODY_SIZE
             );
-            state.emitted = true;
+            // Drop the in-progress state so a later, valid assembly under
+            // the same transport id can succeed.
+            self.by_transport.remove(&transport_id);
             return None;
         }
         let body = state.assemble_body(header.body_size)?;
-        state.emitted = true;
+        // Reset transport state after a successful assembly so the next
+        // carousel cycle can re-trigger emission. Callers dedup by body
+        // hash to avoid UI churn from repeated identical slides.
+        self.by_transport.remove(&transport_id);
         Some(MotObject {
             transport_id,
             header,
@@ -865,5 +878,46 @@ mod tests {
         );
         // With no valid header, we can't emit.
         assert!(asm.push_msc_data_group(&body_dg).is_none());
+    }
+
+    #[test]
+    fn mot_assembler_re_emits_on_carousel_repeat() {
+        // A typical slideshow carousel cycles back to the same transport_id.
+        // Assembler must emit on every complete assembly so the caller can
+        // dedup by body hash rather than silently hiding repeated objects.
+        let mut params = Vec::new();
+        let name = b"slide.png";
+        params.push((0b11 << 6) | PARAM_CONTENT_NAME);
+        params.push((1 + name.len()) as u8);
+        params.push(0x0F << 4);
+        params.extend_from_slice(name);
+        let body = vec![0x77u8; 64];
+        let header_bytes = build_mot_header(body.len() as u32, 2, 3, &params);
+        let header_dg = build_msc_dg(
+            DG_TYPE_MOT_HEADER,
+            0,
+            0,
+            Some((0, true)),
+            Some(0x0101),
+            &header_bytes,
+            true,
+        );
+        let body_dg = build_msc_dg(
+            DG_TYPE_MOT_BODY,
+            0,
+            0,
+            Some((0, true)),
+            Some(0x0101),
+            &body,
+            true,
+        );
+
+        let mut asm = MotAssembler::new();
+        assert!(asm.push_msc_data_group(&header_dg).is_none());
+        asm.push_msc_data_group(&body_dg).expect("first emission");
+        // Cycle repeats — must emit again.
+        assert!(asm.push_msc_data_group(&header_dg).is_none());
+        asm.push_msc_data_group(&body_dg)
+            .expect("second carousel cycle must re-emit");
     }
 }

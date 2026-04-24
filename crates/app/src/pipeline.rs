@@ -200,6 +200,8 @@ fn run_metadata_worker(
     let mut mot_msc = MscDecoder::new();
     let mut packet_dls = PacketDlsAssembler::new();
     let mut packet_mot = PacketMotAssembler::new();
+    let mut xpad_mot_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut xpad_mot_fallback_id: u64 = 0;
     let mut last_now_playing: Option<NowPlaying> = None;
     let mut active_generation: Option<u64> = None;
     let mut active_sid: Option<u32> = None;
@@ -217,6 +219,8 @@ fn run_metadata_worker(
             mot_msc.set_target_sid(task_sid);
             packet_dls.reset();
             packet_mot.reset();
+            xpad_mot_seen.clear();
+            xpad_mot_fallback_id = 0;
             last_now_playing = None;
             active_generation = Some(task_generation);
             active_sid = Some(task_sid);
@@ -224,18 +228,34 @@ fn run_metadata_worker(
 
         match task {
             MetadataTask::XPadDabPlus { au_data, .. } => {
-                if let Some(meta) = xpad.push_dabplus_au_metadata(&au_data) {
-                    if generation.load(Ordering::SeqCst) == task_generation {
+                let meta = xpad.push_dabplus_au_metadata(&au_data);
+                if generation.load(Ordering::SeqCst) == task_generation {
+                    if let Some(meta) = meta {
                         maybe_emit_now_playing(&update_tx, task_sid, meta, &mut last_now_playing);
                     }
+                    drain_xpad_mot(
+                        &mut xpad,
+                        task_sid,
+                        &update_tx,
+                        &mut xpad_mot_seen,
+                        &mut xpad_mot_fallback_id,
+                    );
                 }
             }
             #[cfg(feature = "mp2")]
             MetadataTask::XPadMp2 { frame_data, .. } => {
-                if let Some(meta) = xpad.push_mp2_bytes_metadata(&frame_data) {
-                    if generation.load(Ordering::SeqCst) == task_generation {
+                let meta = xpad.push_mp2_bytes_metadata(&frame_data);
+                if generation.load(Ordering::SeqCst) == task_generation {
+                    if let Some(meta) = meta {
                         maybe_emit_now_playing(&update_tx, task_sid, meta, &mut last_now_playing);
                     }
+                    drain_xpad_mot(
+                        &mut xpad,
+                        task_sid,
+                        &update_tx,
+                        &mut xpad_mot_seen,
+                        &mut xpad_mot_fallback_id,
+                    );
                 }
             }
             MetadataTask::PacketDls {
@@ -1739,6 +1759,47 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Drain any MOT objects assembled by the X-PAD path into
+/// `PipelineUpdate::Content`. Dedups repeated carousel payloads by body hash.
+fn drain_xpad_mot(
+    xpad: &mut XPadAssembler,
+    sid: u32,
+    update_tx: &mpsc::SyncSender<PipelineUpdate>,
+    seen: &mut std::collections::HashSet<u64>,
+    fallback_id: &mut u64,
+) {
+    for obj in xpad.take_mot_objects() {
+        let hash = hash_bytes(&obj.body);
+        if !seen.insert(hash) {
+            continue;
+        }
+        let mime = obj
+            .header
+            .mime_type
+            .clone()
+            .or_else(|| obj.header.inferred_mime().map(str::to_string))
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let ext = obj.header.preferred_extension();
+        let filename = obj
+            .header
+            .content_name
+            .as_deref()
+            .map(sanitize_filename)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                *fallback_id += 1;
+                format!("xpad-{}.{}", *fallback_id, ext)
+            });
+        let content = ContentItem {
+            content_type: mime,
+            filename,
+            bytes: obj.body,
+            updated_at_unix_ms: unix_ms_now(),
+        };
+        let _ = update_tx.try_send(PipelineUpdate::Content { sid, content });
+    }
 }
 
 fn find_embedded_object(bytes: &[u8]) -> Option<(usize, usize, &'static str, &'static str)> {
