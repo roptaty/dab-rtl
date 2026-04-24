@@ -36,6 +36,7 @@ use protocol::{
         Component, ContentItem, MetadataSource, NowPlaying, ProtectionLevel, ServiceType,
         UserApplication,
     },
+    mot::MotAssembler,
     Ensemble, FicHandler, XPadAssembler,
 };
 
@@ -1570,7 +1571,12 @@ struct PacketMotAssembler {
 
 #[derive(Default)]
 struct MotStreamState {
-    buffer: Vec<u8>,
+    /// MSC Data Group / MOT assembler for well-formed slideshow streams.
+    mot: MotAssembler,
+    /// Fallback scan buffer for streams that don't conform to EN 301 234
+    /// framing (e.g. test signals, encoder bugs). Only used when the MSC-DG
+    /// parse fails.
+    fallback_buffer: Vec<u8>,
     seen_hashes: std::collections::HashSet<u64>,
 }
 
@@ -1658,24 +1664,62 @@ impl PacketMotAssembler {
     }
 
     fn push_group(&mut self, address: u16, bytes: &[u8]) -> Vec<ContentItem> {
-        let mut extracted = Vec::new();
         let state = self.streams.entry(address).or_default();
-        state.buffer.extend_from_slice(bytes);
-        if state.buffer.len() > 2 * 1024 * 1024 {
-            let keep_from = state.buffer.len() - 512 * 1024;
-            state.buffer.drain(..keep_from);
+        // Primary path: each packet-mode group is one MSC Data Group. Parse
+        // it, feed it to the per-address MotAssembler, and emit when a full
+        // MOT object (header + body) is in hand.
+        if let Some(obj) = state.mot.push_msc_data_group(bytes) {
+            let payload_hash = hash_bytes(&obj.body);
+            if !state.seen_hashes.insert(payload_hash) {
+                return Vec::new();
+            }
+            let mime = obj
+                .header
+                .mime_type
+                .clone()
+                .or_else(|| obj.header.inferred_mime().map(str::to_string))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let ext = obj.header.preferred_extension();
+            let filename = obj
+                .header
+                .content_name
+                .as_deref()
+                .map(sanitize_filename)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    self.next_fallback_id += 1;
+                    format!("cover-{}.{}", self.next_fallback_id, ext)
+                });
+            return vec![ContentItem {
+                content_type: mime,
+                filename,
+                bytes: obj.body,
+                updated_at_unix_ms: unix_ms_now(),
+            }];
         }
 
-        while let Some((start, end, content_type, ext)) = find_embedded_object(&state.buffer) {
-            let payload = state.buffer[start..end].to_vec();
+        // Fallback: the group wasn't a recognisable MSC-DG (or was a body
+        // segment that didn't complete a transport yet). Accumulate the
+        // bytes and scan for PNG/JPEG signatures so we still pick up
+        // slideshow content from stations that ship non-standard framing.
+        state.fallback_buffer.extend_from_slice(bytes);
+        if state.fallback_buffer.len() > 2 * 1024 * 1024 {
+            let keep_from = state.fallback_buffer.len() - 512 * 1024;
+            state.fallback_buffer.drain(..keep_from);
+        }
+        let mut extracted = Vec::new();
+        while let Some((start, end, content_type, ext)) =
+            find_embedded_object(&state.fallback_buffer)
+        {
+            let payload = state.fallback_buffer[start..end].to_vec();
             let payload_hash = hash_bytes(&payload);
             if !state.seen_hashes.insert(payload_hash) {
-                state.buffer.drain(..end);
+                state.fallback_buffer.drain(..end);
                 continue;
             }
             let context_start = start.saturating_sub(256);
-            let filename =
-                sniff_filename(&state.buffer[context_start..start], ext).unwrap_or_else(|| {
+            let filename = sniff_filename(&state.fallback_buffer[context_start..start], ext)
+                .unwrap_or_else(|| {
                     self.next_fallback_id += 1;
                     format!("cover-{}.{}", self.next_fallback_id, ext)
                 });
@@ -1685,9 +1729,8 @@ impl PacketMotAssembler {
                 bytes: payload,
                 updated_at_unix_ms: unix_ms_now(),
             });
-            state.buffer.drain(..end);
+            state.fallback_buffer.drain(..end);
         }
-
         extracted
     }
 }
