@@ -75,10 +75,24 @@ struct ScanState {
     current_idx: usize,
     /// Ticks spent on the current channel (200 ms each).
     ticks: u32,
+    /// Ticks since the last new piece of FIC info (new SId, new/changed
+    /// service label, or first ensemble label) on the current channel.
+    /// Resets to 0 every time `note_new_info()` is called.
+    quiet_ticks: u32,
+    /// `true` once any FIC info has been observed on the current channel —
+    /// distinguishes "still hunting" from "settled after lock".
+    saw_info: bool,
     /// Services collected across all channels so far.
     services: Vec<DiscoveredService>,
     /// SIds already collected across all channels (to avoid duplicates).
     seen_sids: std::collections::HashSet<u32>,
+    /// Latest known label per SId on the current channel — used to detect
+    /// when a label first arrives or changes (resets the quiet timer).
+    /// Cleared when moving to the next channel.
+    known_labels: std::collections::HashMap<u32, String>,
+    /// Whether the ensemble label has been observed on the current channel.
+    /// Reset when moving to the next channel.
+    ensemble_label_seen: bool,
     /// Number of services found before tuning to the current channel (for per-channel reporting).
     channel_start_count: usize,
 }
@@ -89,8 +103,12 @@ impl ScanState {
             channels,
             current_idx: 0,
             ticks: 0,
+            quiet_ticks: 0,
+            saw_info: false,
             services: Vec::new(),
             seen_sids: std::collections::HashSet::new(),
+            known_labels: std::collections::HashMap::new(),
+            ensemble_label_seen: false,
             channel_start_count: 0,
         }
     }
@@ -102,8 +120,30 @@ impl ScanState {
             .unwrap_or("")
     }
 
+    fn current_freq(&self) -> Option<u32> {
+        self.channels.get(self.current_idx).map(|(_, f)| *f)
+    }
+
     fn total(&self) -> usize {
         self.channels.len()
+    }
+
+    /// Record that something new was decoded on the current channel.
+    /// Resets the per-channel quiet timer and marks the channel as locked.
+    fn note_new_info(&mut self) {
+        self.saw_info = true;
+        self.quiet_ticks = 0;
+    }
+
+    /// Reset per-channel state when advancing to the next channel.
+    fn reset_for_next_channel(&mut self) {
+        self.ticks = 0;
+        self.quiet_ticks = 0;
+        self.saw_info = false;
+        self.seen_sids.clear();
+        self.known_labels.clear();
+        self.ensemble_label_seen = false;
+        self.channel_start_count = self.services.len();
     }
 }
 
@@ -122,9 +162,22 @@ enum UiMode {
 //  App state                                                                   //
 // ─────────────────────────────────────────────────────────────────────────── //
 
-/// How many 200 ms ticks to spend on each channel during a scan.
-/// 25 ticks = 5 seconds.
-const SCAN_TICKS_PER_CHANNEL: u32 = 25;
+/// Maximum ticks to wait for *any* FIC info on a channel before declaring it
+/// empty.  30 ticks × 200 ms = 6 s.  Generous enough to absorb retune /
+/// stream-reopen latency and OFDM lock-on, while still skipping truly empty
+/// channels in well under double-digit seconds.
+const SCAN_NO_LOCK_TICKS: u32 = 30;
+
+/// Once info has been observed, advance to the next channel after this many
+/// ticks without any new info.  25 ticks × 200 ms = 5 s.  This window is
+/// reset every time a new SId, a new/changed service label, or the ensemble
+/// label arrives — so on lively channels we keep dwelling as long as the FIC
+/// keeps producing fresh data.
+const SCAN_QUIET_TICKS: u32 = 25;
+
+/// Hard ceiling per channel.  75 ticks × 200 ms = 15 s.  Caps total scan
+/// time on noisy channels where labels keep flickering in and out.
+const SCAN_MAX_TICKS: u32 = 75;
 
 /// Maximum number of log lines kept in the scan log ring buffer.
 const MAX_SCAN_LOG: usize = 200;
@@ -544,22 +597,40 @@ impl AppState {
 
     /// Collect newly-discovered services from the current ensemble into the scan state.
     ///
+    /// Drops ensembles whose `freq_hz` does not match the channel currently
+    /// being scanned (stale snapshots from a previous channel that arrived
+    /// after we already advanced).  Resets the scan's quiet timer whenever
+    /// a new SId, a new/changed service label, or the ensemble label is
+    /// observed — that keeps the scan dwelling on a channel as long as the
+    /// FIC keeps producing fresh information.
+    ///
     /// Uses scoped borrows to avoid overlapping mutable/immutable access.
     fn collect_from_ensemble(&mut self) {
-        if self.scan_state.is_none() {
+        let Some(scan) = self.scan_state.as_ref() else {
+            return;
+        };
+        let Some(current_freq) = scan.current_freq() else {
+            return;
+        };
+        let freq = self.ensemble.freq_hz;
+        // Drop stale ensemble snapshots from a previous channel.
+        if freq != current_freq {
             return;
         }
-        let freq = self.ensemble.freq_hz;
 
-        // Build the list of candidates from the ensemble (shared borrow only).
-        let candidates: Vec<(u32, DiscoveredService)> = self
+        // Snapshot ensemble label and per-service (sid, label, ...) tuples
+        // up-front so the rest of the function can hold a mutable borrow on
+        // `self.scan_state`.
+        let ensemble_label_present = !self.ensemble.label.is_empty();
+        let services_snapshot: Vec<(u32, String, bool, DiscoveredService)> = self
             .ensemble
             .services
             .iter()
-            .filter(|svc| !svc.label.is_empty())
             .map(|svc| {
                 (
                     svc.id,
+                    svc.label.clone(),
+                    !svc.label.is_empty(),
                     DiscoveredService {
                         label: svc.label.clone(),
                         sid: svc.id,
@@ -576,13 +647,50 @@ impl AppState {
             })
             .collect();
 
-        // Now update the scan state (separate borrow).
-        if let Some(ref mut scan) = self.scan_state {
-            for (sid, entry) in candidates {
-                if scan.seen_sids.insert(sid) {
-                    scan.services.push(entry);
+        let Some(scan) = self.scan_state.as_mut() else {
+            return;
+        };
+
+        let mut got_info = false;
+
+        if ensemble_label_present && !scan.ensemble_label_seen {
+            scan.ensemble_label_seen = true;
+            got_info = true;
+        }
+
+        for (sid, label, has_label, entry) in services_snapshot {
+            // New SId observed → reset quiet timer.  Track unconditionally so
+            // bare FIG 0/2 entries (no FIG 1/1 yet) still count as info.
+            let sid_is_new = scan.seen_sids.insert(sid);
+            if sid_is_new {
+                got_info = true;
+            }
+            // New or updated label → reset quiet timer too, and add the
+            // service to the discovered list (only labelled services are
+            // user-meaningful).
+            if has_label {
+                let label_changed = match scan.known_labels.get(&sid) {
+                    Some(prev) => prev != &label,
+                    None => true,
+                };
+                if label_changed {
+                    scan.known_labels.insert(sid, label);
+                    got_info = true;
+                    // Insert into the discovered list if this SId hasn't
+                    // appeared with a label before; otherwise update the
+                    // existing entry (broadcasters can revise labels mid-scan).
+                    if let Some(existing) = scan.services.iter_mut().find(|s| s.sid == sid) {
+                        existing.label = entry.label.clone();
+                        existing.is_dab_plus = entry.is_dab_plus;
+                    } else {
+                        scan.services.push(entry);
+                    }
                 }
             }
+        }
+
+        if got_info {
+            scan.note_new_info();
         }
     }
 }
@@ -659,6 +767,24 @@ fn run_loop(
         while let Ok(update) = handle.update_rx.try_recv() {
             match update {
                 PipelineUpdate::Ensemble(mut ens) => {
+                    // While scanning, drop snapshots whose freq_hz doesn't
+                    // match the channel we're currently dwelling on — the
+                    // pipeline's update channel can hold a few queued
+                    // updates from before a retune, and treating those as
+                    // current-channel data would corrupt the discovered
+                    // service list.
+                    if let Some(scan) = state.scan_state.as_ref() {
+                        if scan.current_freq().is_some_and(|f| f != ens.freq_hz) {
+                            log::debug!(
+                                "scan: dropping stale Ensemble update freq={} \
+                                 (current channel freq={:?})",
+                                ens.freq_hz,
+                                scan.current_freq()
+                            );
+                            continue;
+                        }
+                    }
+
                     let old_idx = state.list_state.selected().unwrap_or(0);
                     // Preserve DLS text across ensemble refreshes: FIC snapshots
                     // never carry dls_text (DLS arrives via packet-mode MSC), so
@@ -875,6 +1001,15 @@ fn start_scan(state: &mut AppState, handle: &PipelineHandle, channels: Vec<(Stri
 }
 
 /// Called once per 200 ms tick to advance the channel-by-channel scan.
+///
+/// Per-channel timing is adaptive (rather than a fixed 5 s budget):
+/// * If no FIC info has arrived at all, we wait up to `SCAN_NO_LOCK_TICKS`
+///   before declaring the channel empty and skipping.
+/// * Once info has arrived, we keep dwelling until `SCAN_QUIET_TICKS` have
+///   elapsed without any further new info — every new SId or service label
+///   resets that timer in `collect_from_ensemble`.
+/// * `SCAN_MAX_TICKS` is a hard ceiling for noisy channels where labels
+///   keep flickering.
 fn advance_scan(state: &mut AppState, handle: &PipelineHandle) {
     // Tick and decide what to do — keep this borrow scoped.
     let action = {
@@ -882,22 +1017,26 @@ fn advance_scan(state: &mut AppState, handle: &PipelineHandle) {
             return;
         };
         scan.ticks += 1;
-        if scan.ticks < SCAN_TICKS_PER_CHANNEL {
+        scan.quiet_ticks += 1;
+
+        let should_advance = if scan.saw_info {
+            scan.quiet_ticks >= SCAN_QUIET_TICKS || scan.ticks >= SCAN_MAX_TICKS
+        } else {
+            scan.ticks >= SCAN_NO_LOCK_TICKS
+        };
+        if !should_advance {
             return;
         }
-        scan.ticks = 0;
 
         let prev_name = scan.channel_name().to_string();
         let found_on_channel = scan.services.len() - scan.channel_start_count;
 
         scan.current_idx += 1;
-        scan.seen_sids.clear();
+        scan.reset_for_next_channel();
 
         let idx = scan.current_idx;
         let total = scan.total();
         let next = scan.channels.get(idx).cloned();
-
-        scan.channel_start_count = scan.services.len();
 
         (idx, total, prev_name, found_on_channel, next)
     }; // mutable borrow of state.scan_state ends here
@@ -1599,5 +1738,143 @@ mod tests {
             types,
             vec!["image/jpeg".to_string(), "image/png".to_string()]
         );
+    }
+
+    fn scanning_state(channels: Vec<(&str, u32)>) -> AppState {
+        let mut state = AppState::new();
+        let owned: Vec<(String, u32)> = channels
+            .into_iter()
+            .map(|(n, f)| (n.to_string(), f))
+            .collect();
+        state.scan_state = Some(ScanState::new(owned));
+        state
+    }
+
+    /// Bare FIG 0/2 (SId without a label) should reset the quiet timer and
+    /// flip `saw_info`, but should NOT push a service into the discovered
+    /// list — only labelled services are user-meaningful.
+    #[test]
+    fn scan_collect_unlabelled_sid_resets_quiet_but_no_discovery() {
+        let mut state = scanning_state(vec![("11C", 220_352_000)]);
+        state.ensemble.freq_hz = 220_352_000;
+        state.ensemble.services.push(Service {
+            id: 0xABCD,
+            label: String::new(),
+            ..Default::default()
+        });
+
+        let scan = state.scan_state.as_mut().unwrap();
+        scan.quiet_ticks = 17;
+
+        state.collect_from_ensemble();
+        let scan = state.scan_state.as_ref().unwrap();
+        assert!(scan.saw_info, "SId discovery should mark info seen");
+        assert_eq!(scan.quiet_ticks, 0, "new SId should reset quiet timer");
+        assert_eq!(scan.services.len(), 0, "unlabelled SId is not discovered");
+        assert!(scan.seen_sids.contains(&0xABCD));
+    }
+
+    /// A label arriving on a previously-unlabelled SId should reset the
+    /// quiet timer and add the service to the discovered list.
+    #[test]
+    fn scan_collect_label_arrival_resets_and_adds() {
+        let mut state = scanning_state(vec![("11C", 220_352_000)]);
+        state.ensemble.freq_hz = 220_352_000;
+
+        // First snapshot: SId without a label.
+        state.ensemble.services.push(Service {
+            id: 0xABCD,
+            label: String::new(),
+            ..Default::default()
+        });
+        state.collect_from_ensemble();
+        state.scan_state.as_mut().unwrap().quiet_ticks = 22;
+
+        // Second snapshot: same SId, now with a label.
+        state.ensemble.services[0].label = "Radio Test".into();
+        state.collect_from_ensemble();
+
+        let scan = state.scan_state.as_ref().unwrap();
+        assert_eq!(
+            scan.quiet_ticks, 0,
+            "label arrival should reset the quiet timer"
+        );
+        assert_eq!(scan.services.len(), 1);
+        assert_eq!(scan.services[0].label, "Radio Test");
+    }
+
+    /// Unchanged labels on subsequent ensemble updates should NOT keep
+    /// resetting the quiet timer — otherwise we'd never advance off a
+    /// channel that simply repeats its FIBs.
+    #[test]
+    fn scan_collect_unchanged_label_does_not_reset_quiet() {
+        let mut state = scanning_state(vec![("11C", 220_352_000)]);
+        state.ensemble.freq_hz = 220_352_000;
+        state.ensemble.services.push(Service {
+            id: 0xABCD,
+            label: "Radio Test".into(),
+            ..Default::default()
+        });
+        state.collect_from_ensemble();
+
+        let scan = state.scan_state.as_mut().unwrap();
+        scan.quiet_ticks = 18;
+
+        // Same ensemble snapshot again — nothing new.
+        state.collect_from_ensemble();
+        let scan = state.scan_state.as_ref().unwrap();
+        assert_eq!(scan.quiet_ticks, 18);
+    }
+
+    /// Ensemble snapshots whose freq_hz doesn't match the current scan
+    /// channel are stale leftovers from a previous channel's queue.  They
+    /// must not contribute to the timer or the discovered list.
+    #[test]
+    fn scan_collect_drops_mismatched_freq() {
+        let mut state = scanning_state(vec![("11C", 220_352_000), ("11D", 222_064_000)]);
+
+        // First channel: ingest a labelled service to advance saw_info.
+        state.ensemble.freq_hz = 220_352_000;
+        state.ensemble.services.push(Service {
+            id: 0xABCD,
+            label: "On 11C".into(),
+            ..Default::default()
+        });
+        state.collect_from_ensemble();
+
+        // Advance to the second channel.
+        let scan = state.scan_state.as_mut().unwrap();
+        scan.current_idx = 1;
+        scan.reset_for_next_channel();
+        scan.quiet_ticks = 12;
+
+        // A stale ensemble for 11C arrives after we've moved on — must be
+        // dropped, leaving the new channel's state untouched.
+        state.collect_from_ensemble();
+        let scan = state.scan_state.as_ref().unwrap();
+        assert!(!scan.saw_info, "stale snapshot must not flip saw_info");
+        assert_eq!(scan.quiet_ticks, 12, "stale snapshot must not reset timer");
+        assert!(
+            scan.known_labels.is_empty(),
+            "stale snapshot must not populate per-channel label cache"
+        );
+    }
+
+    /// Ensemble label arrival (FIG 1/0) on its own counts as info — even
+    /// without any services yet, we don't want to skip a channel just
+    /// because the ensemble label is the first thing we decode.
+    #[test]
+    fn scan_collect_ensemble_label_alone_resets_quiet() {
+        let mut state = scanning_state(vec![("11C", 220_352_000)]);
+        state.ensemble.freq_hz = 220_352_000;
+        state.ensemble.label = "Some Ensemble".into();
+
+        state.scan_state.as_mut().unwrap().quiet_ticks = 14;
+        state.collect_from_ensemble();
+
+        let scan = state.scan_state.as_ref().unwrap();
+        assert!(scan.saw_info);
+        assert!(scan.ensemble_label_seen);
+        assert_eq!(scan.quiet_ticks, 0);
     }
 }

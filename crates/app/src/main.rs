@@ -372,12 +372,14 @@ fn scan_single(
 ) {
     use ofdm::OfdmProcessor;
     use pipeline::FicDecoder;
+    use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
-    /// Give up if no DAB ensemble is detected within this time.
+    /// Give up if no DAB info has been decoded within this time.
     const NO_LOCK_SECS: u64 = 30;
-    /// After the first service appears, wait this long for more to arrive.
-    const SETTLE_SECS: u64 = 5;
+    /// After any FIC info arrives (ensemble label, new SId, or new service label),
+    /// wait this long for more before declaring the channel done.
+    const SETTLE_SECS: u64 = 6;
 
     let label = source_label(file, tcp, channel);
     println!("Scanning {label}…");
@@ -386,10 +388,12 @@ fn scan_single(
 
     let mut ofdm = OfdmProcessor::new();
     let mut fic = FicDecoder::new();
-    let mut known_sids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut known_sids: HashSet<u32> = HashSet::new();
+    let mut known_labels: HashMap<u32, String> = HashMap::new();
+    let mut ensemble_label_seen = false;
 
     let start = Instant::now();
-    let mut last_new_service = Option::<Instant>::None;
+    let mut last_new_info = Option::<Instant>::None;
 
     'outer: for iq_buf in stream.rx.iter() {
         ofdm.process_samples(&iq_buf, |frame| {
@@ -399,13 +403,30 @@ fn scan_single(
                 fic.process_symbol(sym);
             }
 
+            // Any newly-decoded FIC information resets the settle timer.
+            // Don't gate on the ensemble label: FIG 1/0 may arrive after
+            // FIG 0/2 / FIG 1/1 (or fail CRC for several seconds), and
+            // gating dropped real services on weak channels.
             let ens = fic.handler.ensemble();
-            if !ens.label.is_empty() {
-                for svc in &ens.services {
-                    if known_sids.insert(svc.id) {
-                        last_new_service = Some(Instant::now());
+            let mut got_info = false;
+            if !ensemble_label_seen && !ens.label.is_empty() {
+                ensemble_label_seen = true;
+                got_info = true;
+            }
+            for svc in &ens.services {
+                if known_sids.insert(svc.id) {
+                    got_info = true;
+                }
+                if !svc.label.is_empty() {
+                    let entry = known_labels.entry(svc.id).or_default();
+                    if entry != &svc.label {
+                        *entry = svc.label.clone();
+                        got_info = true;
                     }
                 }
+            }
+            if got_info {
+                last_new_info = Some(Instant::now());
             }
         });
 
@@ -414,14 +435,14 @@ fn scan_single(
         // so placing these checks inside the `for frame` loop caused the
         // scan to hang indefinitely on empty channels.
 
-        // Timeout: no ensemble lock.
-        if last_new_service.is_none() && start.elapsed() > Duration::from_secs(NO_LOCK_SECS) {
+        // Timeout: nothing decoded at all.
+        if last_new_info.is_none() && start.elapsed() > Duration::from_secs(NO_LOCK_SECS) {
             println!("  (no DAB signal — skipping)");
             break 'outer;
         }
 
-        // Timeout: no new services for SETTLE_SECS after first discovery.
-        if let Some(t) = last_new_service {
+        // Timeout: no new info for SETTLE_SECS since the last update.
+        if let Some(t) = last_new_info {
             if t.elapsed() > Duration::from_secs(SETTLE_SECS) {
                 break 'outer;
             }
@@ -429,9 +450,15 @@ fn scan_single(
     }
 
     // Print final results with labels that arrived during the settle period.
+    // Print whenever we decoded *anything* — even if FIG 1/0 (ensemble label)
+    // never came through, the discovered services are still useful.
     let ens = fic.handler.ensemble();
-    if !ens.label.is_empty() {
-        println!("Ensemble: {} (EId {:04X})", ens.label, ens.id);
+    if !ens.label.is_empty() || !ens.services.is_empty() {
+        if ens.label.is_empty() {
+            println!("Ensemble: <no label> (EId {:04X})", ens.id);
+        } else {
+            println!("Ensemble: {} (EId {:04X})", ens.label, ens.id);
+        }
         let mut services: Vec<_> = ens.services.iter().collect();
         services.sort_by_key(|a| a.label.to_lowercase());
         for svc in &services {
