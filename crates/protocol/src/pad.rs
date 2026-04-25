@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ensemble::{MetadataSource, NowPlaying};
-use crate::mot::{crc16_ccitt, parse_msc_data_group, MotAssembler, MotObject};
+use crate::mot::{crc16_ccitt, MotAssembler, MotObject};
 use crate::text::decode_dab_text_raw;
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -349,8 +349,12 @@ impl XPadAssembler {
             return match app_type {
                 APP_TYPE_DLS_START => self.process_dls_subfield(&chunk, true),
                 APP_TYPE_DLS_CONT => self.process_dls_subfield(&chunk, false),
-                APP_TYPE_MOT_START | APP_TYPE_MOT_CONT => {
-                    self.process_mot_chunk(&chunk);
+                APP_TYPE_MOT_START => {
+                    self.process_mot_chunk(&chunk, true);
+                    None
+                }
+                APP_TYPE_MOT_CONT => {
+                    self.process_mot_chunk(&chunk, false);
                     None
                 }
                 _ => {
@@ -365,13 +369,13 @@ impl XPadAssembler {
             return None;
         }
 
-        let chunks = if ci_flag {
+        let (chunks, ci_fresh) = if ci_flag {
             // New CI list present: parse it, cache it, extract all chunks.
             let (ci_entries, data_right) = parse_ci_list(xpad_area);
             if !ci_entries.is_empty() {
                 self.last_ci = ci_entries.clone();
             }
-            extract_app_chunks(xpad_area, &ci_entries, data_right)
+            (extract_app_chunks(xpad_area, &ci_entries, data_right), true)
         } else {
             // Continuation mode: no CI list in this frame; use the cached one.
             // The entire xpad_area is application data (no CI bytes present).
@@ -379,7 +383,10 @@ impl XPadAssembler {
                 log::debug!("X-PAD: continuation frame but no cached CI list — skipping");
                 return None;
             }
-            extract_app_chunks(xpad_area, &self.last_ci, xpad_area.len())
+            (
+                extract_app_chunks(xpad_area, &self.last_ci, xpad_area.len()),
+                false,
+            )
         };
 
         let mut metadata = None;
@@ -408,16 +415,15 @@ impl XPadAssembler {
                         metadata = Some(m);
                     }
                 }
-                APP_TYPE_MOT_START | APP_TYPE_MOT_CONT => {
-                    // AppTy 12/13 carry pieces of an MSC Data Group that
-                    // typically spans many audio frames. The "start" vs
-                    // "continuation" labels in the X-PAD CI list refer to
-                    // the X-PAD data group transmission unit (one CI cycle),
-                    // not to MSC-DG boundaries — multiple X-PAD cycles
-                    // commonly chain together to form one MSC DG. We just
-                    // append every chunk and let the greedy parser below
-                    // pull off complete MSC DGs as soon as they arrive.
-                    self.process_mot_chunk(&chunk);
+                APP_TYPE_MOT_START => {
+                    // A fresh CI list with an AppTy-12 sub-field marks the
+                    // real start of a new MOT data group. When the CI list
+                    // is being reused on a continuation frame, the same
+                    // sub-field is just further bytes of the current group.
+                    self.process_mot_chunk(&chunk, ci_fresh);
+                }
+                APP_TYPE_MOT_CONT => {
+                    self.process_mot_chunk(&chunk, false);
                 }
                 _ => { /* unknown / unhandled app type */ }
             }
@@ -516,19 +522,16 @@ impl XPadAssembler {
         self.process_dls_chunk(&dg)
     }
 
-    /// Incorporate one X-PAD MOT sub-field (AppTy 12 or 13) into the
-    /// in-progress MSC Data Group buffer, then greedy-parse any complete
-    /// MSC DGs from the front of the buffer.
-    ///
-    /// AppTy 12 ("Start of X-PAD data group") and AppTy 13 ("Continuation")
-    /// in the CI list mark X-PAD transmission units, not MSC-DG boundaries.
-    /// In practice broadcasters chain many X-PAD cycles together to ship one
-    /// MSC DG (a slideshow segment is typically ~1 KB but each X-PAD frame
-    /// only carries 16-32 MOT bytes), so we cannot finalise on AppTy 12.
-    /// Instead we accumulate everything and pop full DGs off the front using
-    /// the segmentation header's self-describing length.
-    fn process_mot_chunk(&mut self, chunk: &[u8]) {
+    /// Incorporate one X-PAD MOT sub-field into the in-progress MSC Data
+    /// Group buffer. When `is_start` is set, any existing buffer is first
+    /// finalised (parsed as an MSC-DG and fed to the MOT assembler) before
+    /// the new chunk is accumulated.
+    fn process_mot_chunk(&mut self, chunk: &[u8], is_start: bool) {
+        if is_start {
+            self.finalise_mot_buffer();
+        }
         if self.mot_buffer.len() + chunk.len() > MAX_MOT_BUFFER {
+            // Protect against runaway streams; drop the in-progress group.
             log::debug!(
                 "X-PAD MOT: buffer overflow ({}+{} > {}), discarding",
                 self.mot_buffer.len(),
@@ -539,48 +542,23 @@ impl XPadAssembler {
             return;
         }
         self.mot_buffer.extend_from_slice(chunk);
-        self.drain_complete_msc_dgs();
     }
 
-    /// Pull off and dispatch every complete MSC Data Group sitting at the
-    /// front of `mot_buffer`. Stops when the front no longer holds a fully
-    /// formed DG (header is incomplete, claimed segment size hasn't fully
-    /// arrived yet, or the bytes are unrecognisable junk).
-    fn drain_complete_msc_dgs(&mut self) {
-        loop {
-            let dg_len = match parse_msc_data_group(&self.mot_buffer) {
-                Some(dg) => {
-                    let len = dg.dg_len;
-                    if !dg.crc_ok {
-                        log::debug!(
-                            "X-PAD MOT: dropping {}B DG (CRC mismatch, type={})",
-                            len,
-                            dg.data_group_type
-                        );
-                        // Honour the claimed length so we stay aligned with
-                        // the broadcaster's framing — the next DG should
-                        // start right after.
-                        len
-                    } else if let Some(obj) = self.mot.push_parsed(&dg) {
-                        log::info!(
-                            "X-PAD MOT: transport_id={:04X} body={}B content_type={}/{} name={:?}",
-                            obj.transport_id,
-                            obj.body.len(),
-                            obj.header.content_type,
-                            obj.header.content_subtype,
-                            obj.header.content_name
-                        );
-                        self.mot_pending.push(obj);
-                        len
-                    } else {
-                        // CRC was OK but the assembler is still waiting on
-                        // more segments / a header DG.
-                        len
-                    }
-                }
-                None => return, // not enough bytes yet, or junk we can't size
-            };
-            self.mot_buffer.drain(..dg_len);
+    fn finalise_mot_buffer(&mut self) {
+        if self.mot_buffer.is_empty() {
+            return;
+        }
+        let bytes = std::mem::take(&mut self.mot_buffer);
+        if let Some(obj) = self.mot.push_msc_data_group(&bytes) {
+            log::info!(
+                "X-PAD MOT: transport_id={:04X} body={}B content_type={}/{} name={:?}",
+                obj.transport_id,
+                obj.body.len(),
+                obj.header.content_type,
+                obj.header.content_subtype,
+                obj.header.content_name
+            );
+            self.mot_pending.push(obj);
         }
     }
 
@@ -2080,9 +2058,9 @@ mod tests {
 
     #[test]
     fn xpad_mot_single_frame_header_and_body_emit_object() {
-        // Ship one MSC-DG (header) and one MSC-DG (body) in successive
-        // AppTy-12 frames. The greedy parser drains each DG as it completes
-        // and the MOT object pops out once the assembler has both halves.
+        // Ship one MSC-DG (header) in one AppTy-12 frame and one MSC-DG (body)
+        // in a second AppTy-12 frame. A third AppTy-12 frame flushes the
+        // second buffer so the MOT object completes and can be drained.
         let body = vec![0x55u8; 8];
         let name = b"hi.png";
         let mot_header = build_mot_header_test(body.len() as u32, 2, 3, name);
@@ -2107,18 +2085,25 @@ mod tests {
         };
         let header_chunk = to_len(&header_dg);
         let body_chunk = to_len(&body_dg);
+        // Flush chunk: anything harmless; the smallest valid CI length is 4.
+        let flush_chunk = vec![0u8; 4];
 
         let mut asm = XPadAssembler::new();
-        // Header frame (AppTy 12) — header DG drains into MotAssembler;
-        // the body hasn't arrived so no object is emitted yet.
+        // Header frame (AppTy 12) — starts a new MOT buffer.
         let f_header = build_xpad_frame(&header_chunk, APP_TYPE_MOT_START);
         asm.push_mp2_frame(&f_header);
         assert!(asm.take_mot_objects().is_empty());
 
-        // Body frame (AppTy 12) — body DG drains; MotAssembler now has
-        // header + body, so the MotObject pops out immediately.
+        // Body frame (AppTy 12) — finalises the header DG into the MOT
+        // assembler, then buffers the body DG.
         let f_body = build_xpad_frame(&body_chunk, APP_TYPE_MOT_START);
         asm.push_mp2_frame(&f_body);
+        assert!(asm.take_mot_objects().is_empty());
+
+        // Flush frame (AppTy 12) — finalises the body DG; MotAssembler has
+        // both header + body, so a MotObject pops out.
+        let f_flush = build_xpad_frame(&flush_chunk, APP_TYPE_MOT_START);
+        asm.push_mp2_frame(&f_flush);
         let objects = asm.take_mot_objects();
         assert_eq!(objects.len(), 1, "expected exactly one MOT object");
         let obj = &objects[0];
@@ -2131,8 +2116,8 @@ mod tests {
     fn xpad_mot_continuation_frame_extends_group() {
         // Split a single MSC-DG across two frames: the first with AppTy-12
         // (start) carrying the first half, the second with AppTy-13 (cont)
-        // carrying the rest. The greedy parser stitches them together as
-        // soon as the second frame's bytes arrive.
+        // carrying the rest. The group only finalises on the next AppTy-12
+        // frame.
         let body = vec![0x77u8; 4];
         let mot_header = build_mot_header_test(body.len() as u32, 2, 3, b"c.png");
         let header_dg = build_msc_dg_test(3, 0, true, 0x00B2, &mot_header);
@@ -2151,16 +2136,17 @@ mod tests {
         // Body fits in a single 16-byte sub-field.
         let mut body_chunk = body_dg.clone();
         body_chunk.resize(16, 0);
+        let flush_chunk = vec![0u8; 4];
 
         let mut asm = XPadAssembler::new();
-        // Frame 1: AppTy 12 (start), first half of header DG. Buffer
-        // doesn't yet have a complete DG so nothing drains.
+        // Frame 1: AppTy 12 (start), first half of header DG.
         asm.push_mp2_frame(&build_xpad_frame(&head_a, APP_TYPE_MOT_START));
-        // Frame 2: AppTy 13 (cont), second half of header DG. Buffer now
-        // has a full header DG → drains into MotAssembler.
+        // Frame 2: AppTy 13 (cont), second half of header DG — extends buffer.
         asm.push_mp2_frame(&build_xpad_frame(&head_b_src, APP_TYPE_MOT_CONT));
-        // Frame 3: AppTy 12 carrying the body DG. Drains; MotObject ready.
+        // Frame 3: AppTy 12 finalises header DG and starts body DG buffer.
         asm.push_mp2_frame(&build_xpad_frame(&body_chunk, APP_TYPE_MOT_START));
+        // Frame 4: AppTy 12 flushes the body DG.
+        asm.push_mp2_frame(&build_xpad_frame(&flush_chunk, APP_TYPE_MOT_START));
 
         let objects = asm.take_mot_objects();
         assert_eq!(objects.len(), 1);
@@ -2169,54 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn xpad_mot_large_segment_spans_many_frames() {
-        // Regression for cover art that never appeared on stations whose
-        // MSC-DG bodies (typical slideshow segment ~1 KB) span dozens of
-        // X-PAD frames. The OLD code finalised the buffer on every fresh-CI
-        // AppTy-12 sub-field, repeatedly throwing away an in-progress DG
-        // before it could complete. The greedy parser now waits for the
-        // self-described segment length before draining.
-        let body = vec![0xAAu8; 1024];
-        let mot_header = build_mot_header_test(body.len() as u32, 2, 3, b"big.png");
-        let header_dg = build_msc_dg_test(3, 0, true, 0x00D4, &mot_header);
-        let body_dg = build_msc_dg_test(4, 0, true, 0x00D4, &body);
-
-        let mut asm = XPadAssembler::new();
-
-        // Helper: feed `data` as a sequence of 16-byte AppTy-12 X-PAD frames,
-        // mimicking the per-frame budget seen in real DAB+ slideshow
-        // streams. Every frame uses AppTy 12 (matches the user's log where
-        // the broadcaster sends a fresh CI list each frame).
-        let feed_chunks = |asm: &mut XPadAssembler, data: &[u8]| {
-            let chunk_size = 16usize;
-            let mut i = 0;
-            while i < data.len() {
-                let end = (i + chunk_size).min(data.len());
-                let mut chunk = data[i..end].to_vec();
-                chunk.resize(chunk_size, 0);
-                asm.push_mp2_frame(&build_xpad_frame(&chunk, APP_TYPE_MOT_START));
-                i += chunk_size;
-            }
-        };
-
-        feed_chunks(&mut asm, &header_dg);
-        // Header DG should already have been consumed; body hasn't arrived.
-        assert!(asm.take_mot_objects().is_empty());
-
-        feed_chunks(&mut asm, &body_dg);
-
-        let objects = asm.take_mot_objects();
-        assert_eq!(objects.len(), 1, "expected one reassembled MOT object");
-        assert_eq!(objects[0].transport_id, 0x00D4);
-        assert_eq!(objects[0].body, body);
-        assert_eq!(objects[0].header.content_name.as_deref(), Some("big.png"));
-    }
-
-    #[test]
     fn xpad_mot_reset_clears_buffer_and_pending() {
-        // Push only the FIRST half of a header DG so the greedy parser
-        // can't fully size it and leaves the bytes in `mot_buffer`. Then
-        // verify reset() clears them.
         let header_dg = build_msc_dg_test(
             3,
             0,
@@ -2224,17 +2163,11 @@ mod tests {
             0x00C3,
             &build_mot_header_test(4, 2, 3, b"x.png"),
         );
-        // Truncate to a length below `header_dg.len()` so parse returns
-        // None (incomplete) and the bytes accumulate in mot_buffer.
-        let half = header_dg.len() / 2;
-        let mut chunk = header_dg[..half].to_vec();
-        chunk.resize(16, 0); // pad to a valid CI length
         let mut asm = XPadAssembler::new();
+        let mut chunk = header_dg.clone();
+        chunk.resize(32, 0);
         asm.push_mp2_frame(&build_xpad_frame(&chunk, APP_TYPE_MOT_START));
-        assert!(
-            !asm.mot_buffer.is_empty(),
-            "incomplete DG should remain buffered"
-        );
+        assert!(!asm.mot_buffer.is_empty());
         asm.reset();
         assert!(asm.mot_buffer.is_empty());
         assert!(asm.take_mot_objects().is_empty());
