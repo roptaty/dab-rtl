@@ -818,10 +818,20 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
     if start > bytes.len() {
         return None;
     }
+    // Tag triplet layout per TS 102 980 §7:
+    //   byte 0: bit 7 RFA, bits 6-0 Content Type
+    //   byte 1: bit 7 RFA, bits 6-0 Start char marker
+    //   byte 2: bit 7 RFA, bits 6-0 Length char marker, encoded as LEN-1
+    // The +1 is applied at extraction time so the stored value still reflects
+    // the wire-format length-1.
     let mut tags: Vec<(u8, usize, usize)> = Vec::new();
     let mut i = start;
     while i + 3 <= bytes.len() {
-        tags.push((bytes[i], bytes[i + 1] as usize, bytes[i + 2] as usize));
+        tags.push((
+            bytes[i] & 0x7F,
+            (bytes[i + 1] & 0x7F) as usize,
+            (bytes[i + 2] & 0x7F) as usize,
+        ));
         i += 3;
     }
     if let Some(expected) = expected_tags {
@@ -850,10 +860,15 @@ fn apply_dl_plus_to_text(text: &str, dl_plus: Option<&DlPlusFields>) -> DlPlusVa
         return out;
     };
     let chars: Vec<char> = text.chars().collect();
-    for (ty, start, len) in &dl_plus.tags {
+    for (ty, start, len_minus_one) in &dl_plus.tags {
+        // DUMMY tag (Content Type 0) fills unused tag slots; ignore.
+        if *ty == 0 {
+            continue;
+        }
         let start = *start;
-        let len = *len;
-        if len == 0 || start >= chars.len() {
+        // Wire format encodes (length - 1); add 1 for the actual char count.
+        let len = *len_minus_one + 1;
+        if start >= chars.len() {
             continue;
         }
         let end = (start + len).min(chars.len());
@@ -1333,9 +1348,9 @@ mod tests {
 
     #[test]
     fn dl_plus_tags_extract_title_artist() {
-        // One DL+ command payload as emitted by ODR-PadEnc:
-        // title type 0x01 at chars 0..4, artist type 0x04 at chars 8..13.
-        let cmd = [0x11u8, 0x01, 0, 5, 0x04, 8, 6];
+        // DL+ command payload as emitted by ODR-PadEnc, LEN-1 wire format:
+        // title (type 0x01) start=0 LEN-1=4 → 5 chars, artist (0x04) start=8 LEN-1=5 → 6 chars.
+        let cmd = [0x11u8, 0x01, 0, 4, 0x04, 8, 5];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
         assert_eq!(values.title.as_deref(), Some("Title"));
@@ -1343,16 +1358,39 @@ mod tests {
     }
 
     #[test]
+    fn dl_plus_tags_strip_rfa_bits_and_apply_len_minus_one() {
+        // Real broadcasters set the RFA high bits to 0 but the parser must
+        // mask defensively in case they don't. Length on the wire is LEN-1
+        // (TS 102 980 §7) — this regression test would have caught the
+        // off-by-one that truncated artist/title to N-1 characters.
+        // 0x11 header (IT=0, IR=0, num_tags-1=1), tags carry RFA high bit set.
+        let cmd = [0x11u8, 0x81, 0x80, 0x84, 0x84, 0x88, 0x85];
+        let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
+        let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
+        assert_eq!(values.title.as_deref(), Some("Title"));
+        assert_eq!(values.artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn dl_plus_dummy_tag_is_ignored() {
+        // Content Type 0 = DUMMY (TS 102 980 §7); must not produce a value.
+        let cmd = [0x11u8, 0x00, 0, 4, 0x01, 0, 4];
+        let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
+        let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
+        assert_eq!(values.title.as_deref(), Some("Title"));
+    }
+
+    #[test]
     fn dl_plus_tags_extract_album_track_genre() {
-        // Tag layout against "Song 03 Album Rock":
-        //   0x01 title      offset  0 len 4  → "Song"
-        //   0x03 track      offset  5 len 2  → "03"
-        //   0x02 album      offset  8 len 5  → "Album"
-        //   0x0B genre      offset 14 len 4  → "Rock"
+        // Tag layout against "Song 03 Album Rock" (LEN-1 wire format):
+        //   0x01 title      offset  0 LEN-1 3 → 4 chars "Song"
+        //   0x03 track      offset  5 LEN-1 1 → 2 chars "03"
+        //   0x02 album      offset  8 LEN-1 4 → 5 chars "Album"
+        //   0x0B genre      offset 14 LEN-1 3 → 4 chars "Rock"
         // NUM_TAGS-1 is a 2-bit field so we split the tags across two DL+
         // command payloads with IR=1 to smoke-test merge semantics.
-        let cmd_a = [0x16u8, 0x01, 0, 4, 0x03, 5, 2, 0x02, 8, 5];
-        let cmd_b = [0x14u8, 0x0B, 14, 4];
+        let cmd_a = [0x16u8, 0x01, 0, 3, 0x03, 5, 1, 0x02, 8, 4];
+        let cmd_b = [0x14u8, 0x0B, 14, 3];
         let dlp_a = parse_dl_plus_command(&cmd_a).expect("expected tags");
         let dlp_b = parse_dl_plus_command(&cmd_b).expect("expected genre tag");
         let values_a = apply_dl_plus_to_text("Song 03 Album Rock", Some(&dlp_a));
@@ -1366,7 +1404,7 @@ mod tests {
     #[test]
     fn dl_plus_drops_non_standard_content_types() {
         // 0x1F/0x20 used to map to title/artist — no longer per TS 102 980.
-        let cmd = [0x12u8, 0x1F, 0, 5, 0x20, 6, 6];
+        let cmd = [0x12u8, 0x1F, 0, 4, 0x20, 6, 5];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         let values = apply_dl_plus_to_text("XXXXX YYYYYY", Some(&dlp));
         assert_eq!(values.title, None);
@@ -1376,14 +1414,14 @@ mod tests {
     #[test]
     fn dl_plus_header_extracts_item_running_and_toggle() {
         // byte 0 = 0x1D = 0001_1101 → link=1, IT=1, IR=1, num_tags-1=1.
-        let cmd = [0x1Du8, 0x01, 0, 5, 0x04, 8, 6];
+        let cmd = [0x1Du8, 0x01, 0, 4, 0x04, 8, 5];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         assert_eq!(dlp.item_toggle, Some(true));
         assert_eq!(dlp.item_running, Some(true));
         assert_eq!(dlp.tags.len(), 2);
 
         // byte 0 = 0x10 = 0001_0000 → IT=0, IR=0, num_tags-1=0 (1 tag).
-        let cmd2 = [0x10u8, 0x01, 0, 5];
+        let cmd2 = [0x10u8, 0x01, 0, 4];
         let dlp2 = parse_dl_plus_command(&cmd2).expect("expected tags");
         assert_eq!(dlp2.item_toggle, Some(false));
         assert_eq!(dlp2.item_running, Some(false));
@@ -1394,7 +1432,7 @@ mod tests {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
         // IR=1 first — title/artist should populate.
-        let cmd_running = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_running = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_running_chunk = build_dl_plus_command_physical(&cmd_running, false);
 
         let mut frame1 = vec![0u8; 8];
@@ -1416,7 +1454,7 @@ mod tests {
 
         // Now the broadcaster signals IR=0 — song fields should be cleared
         // even though the tags still identify character ranges.
-        let cmd_stopped = [0x11u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_stopped = [0x11u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_stopped_chunk = build_dl_plus_command_physical(&cmd_stopped, false);
         let mut logical_stopped = cmd_stopped_chunk.clone();
         logical_stopped.reverse();
@@ -1435,7 +1473,7 @@ mod tests {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
         // 0x15 = 0001_0101 → link=1, IT=0, IR=1, num_tags-1=1 (2 tags).
-        let cmd_payload = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_payload = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
 
         let mut frame1 = vec![0u8; 8];
@@ -1461,7 +1499,7 @@ mod tests {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
         // 0x15 = 0001_0101 → link=1, IT=0, IR=1, num_tags-1=1 (2 tags).
-        let cmd_payload = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd_payload = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
 
         let mut logical_text = text_chunk.clone();
@@ -1506,7 +1544,7 @@ mod tests {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
         // IT=1, IR=1, 2 tags.
-        let cmd = [0x1Du8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd = [0x1Du8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
 
         let mut frame = vec![0u8; 8];
@@ -1535,7 +1573,7 @@ mod tests {
 
         // Seed the cache: text + DL+ command with IT=0, IR=1.
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
-        let cmd = [0x15u8, 0x01, 0, 5, 0x04, 5, 6];
+        let cmd = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
 
         let mut frame1 = vec![0u8; 8];
