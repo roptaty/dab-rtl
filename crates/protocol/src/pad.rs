@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ensemble::{MetadataSource, NowPlaying};
 use crate::mot::{MotAssembler, MotObject};
-use crate::text::decode_dab_text;
+use crate::text::decode_dab_text_raw;
 
 // ─────────────────────────────────────────────────────────────────────────── //
 //  Constants                                                                   //
@@ -536,6 +536,11 @@ impl XPadAssembler {
                 self.command_last_seg_num = Some(seg_num);
             }
             if let Some(cmd_bytes) = self.try_assemble_command_segments() {
+                log::info!(
+                    "DL+ command assembled ({} bytes): {}",
+                    cmd_bytes.len(),
+                    hex_dump(&cmd_bytes)
+                );
                 self.dl_plus = parse_dl_plus_command(&cmd_bytes);
                 if let Some(parsed) = self.try_assemble() {
                     return Some(now_playing_from_parsed(parsed));
@@ -575,6 +580,15 @@ impl XPadAssembler {
             .flat_map(|i| self.segments[&i].iter().copied())
             .collect();
         let text = decode_dls_text(&bytes, self.charset);
+        log::info!(
+            "DLS text assembled: charset={} {} segments, {} bytes raw={} → {:?} ({} chars)",
+            self.charset,
+            (last as usize) + 1,
+            bytes.len(),
+            hex_dump(&bytes),
+            text,
+            text.chars().count()
+        );
         if text.is_empty() {
             return None;
         }
@@ -795,6 +809,7 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
     if bytes.is_empty() {
         return None;
     }
+    log::info!("DL+ command bytes ({}): {}", bytes.len(), hex_dump(bytes));
     // DL+ command payload per ETSI TS 102 980 §7.3:
     //   byte 0: [link:4 = 0001 | IT:1 | IR:1 | NUM_TAGS-1:2]
     //   byte 1+: tag triplets [content_type, start_char, length_char]
@@ -847,11 +862,26 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
     if tags.is_empty() && item_toggle.is_none() && item_running.is_none() {
         return None;
     }
+    log::info!(
+        "DL+ command parsed: IT={:?} IR={:?} tags={:?}",
+        item_toggle,
+        item_running,
+        tags
+    );
     Some(DlPlusFields {
         tags,
         item_toggle,
         item_running,
     })
+}
+
+/// Format bytes as "AB CD EF …" for diagnostic logging.
+fn hex_dump(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn apply_dl_plus_to_text(text: &str, dl_plus: Option<&DlPlusFields>) -> DlPlusValues {
@@ -860,6 +890,12 @@ fn apply_dl_plus_to_text(text: &str, dl_plus: Option<&DlPlusFields>) -> DlPlusVa
         return out;
     };
     let chars: Vec<char> = text.chars().collect();
+    log::info!(
+        "DL+ apply: text={:?} ({} chars), tags={:?}",
+        text,
+        chars.len(),
+        dl_plus.tags
+    );
     for (ty, start, len_minus_one) in &dl_plus.tags {
         // DUMMY tag (Content Type 0) fills unused tag slots; ignore.
         if *ty == 0 {
@@ -869,14 +905,26 @@ fn apply_dl_plus_to_text(text: &str, dl_plus: Option<&DlPlusFields>) -> DlPlusVa
         // Wire format encodes (length - 1); add 1 for the actual char count.
         let len = *len_minus_one + 1;
         if start >= chars.len() {
+            log::info!(
+                "DL+ tag ty={:#04X} start={} len={} → SKIP (start past end of {} chars)",
+                ty,
+                start,
+                len,
+                chars.len()
+            );
             continue;
         }
         let end = (start + len).min(chars.len());
-        let val = chars[start..end]
-            .iter()
-            .collect::<String>()
-            .trim()
-            .to_string();
+        let raw = chars[start..end].iter().collect::<String>();
+        let val = raw.trim().to_string();
+        log::info!(
+            "DL+ tag ty={:#04X} start={} len={} → raw={:?} trimmed={:?}",
+            ty,
+            start,
+            len,
+            raw,
+            val
+        );
         if val.is_empty() {
             continue;
         }
@@ -889,7 +937,10 @@ fn apply_dl_plus_to_text(text: &str, dl_plus: Option<&DlPlusFields>) -> DlPlusVa
             0x08 => &mut out.composer,
             0x09 => &mut out.band,
             0x0B => &mut out.genre,
-            _ => continue,
+            _ => {
+                log::info!("DL+ tag ty={:#04X} not mapped to any field, skipping", ty);
+                continue;
+            }
         };
         if slot.is_none() {
             *slot = Some(val);
@@ -930,7 +981,11 @@ fn now_playing_from_parsed(parsed: ParsedDls) -> NowPlaying {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 fn decode_dls_text(bytes: &[u8], charset: u8) -> String {
-    decode_dab_text(bytes, charset)
+    // DL+ tag start/length markers reference character offsets in the
+    // *transmitted* dynamic label text (TS 102 980 §7). Trimming would shift
+    // those offsets and slice the wrong substring, so we keep whitespace
+    // intact here and only NUL-strip in the per-segment payload code path.
+    decode_dab_text_raw(bytes, charset)
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -1332,10 +1387,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_dls_text_strips_nulls_and_whitespace() {
+    fn decode_dls_text_preserves_whitespace_strips_nulls() {
+        // DLS preserves leading/trailing whitespace because DL+ start/length
+        // markers reference offsets in the transmitted text. NULs are dropped
+        // by the EBU Latin decoder (NUL maps to no character).
         let bytes = b"  Hi\0\0";
         let s = decode_dls_text(bytes, 0);
-        assert_eq!(s, "Hi");
+        assert_eq!(s, "  Hi");
     }
 
     #[test]
@@ -1369,6 +1427,43 @@ mod tests {
         let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
         assert_eq!(values.title.as_deref(), Some("Title"));
         assert_eq!(values.artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn dl_plus_offsets_survive_leading_whitespace() {
+        // Broadcasters routinely pad DLS labels with whitespace and tag DL+
+        // offsets relative to the *transmitted* text. Stripping leading
+        // whitespace before applying tags shifts every offset and slices
+        // the wrong substring (this was the bug behind the "still not
+        // working" report after the LEN-1 fix landed).
+        let mut asm = XPadAssembler::new();
+        // 16-char text needs a 24-byte X-PAD sub-field (2 hdr + 16 text + 2
+        // CRC = 20 bytes; next CI length code up is 24, byte = 0xA2).
+        let text_chunk = build_dls_segment_physical(b"  Title - Artist", false, true, true, 0, 0);
+
+        let mut frame = vec![0u8; 4]; // pad to fill the 24-byte sub-field
+        frame.extend_from_slice(&text_chunk);
+        frame.push(0x00); // CI end marker
+        frame.push(0xA2); // CI byte: length 24, app_type 2 (DLS start)
+        frame.push(0x20); // F-PAD byte 0: variable X-PAD
+        frame.push(0x02); // F-PAD byte 1: CI flag set
+        let meta = asm
+            .push_mp2_frame_metadata(&frame)
+            .expect("expected text metadata");
+        // raw_text preserves leading spaces so DL+ offsets stay aligned.
+        assert_eq!(meta.raw_text, "  Title - Artist");
+
+        // Title at offset 2, length 5 ("Title"); artist at offset 10, length 6 ("Artist").
+        // LEN-1 wire format: byte 4 / byte 5.
+        let cmd_payload = [0x15u8, 0x01, 2, 4, 0x04, 10, 5];
+        let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
+        let mut logical_cmd = cmd_chunk.clone();
+        logical_cmd.reverse();
+        let refreshed = asm
+            .process_dls_chunk(&logical_cmd)
+            .expect("expected refreshed metadata");
+        assert_eq!(refreshed.title.as_deref(), Some("Title"));
+        assert_eq!(refreshed.artist.as_deref(), Some("Artist"));
     }
 
     #[test]

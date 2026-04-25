@@ -7,13 +7,20 @@
 ///
 /// Unknown charsets fall back to EBU Latin.
 pub fn decode_dab_text(bytes: &[u8], charset: u8) -> String {
-    let s = match charset {
+    decode_dab_text_raw(bytes, charset)
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace())
+        .to_string()
+}
+
+/// Decode DAB text without trimming. DL+ markers (TS 102 980 §7) reference
+/// character offsets within the *transmitted* dynamic label text, so DLS
+/// callers must preserve leading whitespace to keep tag offsets aligned.
+pub fn decode_dab_text_raw(bytes: &[u8], charset: u8) -> String {
+    match charset {
         0x06 => decode_charset_06(bytes),
         0x0F => String::from_utf8_lossy(bytes).into_owned(),
         _ => decode_ebu_latin(bytes),
-    };
-    s.trim_matches(|c: char| c == '\0' || c.is_whitespace())
-        .to_string()
+    }
 }
 
 fn decode_charset_06(bytes: &[u8]) -> String {
