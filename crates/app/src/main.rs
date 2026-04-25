@@ -1,4 +1,6 @@
 mod countries;
+mod image_dim;
+mod image_view;
 mod pipeline;
 mod tui;
 

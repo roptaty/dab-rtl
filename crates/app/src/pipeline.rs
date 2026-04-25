@@ -1714,6 +1714,7 @@ impl PacketMotAssembler {
                 content_type: mime,
                 filename,
                 bytes: obj.body,
+                category_title: obj.header.category_title.clone(),
                 updated_at_unix_ms: unix_ms_now(),
             }];
         }
@@ -1747,6 +1748,7 @@ impl PacketMotAssembler {
                 content_type: content_type.to_string(),
                 filename,
                 bytes: payload,
+                category_title: None,
                 updated_at_unix_ms: unix_ms_now(),
             });
             state.fallback_buffer.drain(..end);
@@ -1796,6 +1798,7 @@ fn drain_xpad_mot(
             content_type: mime,
             filename,
             bytes: obj.body,
+            category_title: obj.header.category_title.clone(),
             updated_at_unix_ms: unix_ms_now(),
         };
         let _ = update_tx.try_send(PipelineUpdate::Content { sid, content });

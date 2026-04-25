@@ -166,6 +166,9 @@ struct AppState {
     signal_quality_percent: Option<u8>,
     /// Cached scan-log title.
     scan_log_title: String,
+    /// `true` when the user pressed `i`, requesting the run loop to suspend
+    /// the alt screen and render the selected slideshow image inline.
+    pending_image_view: bool,
 }
 
 impl AppState {
@@ -193,6 +196,7 @@ impl AppState {
             codec: None,
             signal_quality_percent: None,
             scan_log_title: " Scan Log ".into(),
+            pending_image_view: false,
         }
     }
 
@@ -329,16 +333,28 @@ impl AppState {
                         Span::styled("Content: ", Style::default().fg(Color::DarkGray)),
                         Span::raw(types),
                     ]));
+                    let mut selected_detail = format!(
+                        "{}/{}  {}  ({})",
+                        idx + 1,
+                        service.content_items.len(),
+                        selected.content_type,
+                        selected.filename
+                    );
+                    if let Some(dim) = crate::image_dim::sniff(&selected.bytes) {
+                        selected_detail.push_str(&format!("  {}×{}", dim.width, dim.height));
+                    }
                     lines.push(Line::from(vec![
                         Span::styled("Selected: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(format!(
-                            "{}/{}  {}  ({})",
-                            idx + 1,
-                            service.content_items.len(),
-                            selected.content_type,
-                            selected.filename
-                        )),
+                        Span::raw(selected_detail),
                     ]));
+                    if let Some(category) = selected.category_title.as_deref() {
+                        if !category.is_empty() {
+                            lines.push(Line::from(vec![
+                                Span::styled("Category: ", Style::default().fg(Color::DarkGray)),
+                                Span::raw(category.to_string()),
+                            ]));
+                        }
+                    }
                 }
             }
             if let Some(meta) = now_playing {
@@ -358,47 +374,54 @@ impl AppState {
                     Span::styled("Text: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(meta.raw_text.clone(), Style::default().fg(Color::Yellow)),
                 ]));
-                if let Some(title) = &meta.title {
-                    lines.push(Line::from(vec![
-                        Span::styled("Title: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(title.clone()),
-                    ]));
-                }
-                if let Some(artist) = &meta.artist {
-                    lines.push(Line::from(vec![
-                        Span::styled("Artist: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(artist.clone()),
-                    ]));
-                }
-                if let Some(album) = &meta.album {
-                    lines.push(Line::from(vec![
-                        Span::styled("Album: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(album.clone()),
-                    ]));
-                }
-                if let Some(track) = &meta.track {
-                    lines.push(Line::from(vec![
-                        Span::styled("Track: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(track.clone()),
-                    ]));
-                }
-                if let Some(composer) = &meta.composer {
-                    lines.push(Line::from(vec![
-                        Span::styled("Composer: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(composer.clone()),
-                    ]));
-                }
-                if let Some(band) = &meta.band {
-                    lines.push(Line::from(vec![
-                        Span::styled("Band: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(band.clone()),
-                    ]));
-                }
-                if let Some(genre) = &meta.genre {
-                    lines.push(Line::from(vec![
-                        Span::styled("Genre: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(genre.clone()),
-                    ]));
+                // When the broadcaster signals the item has stopped, suppress
+                // structured DL+ song fields (TS 102 980 §7.3.2 IR=0). The raw
+                // DLS line stays so the user still sees any station message
+                // ("Up next…", advertisement copy, etc.) being broadcast.
+                let suppress_song_fields = meta.item_running == Some(false);
+                if !suppress_song_fields {
+                    if let Some(title) = &meta.title {
+                        lines.push(Line::from(vec![
+                            Span::styled("Title: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(title.clone()),
+                        ]));
+                    }
+                    if let Some(artist) = &meta.artist {
+                        lines.push(Line::from(vec![
+                            Span::styled("Artist: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(artist.clone()),
+                        ]));
+                    }
+                    if let Some(album) = &meta.album {
+                        lines.push(Line::from(vec![
+                            Span::styled("Album: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(album.clone()),
+                        ]));
+                    }
+                    if let Some(track) = &meta.track {
+                        lines.push(Line::from(vec![
+                            Span::styled("Track: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(track.clone()),
+                        ]));
+                    }
+                    if let Some(composer) = &meta.composer {
+                        lines.push(Line::from(vec![
+                            Span::styled("Composer: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(composer.clone()),
+                        ]));
+                    }
+                    if let Some(band) = &meta.band {
+                        lines.push(Line::from(vec![
+                            Span::styled("Band: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(band.clone()),
+                        ]));
+                    }
+                    if let Some(genre) = &meta.genre {
+                        lines.push(Line::from(vec![
+                            Span::styled("Genre: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(genre.clone()),
+                        ]));
+                    }
                 }
             }
             lines
@@ -785,6 +808,30 @@ fn run_loop(
                 // Capture mode before handling the key (it may change inside).
                 let was_browse = matches!(state.mode, UiMode::Browse);
                 handle_key(key.code, &mut state, &handle);
+
+                // Honour any pending image-view request before continuing.
+                // The handler temporarily leaves the alt screen, so we have
+                // to clear ratatui's cached buffer when we come back so the
+                // next draw repaints from scratch.
+                if std::mem::take(&mut state.pending_image_view) {
+                    if let Some(content) = state.selected_content_item() {
+                        let bytes = content.bytes.clone();
+                        let term_size = terminal.size().unwrap_or(Rect {
+                            x: 0,
+                            y: 0,
+                            width: 80,
+                            height: 24,
+                        });
+                        let width_cells = term_size.width.saturating_sub(2).max(20) as u32;
+                        match crate::image_view::view(&bytes, width_cells) {
+                            Ok(()) => state.status = "Image preview closed".into(),
+                            Err(err) => {
+                                state.status = format!("Image preview failed: {err}");
+                            }
+                        }
+                    }
+                    terminal.clear()?;
+                }
                 state.rebuild_now_playing();
                 state.rebuild_service_items();
                 dirty = true;
@@ -962,6 +1009,7 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                     state.status = format!("Save failed: {err}");
                 }
             },
+            KeyCode::Char('i') => request_image_view(state),
             _ => {}
         },
         UiMode::Playback => match code {
@@ -994,9 +1042,31 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                     state.status = format!("Save failed: {err}");
                 }
             },
+            KeyCode::Char('i') => request_image_view(state),
             _ => {}
         },
     }
+}
+
+/// Mark the currently-selected slideshow image for inline rendering. The
+/// run loop performs the suspend/restore dance after `handle_key` returns
+/// (we can't do it here because `crate::image_view::view` needs to take over
+/// the terminal).
+fn request_image_view(state: &mut AppState) {
+    let Some(item) = state.selected_content_item() else {
+        state.status = "No image content selected".into();
+        return;
+    };
+    if !item.content_type.starts_with("image/") {
+        state.status = format!("Selected content is {} (not an image)", item.content_type);
+        return;
+    }
+    if !crate::image_view::SUPPORTED {
+        state.status =
+            "Image preview not available — rebuild with --features slideshow-image".into();
+        return;
+    }
+    state.pending_image_view = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -1095,11 +1165,22 @@ fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_status_bar(f: &mut Frame, state: &AppState, area: Rect) {
-    let help_text = match state.mode {
+    let view_key = if crate::image_view::SUPPORTED {
+        "  [i] View image"
+    } else {
+        ""
+    };
+    let browse_help = format!(
+        " [↑↓/jk] Navigate  [Enter] Play  [←→/hl] Content  [d] Download{view_key}  [s] Stop  [c] Country  [q] Quit "
+    );
+    let playback_help = format!(
+        " [b] Browse  [←→/hl] Content  [d] Download{view_key}  [s] Stop  [c] Country  [q] Quit "
+    );
+    let help_text: &str = match state.mode {
         UiMode::CountrySelect => " [↑↓/jk] Navigate  [Enter] Select  [Esc/q] Cancel ",
         UiMode::Browse if state.scan_state.is_some() => " Scanning… ",
-        UiMode::Browse => " [↑↓/jk] Navigate  [Enter] Play  [←→/hl] Content  [d] Download  [s] Stop  [c] Country  [q] Quit ",
-        UiMode::Playback => " [b] Browse  [←→/hl] Content  [d] Download  [s] Stop  [c] Country  [q] Quit ",
+        UiMode::Browse => &browse_help,
+        UiMode::Playback => &playback_help,
     };
     let help = Span::styled(help_text, Style::default().fg(Color::DarkGray));
     let status = Span::styled(
@@ -1344,12 +1425,14 @@ mod tests {
                     content_type: "image/jpeg".into(),
                     filename: "cover.jpg".into(),
                     bytes: vec![1, 2, 3],
+                    category_title: None,
                     updated_at_unix_ms: 0,
                 },
                 ContentItem {
                     content_type: "image/png".into(),
                     filename: "slide.png".into(),
                     bytes: vec![4, 5, 6],
+                    category_title: Some("Now Playing".into()),
                     updated_at_unix_ms: 0,
                 },
             ],
@@ -1374,6 +1457,107 @@ mod tests {
         assert!(rendered.contains("Content: image/jpeg, image/png"));
         assert!(rendered.contains("MOT Types: image/jpeg, image/png"));
         assert!(rendered.contains("Selected: 2/2  image/png  (slide.png)"));
+        // The category title from the second item should surface.
+        assert!(rendered.contains("Category: Now Playing"));
+    }
+
+    #[test]
+    fn build_now_playing_lines_shows_image_dimensions_when_decodable() {
+        // Minimal valid PNG signature + IHDR with 320x240.
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1A\n");
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&320u32.to_be_bytes());
+        png.extend_from_slice(&240u32.to_be_bytes());
+        png.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+
+        let service = Service {
+            label: "Radio".into(),
+            content_items: vec![ContentItem {
+                content_type: "image/png".into(),
+                filename: "cover.png".into(),
+                bytes: png,
+                category_title: None,
+                updated_at_unix_ms: 0,
+            }],
+            ..Default::default()
+        };
+        let rendered = AppState::build_now_playing_lines(
+            Some("Radio"),
+            "Ensemble",
+            Some(&service),
+            None,
+            0,
+            None,
+            None,
+        )
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(rendered.contains("320×240"));
+    }
+
+    #[test]
+    fn build_now_playing_lines_clears_song_fields_when_idle() {
+        let now_playing = NowPlaying {
+            raw_text: "Coming up: morning show".into(),
+            title: Some("Should be hidden".into()),
+            artist: Some("Should be hidden".into()),
+            album: Some("Should be hidden".into()),
+            item_running: Some(false),
+            ..Default::default()
+        };
+
+        let rendered = AppState::build_now_playing_lines(
+            Some("Radio"),
+            "Ensemble",
+            None,
+            Some(&now_playing),
+            0,
+            None,
+            None,
+        )
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(rendered.contains("Status: Idle"));
+        assert!(rendered.contains("Coming up: morning show"));
+        assert!(!rendered.contains("Title:"));
+        assert!(!rendered.contains("Artist:"));
+        assert!(!rendered.contains("Album:"));
+    }
+
+    #[test]
+    fn build_now_playing_lines_keeps_song_fields_when_running() {
+        let now_playing = NowPlaying {
+            raw_text: "Artist - Title".into(),
+            title: Some("Title".into()),
+            artist: Some("Artist".into()),
+            item_running: Some(true),
+            ..Default::default()
+        };
+        let rendered = AppState::build_now_playing_lines(
+            Some("Radio"),
+            "Ensemble",
+            None,
+            Some(&now_playing),
+            0,
+            None,
+            None,
+        )
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(rendered.contains("Status: Playing"));
+        assert!(rendered.contains("Title: Title"));
+        assert!(rendered.contains("Artist: Artist"));
     }
 
     #[test]
