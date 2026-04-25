@@ -379,6 +379,19 @@ impl XPadAssembler {
 
         let mut metadata = None;
         for (app_type, chunk) in chunks {
+            log::info!(
+                "X-PAD sub-field dispatch: app_type={} ({}) chunk_len={} bytes={}",
+                app_type,
+                match app_type {
+                    APP_TYPE_DLS_START => "DLS start",
+                    APP_TYPE_DLS_CONT => "DLS cont",
+                    APP_TYPE_MOT_START => "MOT start",
+                    APP_TYPE_MOT_CONT => "MOT cont",
+                    _ => "other",
+                },
+                chunk.len(),
+                hex_dump(&chunk)
+            );
             match app_type {
                 APP_TYPE_DLS_START | APP_TYPE_DLS_CONT => {
                     if let Some(m) = self.process_dls_chunk(&chunk) {
@@ -459,9 +472,11 @@ impl XPadAssembler {
         let toggle = (header0 & 0x80) != 0;
         let cmd_or_len = header0 & 0x0F;
         let body_len = if is_command {
-            // Command frames use a 7-bit payload length in byte1.
+            // X-PAD DLS command segment header byte 1 carries Field-1 in the
+            // low 4 bits (RFA in bits 7-4) per EN 300 401 §7.4.5.2 / dablin
+            // pad_decoder.cpp DecodeDataGroup. Length = (byte1 & 0x0F) + 1.
             if cmd_or_len == 0x02 {
-                (header1 as usize & 0x7F) + 1
+                (header1 as usize & 0x0F) + 1
             } else {
                 0
             }
@@ -479,11 +494,13 @@ impl XPadAssembler {
             return None;
         }
         let payload = &chunk[2..2 + body_len];
-        let field2 = header1 >> 4;
-        let seg_num = if first { 0 } else { (field2 & 0x07) + 1 };
+        // Continuation segment number is bits 6-4 of byte 1 (3 bits, range
+        // 1-7), encoded directly per EN 300 401 §7.4.5.2 / dablin
+        // DL_SEG::SegNum: `(prefix[1] & 0x70) >> 4`. No -1 / +1 offset.
+        let seg_num = if first { 0 } else { (header1 >> 4) & 0x07 };
 
-        log::debug!(
-            "X-PAD DLS: h0={:02X} h1={:02X} first={} last={} toggle={} command={} seg={} body_len={} chunk_len={}",
+        log::info!(
+            "X-PAD DLS chunk: h0={:02X} h1={:02X} first={} last={} toggle={} command={} seg={} body_len={} chunk_len={}",
             header0,
             header1,
             first,
@@ -564,6 +581,12 @@ impl XPadAssembler {
         if last {
             self.last_seg_num = Some(seg_num);
         }
+        log::info!(
+            "X-PAD DLS state: segments={:?} last_seg_num={:?} charset={}",
+            self.segments.keys().collect::<Vec<_>>(),
+            self.last_seg_num,
+            self.charset
+        );
 
         let parsed = self.try_assemble()?;
         Some(now_playing_from_parsed(parsed))
@@ -810,26 +833,24 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
         return None;
     }
     log::info!("DL+ command bytes ({}): {}", bytes.len(), hex_dump(bytes));
-    // DL+ command payload per ETSI TS 102 980 §7.3:
-    //   byte 0: [link:4 = 0001 | IT:1 | IR:1 | NUM_TAGS-1:2]
+    // DL+ command payload per ETSI TS 102 980 §6.4:
+    //   byte 0: [CId:4 = 0000 | IT:1 | IR:1 | NUM_TAGS-1:2]
     //   byte 1+: tag triplets [content_type, start_char, length_char]
-    //
-    // Some packet-mode paths prepend a legacy command id 0x02 before the
-    // control byte; the control byte there is just NUM_TAGS-1 in bits 1-0
-    // and we have no IT/IR in that variant.
-    let (start, expected_tags, header_flags) = if bytes[0] == 0x02 && bytes.len() >= 2 {
-        let control = bytes[1];
-        let n = (control & 0x03) as usize + 1;
-        (2, Some(n), None)
-    } else if (bytes[0] >> 4) == 0x01 {
-        let b0 = bytes[0];
-        let it = (b0 & 0x08) != 0;
-        let ir = (b0 & 0x04) != 0;
-        let n = (b0 & 0x03) as usize + 1;
-        (1, Some(n), Some((it, ir)))
-    } else {
-        (0, None, None)
-    };
+    // Cross-checked against dablin's pad_decoder.cpp::AppendDLPlus, which
+    // bails when (cmd[0] >> 4) != 0b0000.
+    if (bytes[0] >> 4) != 0 {
+        log::info!(
+            "DL+ command: header byte {:#04X} has non-zero CId nibble — not a DL+ tag command",
+            bytes[0]
+        );
+        return None;
+    }
+    let b0 = bytes[0];
+    let it = (b0 & 0x08) != 0;
+    let ir = (b0 & 0x04) != 0;
+    let expected_tags = (b0 & 0x03) as usize + 1;
+    let header_flags = Some((it, ir));
+    let start = 1usize;
     if start > bytes.len() {
         return None;
     }
@@ -849,9 +870,7 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
         ));
         i += 3;
     }
-    if let Some(expected) = expected_tags {
-        tags.truncate(expected);
-    }
+    tags.truncate(expected_tags);
     let (item_toggle, item_running) = match header_flags {
         Some((it, ir)) => (Some(it), Some(ir)),
         None => (None, None),
@@ -1078,7 +1097,9 @@ mod tests {
         let byte1 = if first {
             (charset & 0x0F) << 4
         } else {
-            ((seg_num.saturating_sub(1)) & 0x07) << 4
+            // EN 300 401 §7.4.5.2: continuation byte 1 bits 6-4 carry the
+            // segment number directly (range 1-7). No -1 offset.
+            (seg_num & 0x07) << 4
         };
         let mut logical = Vec::with_capacity(2 + text.len() + 2);
         logical.push(byte0);
@@ -1275,9 +1296,11 @@ mod tests {
     }
 
     #[test]
-    fn assembler_two_segment_label_uses_minus_one_segment_numbering() {
+    fn assembler_two_segment_label_reassembles_in_order() {
         let mut asm = XPadAssembler::new();
 
+        // Segment 0 is implicit via first=true; continuation segment number
+        // is encoded directly (1, not 0) per EN 300 401 §7.4.5.2.
         let seg0 = build_dls_segment_physical(b"Te", false, true, false, 0, 0);
         let seg1 = build_dls_segment_physical(b"xt", false, false, true, 0, 1);
 
@@ -1408,7 +1431,7 @@ mod tests {
     fn dl_plus_tags_extract_title_artist() {
         // DL+ command payload as emitted by ODR-PadEnc, LEN-1 wire format:
         // title (type 0x01) start=0 LEN-1=4 → 5 chars, artist (0x04) start=8 LEN-1=5 → 6 chars.
-        let cmd = [0x11u8, 0x01, 0, 4, 0x04, 8, 5];
+        let cmd = [0x01u8, 0x01, 0, 4, 0x04, 8, 5];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
         assert_eq!(values.title.as_deref(), Some("Title"));
@@ -1421,8 +1444,9 @@ mod tests {
         // mask defensively in case they don't. Length on the wire is LEN-1
         // (TS 102 980 §7) — this regression test would have caught the
         // off-by-one that truncated artist/title to N-1 characters.
-        // 0x11 header (IT=0, IR=0, num_tags-1=1), tags carry RFA high bit set.
-        let cmd = [0x11u8, 0x81, 0x80, 0x84, 0x84, 0x88, 0x85];
+        // 0x01 header (CId=0, IT=0, IR=0, num_tags-1=1), tags carry RFA high
+        // bit set.
+        let cmd = [0x01u8, 0x81, 0x80, 0x84, 0x84, 0x88, 0x85];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
         assert_eq!(values.title.as_deref(), Some("Title"));
@@ -1454,8 +1478,8 @@ mod tests {
         assert_eq!(meta.raw_text, "  Title - Artist");
 
         // Title at offset 2, length 5 ("Title"); artist at offset 10, length 6 ("Artist").
-        // LEN-1 wire format: byte 4 / byte 5.
-        let cmd_payload = [0x15u8, 0x01, 2, 4, 0x04, 10, 5];
+        // LEN-1 wire format: byte 4 / byte 5. Header 0x05 = CId=0, IT=0, IR=1, NUM-1=1 (2 tags).
+        let cmd_payload = [0x05u8, 0x01, 2, 4, 0x04, 10, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
         let mut logical_cmd = cmd_chunk.clone();
         logical_cmd.reverse();
@@ -1467,9 +1491,24 @@ mod tests {
     }
 
     #[test]
+    fn dl_plus_real_broadcast_bytes_parse_with_cid_zero() {
+        // Captured from a live DAB+ broadcast (Channel 12C, 2026-04-25):
+        // header 0x05 = CId=0, IT=0, IR=1, NUM-1=01 (2 tags)
+        //   tag1: ty=0x01 (Title) start=0x0C=12 LEN-1=0x1B → length=28
+        //   tag2: ty=0x04 (Artist) start=0x00 LEN-1=0x08 → length=9
+        // Old code with CId=0x1 check fell into the no-header branch and
+        // emitted garbage tags (5,1,12) and (27,4,0).
+        let cmd = [0x05u8, 0x01, 0x0C, 0x1B, 0x04, 0x00, 0x08];
+        let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
+        assert_eq!(dlp.item_toggle, Some(false));
+        assert_eq!(dlp.item_running, Some(true));
+        assert_eq!(dlp.tags, vec![(0x01, 12, 0x1B), (0x04, 0, 0x08)]);
+    }
+
+    #[test]
     fn dl_plus_dummy_tag_is_ignored() {
         // Content Type 0 = DUMMY (TS 102 980 §7); must not produce a value.
-        let cmd = [0x11u8, 0x00, 0, 4, 0x01, 0, 4];
+        let cmd = [0x01u8, 0x00, 0, 4, 0x01, 0, 4];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         let values = apply_dl_plus_to_text("Title - Artist", Some(&dlp));
         assert_eq!(values.title.as_deref(), Some("Title"));
@@ -1484,8 +1523,8 @@ mod tests {
         //   0x0B genre      offset 14 LEN-1 3 → 4 chars "Rock"
         // NUM_TAGS-1 is a 2-bit field so we split the tags across two DL+
         // command payloads with IR=1 to smoke-test merge semantics.
-        let cmd_a = [0x16u8, 0x01, 0, 3, 0x03, 5, 1, 0x02, 8, 4];
-        let cmd_b = [0x14u8, 0x0B, 14, 3];
+        let cmd_a = [0x06u8, 0x01, 0, 3, 0x03, 5, 1, 0x02, 8, 4];
+        let cmd_b = [0x04u8, 0x0B, 14, 3];
         let dlp_a = parse_dl_plus_command(&cmd_a).expect("expected tags");
         let dlp_b = parse_dl_plus_command(&cmd_b).expect("expected genre tag");
         let values_a = apply_dl_plus_to_text("Song 03 Album Rock", Some(&dlp_a));
@@ -1499,7 +1538,8 @@ mod tests {
     #[test]
     fn dl_plus_drops_non_standard_content_types() {
         // 0x1F/0x20 used to map to title/artist — no longer per TS 102 980.
-        let cmd = [0x12u8, 0x1F, 0, 4, 0x20, 6, 5];
+        // Header 0x02 = CId=0, IT=0, IR=0, NUM-1=10 (3 tags); we only supply 2.
+        let cmd = [0x02u8, 0x1F, 0, 4, 0x20, 6, 5];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         let values = apply_dl_plus_to_text("XXXXX YYYYYY", Some(&dlp));
         assert_eq!(values.title, None);
@@ -1508,15 +1548,15 @@ mod tests {
 
     #[test]
     fn dl_plus_header_extracts_item_running_and_toggle() {
-        // byte 0 = 0x1D = 0001_1101 → link=1, IT=1, IR=1, num_tags-1=1.
-        let cmd = [0x1Du8, 0x01, 0, 4, 0x04, 8, 5];
+        // byte 0 = 0x0D = 0000_1101 → CId=0, IT=1, IR=1, num_tags-1=1.
+        let cmd = [0x0Du8, 0x01, 0, 4, 0x04, 8, 5];
         let dlp = parse_dl_plus_command(&cmd).expect("expected tags");
         assert_eq!(dlp.item_toggle, Some(true));
         assert_eq!(dlp.item_running, Some(true));
         assert_eq!(dlp.tags.len(), 2);
 
-        // byte 0 = 0x10 = 0001_0000 → IT=0, IR=0, num_tags-1=0 (1 tag).
-        let cmd2 = [0x10u8, 0x01, 0, 4];
+        // byte 0 = 0x00 = 0000_0000 → IT=0, IR=0, num_tags-1=0 (1 tag).
+        let cmd2 = [0x00u8, 0x01, 0, 4];
         let dlp2 = parse_dl_plus_command(&cmd2).expect("expected tags");
         assert_eq!(dlp2.item_toggle, Some(false));
         assert_eq!(dlp2.item_running, Some(false));
@@ -1527,7 +1567,7 @@ mod tests {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
         // IR=1 first — title/artist should populate.
-        let cmd_running = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
+        let cmd_running = [0x05u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_running_chunk = build_dl_plus_command_physical(&cmd_running, false);
 
         let mut frame1 = vec![0u8; 8];
@@ -1549,7 +1589,7 @@ mod tests {
 
         // Now the broadcaster signals IR=0 — song fields should be cleared
         // even though the tags still identify character ranges.
-        let cmd_stopped = [0x11u8, 0x01, 0, 4, 0x04, 5, 5];
+        let cmd_stopped = [0x01u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_stopped_chunk = build_dl_plus_command_physical(&cmd_stopped, false);
         let mut logical_stopped = cmd_stopped_chunk.clone();
         logical_stopped.reverse();
@@ -1568,7 +1608,7 @@ mod tests {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
         // 0x15 = 0001_0101 → link=1, IT=0, IR=1, num_tags-1=1 (2 tags).
-        let cmd_payload = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
+        let cmd_payload = [0x05u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
 
         let mut frame1 = vec![0u8; 8];
@@ -1594,7 +1634,7 @@ mod tests {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
         // 0x15 = 0001_0101 → link=1, IT=0, IR=1, num_tags-1=1 (2 tags).
-        let cmd_payload = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
+        let cmd_payload = [0x05u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd_payload, false);
 
         let mut logical_text = text_chunk.clone();
@@ -1638,8 +1678,8 @@ mod tests {
     fn dl_plus_item_toggle_surfaces_on_now_playing() {
         let mut asm = XPadAssembler::new();
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
-        // IT=1, IR=1, 2 tags.
-        let cmd = [0x1Du8, 0x01, 0, 4, 0x04, 5, 5];
+        // CId=0, IT=1, IR=1, 2 tags.
+        let cmd = [0x0Du8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
 
         let mut frame = vec![0u8; 8];
@@ -1668,7 +1708,7 @@ mod tests {
 
         // Seed the cache: text + DL+ command with IT=0, IR=1.
         let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
-        let cmd = [0x15u8, 0x01, 0, 4, 0x04, 5, 5];
+        let cmd = [0x05u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
 
         let mut frame1 = vec![0u8; 8];
