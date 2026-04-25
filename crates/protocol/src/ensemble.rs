@@ -53,6 +53,8 @@ pub struct ContentItem {
     pub bytes: Vec<u8>,
     /// MOT `CategoryTitle` parameter (TS 101 499 §4.1.10) when signalled.
     pub category_title: Option<String>,
+    /// Extracted text from image using OCR, if applicable.
+    pub ocr_text: Option<String>,
     /// Receiver timestamp in Unix milliseconds.
     pub updated_at_unix_ms: u64,
 }
