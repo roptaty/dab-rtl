@@ -1,3 +1,4 @@
+mod ascii_art;
 mod countries;
 mod image_dim;
 mod image_view;

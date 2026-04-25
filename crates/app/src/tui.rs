@@ -222,6 +222,8 @@ struct AppState {
     /// `true` when the user pressed `i`, requesting the run loop to suspend
     /// the alt screen and render the selected slideshow image inline.
     pending_image_view: bool,
+    /// Cached ASCII cover art for the selected JPEG and terminal size.
+    ascii_art_cache: AsciiArtCache,
 }
 
 impl AppState {
@@ -250,6 +252,7 @@ impl AppState {
             signal_quality_percent: None,
             scan_log_title: " Scan Log ".into(),
             pending_image_view: false,
+            ascii_art_cache: AsciiArtCache::default(),
         }
     }
 
@@ -508,6 +511,36 @@ impl AppState {
         service.content_items.get(idx)
     }
 
+    fn selected_or_latest_jpeg_content_item(&self) -> Option<SelectedJpegContent<'_>> {
+        let sid = self.playing_sid?;
+        let service = self.ensemble.services.iter().find(|s| s.id == sid)?;
+        if service.content_items.is_empty() {
+            return None;
+        }
+        let jpeg_indices = jpeg_content_indices(service);
+        if jpeg_indices.is_empty() {
+            return None;
+        }
+
+        let idx = self.content_selection.min(service.content_items.len() - 1);
+        if let Some(pos) = jpeg_indices.iter().position(|&jpeg_idx| jpeg_idx == idx) {
+            let item = &service.content_items[idx];
+            return Some(SelectedJpegContent {
+                item,
+                position: pos,
+                count: jpeg_indices.len(),
+            });
+        }
+
+        let fallback_pos = jpeg_indices.len() - 1;
+        let fallback_idx = jpeg_indices[fallback_pos];
+        Some(SelectedJpegContent {
+            item: &service.content_items[fallback_idx],
+            position: fallback_pos,
+            count: jpeg_indices.len(),
+        })
+    }
+
     fn cycle_content_next(&mut self) {
         let Some(count) = self
             .playing_sid
@@ -532,6 +565,43 @@ impl AppState {
         if count > 0 {
             self.content_selection = (self.content_selection + count - 1) % count;
         }
+    }
+
+    fn cycle_cover_next(&mut self) {
+        if !self.cycle_jpeg_content(true) {
+            self.cycle_content_next();
+        }
+    }
+
+    fn cycle_cover_prev(&mut self) {
+        if !self.cycle_jpeg_content(false) {
+            self.cycle_content_prev();
+        }
+    }
+
+    fn cycle_jpeg_content(&mut self, forward: bool) -> bool {
+        let Some(service) = self
+            .playing_sid
+            .and_then(|sid| self.ensemble.services.iter().find(|s| s.id == sid))
+        else {
+            return false;
+        };
+        let jpeg_indices = jpeg_content_indices(service);
+        if jpeg_indices.is_empty() {
+            return false;
+        }
+
+        let current_pos = jpeg_indices
+            .iter()
+            .position(|&idx| idx == self.content_selection)
+            .unwrap_or(jpeg_indices.len() - 1);
+        let next_pos = if forward {
+            (current_pos + 1) % jpeg_indices.len()
+        } else {
+            (current_pos + jpeg_indices.len() - 1) % jpeg_indices.len()
+        };
+        self.content_selection = jpeg_indices[next_pos];
+        true
     }
 
     /// Append a message to the scan log ring buffer, capped at `MAX_SCAN_LOG` lines.
@@ -693,6 +763,28 @@ impl AppState {
             scan.note_new_info();
         }
     }
+}
+
+#[derive(Default)]
+struct AsciiArtCache {
+    key: Option<AsciiArtKey>,
+    lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsciiArtKey {
+    sid: u32,
+    filename: String,
+    updated_at_unix_ms: u64,
+    bytes_len: usize,
+    width: u16,
+    height: u16,
+}
+
+struct SelectedJpegContent<'a> {
+    item: &'a ContentItem,
+    position: usize,
+    count: usize,
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -1135,8 +1227,8 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                 state.status = "Stopped".into();
                 state.mode = UiMode::Browse;
             }
-            KeyCode::Left | KeyCode::Char('h') => state.cycle_content_prev(),
-            KeyCode::Right | KeyCode::Char('l') => state.cycle_content_next(),
+            KeyCode::Left | KeyCode::Char('h') => state.cycle_cover_prev(),
+            KeyCode::Right | KeyCode::Char('l') => state.cycle_cover_next(),
             KeyCode::Char('d') => match save_selected_content(state) {
                 Ok(Some(path)) => {
                     state.status = format!("Saved {}", path.display());
@@ -1168,8 +1260,8 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                 state.status = "Stopped".into();
                 state.mode = UiMode::Browse;
             }
-            KeyCode::Left | KeyCode::Char('h') => state.cycle_content_prev(),
-            KeyCode::Right | KeyCode::Char('l') => state.cycle_content_next(),
+            KeyCode::Left | KeyCode::Char('h') => state.cycle_cover_prev(),
+            KeyCode::Right | KeyCode::Char('l') => state.cycle_cover_next(),
             KeyCode::Char('d') => match save_selected_content(state) {
                 Ok(Some(path)) => {
                     state.status = format!("Saved {}", path.display());
@@ -1290,16 +1382,100 @@ fn render_service_list(f: &mut Frame, state: &mut AppState, area: Rect) {
     f.render_stateful_widget(list, area, &mut state.list_state);
 }
 
-fn render_now_playing(f: &mut Frame, state: &AppState, area: Rect) {
+fn render_now_playing(f: &mut Frame, state: &mut AppState, area: Rect) {
     let title = if matches!(state.mode, UiMode::Playback) && state.scan_state.is_none() {
         " Selected Service "
     } else {
         " Now Playing "
     };
+
+    let show_art = state.playing_sid.is_some()
+        && state.selected_or_latest_jpeg_content_item().is_some()
+        && area.width >= 36
+        && area.height >= 10;
+
+    if show_art {
+        let horizontal = area.width >= 72;
+        let panes = Layout::default()
+            .direction(if horizontal {
+                Direction::Horizontal
+            } else {
+                Direction::Vertical
+            })
+            .constraints(if horizontal {
+                [Constraint::Percentage(48), Constraint::Percentage(52)]
+            } else {
+                [Constraint::Percentage(45), Constraint::Percentage(55)]
+            })
+            .split(area);
+
+        render_now_playing_text(f, state, panes[0], title);
+        render_ascii_cover_art(f, state, panes[1]);
+        return;
+    }
+
+    render_now_playing_text(f, state, area, title);
+}
+
+fn render_now_playing_text(f: &mut Frame, state: &AppState, area: Rect, title: &str) {
     let para = Paragraph::new(state.now_playing_lines.clone())
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: true });
 
+    f.render_widget(para, area);
+}
+
+fn render_ascii_cover_art(f: &mut Frame, state: &mut AppState, area: Rect) {
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2);
+    let Some((key, bytes, position, count)) = state
+        .selected_or_latest_jpeg_content_item()
+        .and_then(|selected| {
+            Some((
+                AsciiArtKey {
+                    sid: state.playing_sid?,
+                    filename: selected.item.filename.clone(),
+                    updated_at_unix_ms: selected.item.updated_at_unix_ms,
+                    bytes_len: selected.item.bytes.len(),
+                    width: inner_width,
+                    height: inner_height,
+                },
+                selected.item.bytes.clone(),
+                selected.position,
+                selected.count,
+            ))
+        })
+    else {
+        return;
+    };
+
+    if state.ascii_art_cache.key.as_ref() != Some(&key) {
+        state.ascii_art_cache.lines =
+            crate::ascii_art::jpeg_to_ascii(&bytes, inner_width, inner_height).unwrap_or_default();
+        state.ascii_art_cache.key = Some(key);
+    }
+
+    let lines = if state.ascii_art_cache.lines.is_empty() {
+        vec![Line::from(Span::styled(
+            "JPEG cover art could not be decoded",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        state
+            .ascii_art_cache
+            .lines
+            .iter()
+            .map(|line| Line::from(Span::raw(line.clone())))
+            .collect()
+    };
+
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Cover Art {}/{} ",
+            position + 1,
+            count
+        )))
+        .alignment(Alignment::Center);
     f.render_widget(para, area);
 }
 
@@ -1310,10 +1486,10 @@ fn render_status_bar(f: &mut Frame, state: &AppState, area: Rect) {
         ""
     };
     let browse_help = format!(
-        " [↑↓/jk] Navigate  [Enter] Play  [←→/hl] Content  [d] Download{view_key}  [s] Stop  [c] Country  [q] Quit "
+        " [↑↓/jk] Navigate  [Enter] Play  [←→/hl] Cover  [d] Download{view_key}  [s] Stop  [c] Country  [q] Quit "
     );
     let playback_help = format!(
-        " [b] Browse  [←→/hl] Content  [d] Download{view_key}  [s] Stop  [c] Country  [q] Quit "
+        " [b] Browse  [←→/hl] Cover  [d] Download{view_key}  [s] Stop  [c] Country  [q] Quit "
     );
     let help_text: &str = match state.mode {
         UiMode::CountrySelect => " [↑↓/jk] Navigate  [Enter] Select  [Esc/q] Cancel ",
@@ -1413,6 +1589,20 @@ fn record_mot_content_type(types: &mut Vec<String>, content_type: &str) {
         types.push(content_type.to_string());
         types.sort();
     }
+}
+
+fn jpeg_content_indices(service: &Service) -> Vec<usize> {
+    service
+        .content_items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| is_jpeg_content(item).then_some(idx))
+        .collect()
+}
+
+fn is_jpeg_content(item: &ContentItem) -> bool {
+    matches!(item.content_type.as_str(), "image/jpeg" | "image/jpg")
+        || (item.bytes.len() >= 2 && item.bytes[0] == 0xFF && item.bytes[1] == 0xD8)
 }
 
 fn is_new_now_playing_item(previous: Option<&NowPlaying>, next: &NowPlaying) -> bool {
@@ -1637,6 +1827,69 @@ mod tests {
         .join("\n");
 
         assert!(rendered.contains("320×240"));
+    }
+
+    #[test]
+    fn cover_cycle_skips_non_jpeg_items() {
+        let mut state = AppState::new();
+        state.playing_sid = Some(0x1234);
+        state.ensemble.services.push(Service {
+            id: 0x1234,
+            label: "Radio".into(),
+            content_items: vec![
+                ContentItem {
+                    content_type: "image/png".into(),
+                    filename: "slide.png".into(),
+                    bytes: vec![0x89, b'P', b'N', b'G'],
+                    category_title: None,
+                    updated_at_unix_ms: 0,
+                },
+                ContentItem {
+                    content_type: "image/jpeg".into(),
+                    filename: "cover-a.jpg".into(),
+                    bytes: vec![0xFF, 0xD8],
+                    category_title: None,
+                    updated_at_unix_ms: 1,
+                },
+                ContentItem {
+                    content_type: "image/jpeg".into(),
+                    filename: "cover-b.jpg".into(),
+                    bytes: vec![0xFF, 0xD8],
+                    category_title: None,
+                    updated_at_unix_ms: 2,
+                },
+            ],
+            ..Default::default()
+        });
+
+        state.content_selection = 0;
+        assert_eq!(
+            state
+                .selected_or_latest_jpeg_content_item()
+                .map(|selected| selected.item.filename.as_str()),
+            Some("cover-b.jpg")
+        );
+
+        state.cycle_cover_next();
+        assert_eq!(state.content_selection, 1);
+        assert_eq!(
+            state
+                .selected_content_item()
+                .map(|item| item.filename.as_str()),
+            Some("cover-a.jpg")
+        );
+
+        state.cycle_cover_next();
+        assert_eq!(state.content_selection, 2);
+        assert_eq!(
+            state
+                .selected_content_item()
+                .map(|item| item.filename.as_str()),
+            Some("cover-b.jpg")
+        );
+
+        state.cycle_cover_next();
+        assert_eq!(state.content_selection, 1);
     }
 
     #[test]

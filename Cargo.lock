@@ -492,6 +492,7 @@ dependencies = [
  "env_logger",
  "fec",
  "image",
+ "jpeg-decoder",
  "log",
  "nix",
  "num-complex",
