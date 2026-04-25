@@ -41,6 +41,10 @@ pub struct MscDataGroup<'a> {
     /// `true` when the CRC was absent (nothing to verify) or verified. `false`
     /// when a CRC was signalled but the check failed.
     pub crc_ok: bool,
+    /// Total byte length of the DG within the input buffer (header + optional
+    /// extension/segment/UA fields + payload + optional CRC). Useful for
+    /// callers that greedy-parse a stream of concatenated DGs.
+    pub dg_len: usize,
 }
 
 /// Parse one MSC Data Group. Returns `None` when the buffer is too short for
@@ -167,6 +171,7 @@ pub fn parse_msc_data_group(bytes: &[u8]) -> Option<MscDataGroup<'_>> {
         transport_id,
         payload,
         crc_ok,
+        dg_len: crc_end,
     })
 }
 
