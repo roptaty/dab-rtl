@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ensemble::{MetadataSource, NowPlaying};
-use crate::mot::{MotAssembler, MotObject};
+use crate::mot::{crc16_ccitt, MotAssembler, MotObject};
 use crate::text::decode_dab_text_raw;
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -504,6 +504,21 @@ impl XPadAssembler {
         // Anything left in the sub-field after the data group is padding.
         // Clear so a subsequent CONT sub-field can't accidentally append to it.
         self.dls_dg_buffer.clear();
+        // Verify CRC-16/CCITT over header+body (last 2 bytes of dg are the CRC).
+        // Without this check, junk bytes that happen to fit the DG header
+        // structure are accepted as "valid" labels and corrupt the displayed
+        // text — common when the broadcaster also streams MOT slideshow and
+        // every audio frame carries multiple X-PAD sub-fields.
+        let stored_crc = ((dg[dg_len - 2] as u16) << 8) | dg[dg_len - 1] as u16;
+        let computed_crc = crc16_ccitt(&dg[..dg_len - 2]);
+        if computed_crc != stored_crc {
+            log::debug!(
+                "X-PAD DLS: CRC mismatch (computed={:04X} stored={:04X}), discarding DG",
+                computed_crc,
+                stored_crc
+            );
+            return None;
+        }
         self.process_dls_chunk(&dg)
     }
 
@@ -1198,7 +1213,9 @@ mod tests {
         logical.push(byte0);
         logical.push(byte1);
         logical.extend_from_slice(text);
-        logical.extend_from_slice(&[0x00, 0x00]); // CRC placeholder
+        let crc = crate::mot::crc16_ccitt(&logical);
+        logical.push((crc >> 8) as u8);
+        logical.push((crc & 0xFF) as u8);
         logical.reverse();
         logical
     }
@@ -1210,7 +1227,9 @@ mod tests {
         logical.push(byte0);
         logical.push(byte1);
         logical.extend_from_slice(payload);
-        logical.extend_from_slice(&[0x00, 0x00]); // CRC placeholder
+        let crc = crate::mot::crc16_ccitt(&logical);
+        logical.push((crc >> 8) as u8);
+        logical.push((crc & 0xFF) as u8);
         logical.reverse();
         logical
     }
@@ -1611,6 +1630,48 @@ mod tests {
             .process_dls_subfield(&seg1_dg, true)
             .expect("expected complete label");
         assert_eq!(meta.raw_text, "Silke - If The World Ended Today");
+    }
+
+    #[test]
+    fn xpad_dls_rejects_data_group_with_bad_crc() {
+        // Captured live (Channel 13B, 2026-04-25): when a station also
+        // streams MOT slideshow, every audio frame carries (MOT cont, DLS
+        // cont, DLS start) sub-fields. Some DLS-start sub-fields contain
+        // bytes that pass the body_len gate but are actually image / padding
+        // junk — note the FF 00 JPEG byte-stuffing pattern. Without CRC
+        // verification the parser accepted these as legitimate labels and
+        // the displayed text flipped to garbage between valid updates.
+        let mut asm = XPadAssembler::new();
+
+        // First feed a real, CRC-valid label so we have established state.
+        // Each DLS segment is its own data group started via AppType 2.
+        let mut seg0_logical =
+            build_dls_segment_physical(b"James TW - When ", true, true, false, 0, 0);
+        seg0_logical.reverse();
+        assert!(asm.process_dls_subfield(&seg0_logical, true).is_none());
+
+        let mut seg1_logical =
+            build_dls_segment_physical(b"You Love Someone", true, false, true, 0, 1);
+        seg1_logical.reverse();
+        let meta = asm
+            .process_dls_subfield(&seg1_logical, true)
+            .expect("expected valid label to assemble");
+        assert_eq!(meta.raw_text, "James TW - When You Love Someone");
+
+        // Now feed the corrupt sub-field captured in the log. h0=0xE5
+        // parses as a single-segment, non-command segment with body_len=6;
+        // dg_len=10. The bytes 0x29 0xB6 are NOT a valid CRC over the
+        // preceding 8 bytes, so the DG must be rejected.
+        let junk = [
+            0xE5u8, 0x81, 0xFF, 0x00, 0x67, 0xA1, 0x3E, 0x9D, 0x29, 0xB6, 0x11, 0x22,
+        ];
+        assert!(
+            asm.process_dls_subfield(&junk, true).is_none(),
+            "DG with bad CRC must not be accepted"
+        );
+        // The previously assembled label must still be intact.
+        let parsed = asm.try_assemble().expect("previous label must survive");
+        assert_eq!(parsed.text, "James TW - When You Love Someone");
     }
 
     #[test]

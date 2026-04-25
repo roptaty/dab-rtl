@@ -172,7 +172,7 @@ pub fn parse_msc_data_group(bytes: &[u8]) -> Option<MscDataGroup<'_>> {
 
 /// CRC-16/CCITT used by MSC data groups. Polynomial 0x1021, initial value
 /// 0xFFFF, output complemented (matches FIB CRC).
-fn crc16_ccitt(bytes: &[u8]) -> u16 {
+pub(crate) fn crc16_ccitt(bytes: &[u8]) -> u16 {
     let mut crc: u16 = 0xFFFF;
     for &b in bytes {
         crc ^= (b as u16) << 8;
