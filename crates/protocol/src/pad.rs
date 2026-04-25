@@ -90,6 +90,15 @@ pub struct XPadAssembler {
     command_last_seg_num: Option<u8>,
     /// Most recently decoded DL+ tags.
     dl_plus: Option<DlPlusFields>,
+    /// In-progress DLS data group reassembled across X-PAD sub-fields.
+    ///
+    /// A single DLS segment is a complete MSC data group of `2 + body_len + 2`
+    /// bytes (header, body, CRC). Broadcasters routinely split that data group
+    /// across multiple X-PAD CI sub-fields: app type 2 (DLS start) carries the
+    /// first slice and app type 3 (DLS continuation) carries the rest.
+    /// Without reassembly, the continuation bytes look like a fresh DLS segment
+    /// header and get mis-parsed.
+    dls_dg_buffer: Vec<u8>,
     /// MSC Data Group + MOT reassembler for X-PAD slideshow transport.
     mot: MotAssembler,
     /// In-progress MSC Data Group bytes reassembled from AppTy 12/13 X-PAD
@@ -143,6 +152,7 @@ impl XPadAssembler {
             command_segments: BTreeMap::new(),
             command_last_seg_num: None,
             dl_plus: None,
+            dls_dg_buffer: Vec::new(),
             mot: MotAssembler::new(),
             mot_buffer: Vec::new(),
             mot_pending: Vec::new(),
@@ -159,6 +169,7 @@ impl XPadAssembler {
         self.command_segments.clear();
         self.command_last_seg_num = None;
         self.dl_plus = None;
+        self.dls_dg_buffer.clear();
         self.mot.reset();
         self.mot_buffer.clear();
         self.mot_pending.clear();
@@ -336,7 +347,8 @@ impl XPadAssembler {
             let mut chunk = xpad_area[xpad_area.len() - 4..xpad_area.len() - 1].to_vec();
             chunk.reverse();
             return match app_type {
-                APP_TYPE_DLS_START | APP_TYPE_DLS_CONT => self.process_dls_chunk(&chunk),
+                APP_TYPE_DLS_START => self.process_dls_subfield(&chunk, true),
+                APP_TYPE_DLS_CONT => self.process_dls_subfield(&chunk, false),
                 APP_TYPE_MOT_START => {
                     self.process_mot_chunk(&chunk, true);
                     None
@@ -393,8 +405,13 @@ impl XPadAssembler {
                 hex_dump(&chunk)
             );
             match app_type {
-                APP_TYPE_DLS_START | APP_TYPE_DLS_CONT => {
-                    if let Some(m) = self.process_dls_chunk(&chunk) {
+                APP_TYPE_DLS_START => {
+                    if let Some(m) = self.process_dls_subfield(&chunk, true) {
+                        metadata = Some(m);
+                    }
+                }
+                APP_TYPE_DLS_CONT => {
+                    if let Some(m) = self.process_dls_subfield(&chunk, false) {
                         metadata = Some(m);
                     }
                 }
@@ -412,6 +429,82 @@ impl XPadAssembler {
             }
         }
         metadata
+    }
+
+    /// Reassemble a DLS MSC data group across X-PAD sub-fields.
+    ///
+    /// Per ETSI EN 300 401 §7.4.5 the broadcaster splits a single DLS data
+    /// group (header + body + CRC) across one or more X-PAD CI sub-fields:
+    /// the first carries app type 2 (DLS start), subsequent ones app type 3
+    /// (DLS continuation). Treating each sub-field as a standalone segment
+    /// (the previous behaviour) misparsed continuation bytes as a fresh
+    /// segment header and lost most of the label.
+    fn process_dls_subfield(&mut self, chunk: &[u8], is_start: bool) -> Option<NowPlaying> {
+        if is_start {
+            if !self.dls_dg_buffer.is_empty() {
+                log::debug!(
+                    "X-PAD DLS: discarding {} unprocessed buffer bytes on new start",
+                    self.dls_dg_buffer.len()
+                );
+            }
+            self.dls_dg_buffer.clear();
+        } else if self.dls_dg_buffer.is_empty() {
+            log::debug!(
+                "X-PAD DLS: continuation sub-field with no preceding start, dropping {} bytes",
+                chunk.len()
+            );
+            return None;
+        }
+        if self.dls_dg_buffer.len() + chunk.len() > MAX_MOT_BUFFER {
+            log::debug!("X-PAD DLS: data group buffer overflow, resetting");
+            self.dls_dg_buffer.clear();
+            return None;
+        }
+        self.dls_dg_buffer.extend_from_slice(chunk);
+
+        if self.dls_dg_buffer.len() < 2 {
+            return None;
+        }
+        let header0 = self.dls_dg_buffer[0];
+        let header1 = self.dls_dg_buffer[1];
+        let is_command = (header0 & 0x10) != 0;
+        let body_len = if is_command {
+            let cmd_or_len = header0 & 0x0F;
+            match cmd_or_len {
+                0x01 => 0,                             // remove-label, no body
+                0x02 => (header1 as usize & 0x0F) + 1, // DL+ command
+                _ => {
+                    log::debug!(
+                        "X-PAD DLS: unknown command id {:#04X} in data group, abandoning",
+                        cmd_or_len
+                    );
+                    self.dls_dg_buffer.clear();
+                    return None;
+                }
+            }
+        } else {
+            (header0 as usize & 0x0F) + 1
+        };
+        let dg_len = 2 + body_len + 2; // header + body + CRC
+        if self.dls_dg_buffer.len() < dg_len {
+            log::info!(
+                "X-PAD DLS: data group incomplete ({}/{} bytes), waiting for continuation",
+                self.dls_dg_buffer.len(),
+                dg_len
+            );
+            return None;
+        }
+        let dg: Vec<u8> = self.dls_dg_buffer[..dg_len].to_vec();
+        log::info!(
+            "X-PAD DLS: data group complete ({} bytes, sub-field had {} bytes trailing): {}",
+            dg.len(),
+            self.dls_dg_buffer.len() - dg_len,
+            hex_dump(&dg)
+        );
+        // Anything left in the sub-field after the data group is padding.
+        // Clear so a subsequent CONT sub-field can't accidentally append to it.
+        self.dls_dg_buffer.clear();
+        self.process_dls_chunk(&dg)
     }
 
     /// Incorporate one X-PAD MOT sub-field into the in-progress MSC Data
@@ -1488,6 +1581,36 @@ mod tests {
             .expect("expected refreshed metadata");
         assert_eq!(refreshed.title.as_deref(), Some("Title"));
         assert_eq!(refreshed.artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn xpad_dls_data_group_reassembles_across_app_types_2_and_3() {
+        // Captured live (Channel 12C, 2026-04-25): broadcaster sends segment 0
+        // ("Silke - If The W" + CRC) split across two X-PAD sub-fields:
+        //   app type 2 (start): 4 bytes  4F 00 53 69         ← header + "Si"
+        //   app type 3 (cont):  16 bytes 6C 6B 65 ... BF 16   ← rest + CRC
+        // Then segment 1 ("orld Ended Today" + CRC) in one app-type-2 sub-field.
+        // Without data-group reassembly the continuation bytes get mis-parsed
+        // as a new segment and the label comes out as "- If Torld Ended Today".
+        let mut asm = XPadAssembler::new();
+
+        let start = [0x4Fu8, 0x00, 0x53, 0x69];
+        let cont = [
+            0x6Cu8, 0x6B, 0x65, 0x20, 0x2D, 0x20, 0x49, 0x66, 0x20, 0x54, 0x68, 0x65, 0x20, 0x57,
+            0xBF, 0x16,
+        ];
+        // process_dls_subfield is private but reachable from this same-crate test.
+        assert!(asm.process_dls_subfield(&start, true).is_none());
+        assert!(asm.process_dls_subfield(&cont, false).is_none());
+
+        let seg1_dg = [
+            0x2Fu8, 0x10, 0x6F, 0x72, 0x6C, 0x64, 0x20, 0x45, 0x6E, 0x64, 0x65, 0x64, 0x20, 0x54,
+            0x6F, 0x64, 0x61, 0x79, 0x33, 0x75, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let meta = asm
+            .process_dls_subfield(&seg1_dg, true)
+            .expect("expected complete label");
+        assert_eq!(meta.raw_text, "Silke - If The World Ended Today");
     }
 
     #[test]
