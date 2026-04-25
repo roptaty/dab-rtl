@@ -18,6 +18,7 @@ Thumbs.db
 
 # Logs
 *.log
+log*.txt
 
 # Local environment overrides
 .env
