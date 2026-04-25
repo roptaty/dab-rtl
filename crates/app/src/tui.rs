@@ -1461,12 +1461,29 @@ fn render_ascii_cover_art(f: &mut Frame, state: &mut AppState, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        state
+        let mut art_lines: Vec<Line> = state
             .ascii_art_cache
             .lines
             .iter()
             .map(|line| Line::from(Span::raw(line.clone())))
-            .collect()
+            .collect();
+        
+        // Add OCR text below the art if available
+        if let Some(selected) = state.selected_or_latest_jpeg_content_item() {
+            if let Some(ocr_text) = &selected.item.ocr_text {
+                if !ocr_text.is_empty() {
+                    art_lines.push(Line::from("")); // Empty line separator
+                    for line in ocr_text.lines() {
+                        art_lines.push(Line::from(Span::styled(
+                            line.to_string(),
+                            Style::default().fg(Color::White),
+                        )));
+                    }
+                }
+            }
+        }
+        
+        art_lines
     };
 
     let para = Paragraph::new(lines)
@@ -1755,6 +1772,7 @@ mod tests {
                     filename: "cover.jpg".into(),
                     bytes: vec![1, 2, 3],
                     category_title: None,
+                    ocr_text: None,
                     updated_at_unix_ms: 0,
                 },
                 ContentItem {
@@ -1762,6 +1780,7 @@ mod tests {
                     filename: "slide.png".into(),
                     bytes: vec![4, 5, 6],
                     category_title: Some("Now Playing".into()),
+                    ocr_text: None,
                     updated_at_unix_ms: 0,
                 },
             ],
@@ -1808,6 +1827,7 @@ mod tests {
                 filename: "cover.png".into(),
                 bytes: png,
                 category_title: None,
+                ocr_text: None,
                 updated_at_unix_ms: 0,
             }],
             ..Default::default()
@@ -1842,6 +1862,7 @@ mod tests {
                     filename: "slide.png".into(),
                     bytes: vec![0x89, b'P', b'N', b'G'],
                     category_title: None,
+                    ocr_text: None,
                     updated_at_unix_ms: 0,
                 },
                 ContentItem {
@@ -1849,6 +1870,7 @@ mod tests {
                     filename: "cover-a.jpg".into(),
                     bytes: vec![0xFF, 0xD8],
                     category_title: None,
+                    ocr_text: None,
                     updated_at_unix_ms: 1,
                 },
                 ContentItem {
@@ -1856,6 +1878,7 @@ mod tests {
                     filename: "cover-b.jpg".into(),
                     bytes: vec![0xFF, 0xD8],
                     category_title: None,
+                    ocr_text: None,
                     updated_at_unix_ms: 2,
                 },
             ],

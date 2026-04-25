@@ -30,6 +30,8 @@ use audio::DabPlusDecoder;
 #[cfg(feature = "mp2")]
 use audio::Mp2Decoder;
 use fec::ViterbiDecoder;
+use leptess::leptonica;
+use leptess::tesseract;
 use ofdm::OfdmProcessor;
 use protocol::{
     ensemble::{
@@ -1710,11 +1712,17 @@ impl PacketMotAssembler {
                     self.next_fallback_id += 1;
                     format!("cover-{}.{}", self.next_fallback_id, ext)
                 });
+            let ocr_text = if mime.starts_with("image/") {
+                perform_ocr(&obj.body, &mime)
+            } else {
+                None
+            };
             return vec![ContentItem {
                 content_type: mime,
                 filename,
                 bytes: obj.body,
                 category_title: obj.header.category_title.clone(),
+                ocr_text,
                 updated_at_unix_ms: unix_ms_now(),
             }];
         }
@@ -1744,11 +1752,17 @@ impl PacketMotAssembler {
                     self.next_fallback_id += 1;
                     format!("cover-{}.{}", self.next_fallback_id, ext)
                 });
+            let ocr_text = if content_type.starts_with("image/") {
+                perform_ocr(&payload, content_type)
+            } else {
+                None
+            };
             extracted.push(ContentItem {
                 content_type: content_type.to_string(),
                 filename,
                 bytes: payload,
                 category_title: None,
+                ocr_text,
                 updated_at_unix_ms: unix_ms_now(),
             });
             state.fallback_buffer.drain(..end);
@@ -1794,14 +1808,43 @@ fn drain_xpad_mot(
                 *fallback_id += 1;
                 format!("xpad-{}.{}", *fallback_id, ext)
             });
+        let ocr_text = if mime.starts_with("image/") {
+            perform_ocr(&obj.body, &mime)
+        } else {
+            None
+        };
         let content = ContentItem {
             content_type: mime,
             filename,
             bytes: obj.body,
             category_title: obj.header.category_title.clone(),
+            ocr_text,
             updated_at_unix_ms: unix_ms_now(),
         };
         let _ = update_tx.try_send(PipelineUpdate::Content { sid, content });
+    }
+}
+
+fn perform_ocr(bytes: &[u8], mime: &str) -> Option<String> {
+    let pix = match mime {
+        "image/png" => leptonica::Pix::read_mem(bytes),
+        "image/jpeg" => leptonica::Pix::read_mem(bytes),
+        "image/gif" => leptonica::Pix::read_mem(bytes),
+        "image/bmp" => leptonica::Pix::read_mem(bytes),
+        _ => return None,
+    };
+    let pix = match pix {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let mut api = tesseract::TessApi::new(None, "eng").ok()?;
+    api.set_image(&pix);
+    let text = api.get_utf8_text().ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
     }
 }
 
