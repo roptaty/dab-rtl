@@ -164,9 +164,24 @@ pub fn open_stream(config: DeviceConfig, buf_size: u32) -> Result<SdrStream, Sdr
 
     let (tx, rx) = mpsc::sync_channel::<Vec<Complex32>>(8);
 
-    // Number of initial IQ sample pairs to discard while the PLL locks and
-    // AGC settles (~50 ms at 2.048 Msps ≈ 102 400 samples).
-    let discard_samples: usize = SAMPLE_RATE as usize / 20; // 50 ms
+    // Number of initial IQ sample pairs to discard while the RTL-SDR
+    // stabilises after a fresh device open (or retune).
+    //
+    // With AGC enabled, BOTH the tuner AGC (R820T) and the digital AGC
+    // (RTL2832U) need time to converge to the new signal level.  The tuner
+    // PLL also needs to lock onto the new centre frequency.  Empirically,
+    // soft-bit amplitudes at the FIC continue growing (mean_abs ≈ 80 → 240
+    // → 394 over the first ~200 ms) while AGC ramps gain, which produces
+    // amplitude-modulated samples → phase noise after the differential
+    // demod → all FIB CRCs fail.  Discarding 500 ms ensures the FIC sees
+    // settled, decode-quality samples on its very first frame; without
+    // this, scans on a freshly retuned channel often find nothing on
+    // marginal/weaker stations because the demod hasn't recovered before
+    // the per-channel time budget runs out.
+    //
+    // With fixed gain, only the PLL needs to settle (~150 ms is plenty).
+    let discard_ms: usize = if config.gain == GAIN_AUTO { 500 } else { 150 };
+    let discard_samples: usize = SAMPLE_RATE as usize * discard_ms / 1000;
 
     let thread = std::thread::Builder::new()
         .name("rtlsdr-reader".into())
@@ -408,11 +423,19 @@ pub fn open_tcp_stream(config: &TcpConfig) -> Result<SdrStream, SdrError> {
     let (tx, rx) = mpsc::sync_channel::<Vec<Complex32>>(8);
     let buf_size: usize = 32_768;
 
+    // Discard the same warm-up window we use for local USB devices: the
+    // remote rtl_tcp dongle has the same AGC / PLL settling behaviour after
+    // a freq change.  See `open_stream` for the full rationale.
+    let discard_ms: usize = if config.gain == GAIN_AUTO { 500 } else { 150 };
+    let discard_samples: usize = SAMPLE_RATE as usize * discard_ms / 1000;
+
     let thread = std::thread::Builder::new()
         .name("rtl-tcp-reader".into())
         .spawn(move || {
             let mut raw = vec![0u8; buf_size];
             let mut scratch = Vec::with_capacity(buf_size / 2);
+            let mut discarded: usize = 0;
+            let mut discard_logged = false;
             loop {
                 match tcp.read(&mut raw) {
                     Ok(0) => {
@@ -425,6 +448,22 @@ pub fn open_tcp_stream(config: &TcpConfig) -> Result<SdrStream, SdrError> {
                             continue;
                         }
                         iq_to_complex_into(&raw[..usable], &mut scratch);
+
+                        // Drop initial samples until AGC / PLL have settled.
+                        if discarded < discard_samples {
+                            discarded += scratch.len();
+                            scratch.clear();
+                            if discarded >= discard_samples && !discard_logged {
+                                discard_logged = true;
+                                log::info!(
+                                    "rtl-tcp-reader: discarded {} initial samples ({:.0} ms)",
+                                    discarded,
+                                    discarded as f64 / SAMPLE_RATE as f64 * 1000.0
+                                );
+                            }
+                            continue;
+                        }
+
                         let samples = std::mem::take(&mut scratch);
                         if tx.send(samples).is_err() {
                             log::info!("rtl-tcp-reader: receiver dropped, stopping");
