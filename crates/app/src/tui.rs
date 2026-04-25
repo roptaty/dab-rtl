@@ -44,7 +44,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use protocol::{ContentItem, Ensemble, NowPlaying, Service};
+use protocol::{announcement_label, pty_label, ContentItem, Ensemble, NowPlaying, Service};
 
 use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 
@@ -65,6 +65,30 @@ pub struct DiscoveredService {
     pub mot_content_types: Vec<String>,
     pub codec: Option<String>,
     pub signal_quality_percent: Option<u8>,
+    pub pty: Option<u8>,
+}
+
+/// Snapshot of the audio stream and sub-channel parameters for the playing
+/// service, kept on `AppState` so the now-playing renderer can show them.
+#[derive(Clone, Default, Debug)]
+struct PlaybackStreamInfo {
+    pub bitrate_kbps: Option<u32>,
+    pub protection: Option<String>,
+    pub subch_id: Option<u8>,
+    pub sample_rate_hz: Option<u32>,
+    pub base_channels: Option<u8>,
+    pub sbr: bool,
+    pub ps: bool,
+    pub channel_name: Option<String>,
+    pub frequency_hz: Option<u32>,
+}
+
+/// Currently-active announcement for the playing service. `flags == 0` means
+/// no announcement is active and the banner should be hidden.
+#[derive(Clone, Copy, Default, Debug)]
+struct AnnouncementInfo {
+    pub flags: u16,
+    pub subch_id: Option<u8>,
 }
 
 /// Per-channel scan progress tracked by the TUI.
@@ -224,6 +248,10 @@ struct AppState {
     pending_image_view: bool,
     /// Cached ASCII cover art for the selected JPEG and terminal size.
     ascii_art_cache: AsciiArtCache,
+    /// Latest stream/sub-channel info for the playing service, from PlaybackMeta.
+    playback_stream: PlaybackStreamInfo,
+    /// Currently-active announcement for the playing service.
+    current_announcement: Option<AnnouncementInfo>,
 }
 
 impl AppState {
@@ -246,13 +274,25 @@ impl AppState {
             discovered: Vec::new(),
             scan_log: std::collections::VecDeque::new(),
             service_items: Vec::new(),
-            now_playing_lines: Self::build_now_playing_lines(None, "", None, None, 0, None, None),
+            now_playing_lines: Self::build_now_playing_lines(
+                None,
+                "",
+                None,
+                None,
+                0,
+                None,
+                None,
+                &PlaybackStreamInfo::default(),
+                None,
+            ),
             content_selection: 0,
             codec: None,
             signal_quality_percent: None,
             scan_log_title: " Scan Log ".into(),
             pending_image_view: false,
             ascii_art_cache: AsciiArtCache::default(),
+            playback_stream: PlaybackStreamInfo::default(),
+            current_announcement: None,
         }
     }
 
@@ -261,7 +301,11 @@ impl AppState {
         if !self.discovered.is_empty() {
             self.service_items.extend(self.discovered.iter().map(|s| {
                 let tag = if s.is_dab_plus { "" } else { " [DAB Legacy]" };
-                format!("{}{tag}", s.label)
+                let pty_chip = s
+                    .pty
+                    .map(|c| format!(" [{}]", pty_label(c)))
+                    .unwrap_or_default();
+                format!("{}{tag}{pty_chip}", s.label)
             }));
         } else {
             self.service_items
@@ -272,7 +316,12 @@ impl AppState {
                         s.label.clone()
                     };
                     let tag = if s.is_dab_plus { "" } else { " [DAB Legacy]" };
-                    format!("{label}{tag}")
+                    let pty_chip = s
+                        .pty_dynamic
+                        .or(s.pty_static)
+                        .map(|c| format!(" [{}]", pty_label(c)))
+                        .unwrap_or_default();
+                    format!("{label}{tag}{pty_chip}")
                 }));
         }
     }
@@ -306,6 +355,8 @@ impl AppState {
             self.content_selection,
             self.codec.as_deref(),
             self.signal_quality_percent,
+            &self.playback_stream,
+            self.current_announcement,
         );
     }
 
@@ -314,6 +365,7 @@ impl AppState {
         self.scan_log_title = format!(" Scan Log — {found} stations found so far ");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_now_playing_lines(
         playing_label: Option<&str>,
         ensemble_label: &str,
@@ -322,22 +374,45 @@ impl AppState {
         content_selection: usize,
         codec: Option<&str>,
         signal_quality_percent: Option<u8>,
+        stream: &PlaybackStreamInfo,
+        announcement: Option<AnnouncementInfo>,
     ) -> Vec<Line<'static>> {
         if let Some(label) = playing_label {
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        "Now playing: ",
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(label.to_string()),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("Ensemble: ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(ensemble_label.to_string()),
-                ]),
-            ];
+            let mut lines = Vec::new();
+            // Banner first so it sits at the very top of the panel.
+            if let Some(ann) = announcement.filter(|a| a.flags != 0) {
+                let bit = ann.flags.trailing_zeros() as u8;
+                let priority_color = match bit {
+                    0 => Color::Red,        // Alarm
+                    1 | 4 => Color::Yellow, // Traffic / News flash
+                    _ => Color::Blue,
+                };
+                let suffix = ann
+                    .subch_id
+                    .map(|s| format!(" (SubCh {s})"))
+                    .unwrap_or_default();
+                let banner = format!(" ▶ {} announcement{} ", announcement_label(bit), suffix);
+                lines.push(Line::from(Span::styled(
+                    banner,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(priority_color)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Now playing: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(label.to_string()),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Ensemble: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(ensemble_label.to_string()),
+            ]));
             if let Some(codec) = codec {
                 lines.push(Line::from(vec![
                     Span::styled("Codec: ", Style::default().fg(Color::DarkGray)),
@@ -349,6 +424,33 @@ impl AppState {
                     Span::styled("Reception: ", Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("{signal_quality_percent}%")),
                 ]));
+            }
+            // Stream / Bitrate / Channel / Genre lines.
+            if let Some(stream_line) = format_stream_line(stream) {
+                lines.push(Line::from(vec![
+                    Span::styled("Stream: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(stream_line),
+                ]));
+            }
+            if let Some(rate_line) = format_bitrate_line(stream) {
+                lines.push(Line::from(vec![
+                    Span::styled("Bitrate: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(rate_line),
+                ]));
+            }
+            if let Some(channel_line) = format_channel_line(stream) {
+                lines.push(Line::from(vec![
+                    Span::styled("Channel: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(channel_line),
+                ]));
+            }
+            if let Some(svc) = service {
+                if let Some(code) = svc.pty_dynamic.or(svc.pty_static) {
+                    lines.push(Line::from(vec![
+                        Span::styled("Genre: ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(pty_label(code).to_string()),
+                    ]));
+                }
             }
             if let Some(service) = service {
                 let app_labels = service.advertised_app_labels();
@@ -712,6 +814,7 @@ impl AppState {
                         mot_content_types: svc.mot_content_types.clone(),
                         codec: None,
                         signal_quality_percent: None,
+                        pty: svc.pty_dynamic.or(svc.pty_static),
                     },
                 )
             })
@@ -752,6 +855,7 @@ impl AppState {
                     if let Some(existing) = scan.services.iter_mut().find(|s| s.sid == sid) {
                         existing.label = entry.label.clone();
                         existing.is_dab_plus = entry.is_dab_plus;
+                        existing.pty = entry.pty;
                     } else {
                         scan.services.push(entry);
                     }
@@ -927,6 +1031,8 @@ fn run_loop(
                             .to_string()
                         });
                     state.signal_quality_percent = None;
+                    state.playback_stream = PlaybackStreamInfo::default();
+                    state.current_announcement = None;
                     if state.scan_state.is_none() {
                         state.mode = UiMode::Playback;
                     }
@@ -970,10 +1076,30 @@ fn run_loop(
                     sid,
                     codec,
                     signal_quality_percent,
+                    bitrate_kbps,
+                    protection,
+                    subch_id,
+                    sample_rate_hz,
+                    base_channels,
+                    sbr,
+                    ps,
+                    channel_name,
+                    frequency_hz,
                 } => {
                     if state.playing_sid == Some(sid) {
                         state.codec = Some(codec.clone());
                         state.signal_quality_percent = Some(signal_quality_percent);
+                        state.playback_stream = PlaybackStreamInfo {
+                            bitrate_kbps,
+                            protection,
+                            subch_id,
+                            sample_rate_hz,
+                            base_channels,
+                            sbr,
+                            ps,
+                            channel_name,
+                            frequency_hz,
+                        };
                     }
                     if let Some(entry) = state.discovered.iter_mut().find(|s| s.sid == sid) {
                         entry.codec = Some(codec);
@@ -981,6 +1107,21 @@ fn run_loop(
                     }
                     state.rebuild_now_playing();
                     dirty = true;
+                }
+                PipelineUpdate::Announcement {
+                    sid,
+                    flags,
+                    subch_id,
+                } => {
+                    if state.playing_sid == Some(sid) {
+                        state.current_announcement = if flags == 0 {
+                            None
+                        } else {
+                            Some(AnnouncementInfo { flags, subch_id })
+                        };
+                        state.rebuild_now_playing();
+                        dirty = true;
+                    }
                 }
                 PipelineUpdate::Content { sid, content } => {
                     if let Some(svc) = state.ensemble.services.iter_mut().find(|s| s.id == sid) {
@@ -1224,6 +1365,8 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                 let _ = handle.cmd_tx.try_send(PipelineCmd::Stop);
                 state.playing_sid = None;
                 state.playing_label = None;
+                state.playback_stream = PlaybackStreamInfo::default();
+                state.current_announcement = None;
                 state.status = "Stopped".into();
                 state.mode = UiMode::Browse;
             }
@@ -1257,6 +1400,8 @@ fn handle_key(code: KeyCode, state: &mut AppState, handle: &PipelineHandle) {
                 let _ = handle.cmd_tx.try_send(PipelineCmd::Stop);
                 state.playing_sid = None;
                 state.playing_label = None;
+                state.playback_stream = PlaybackStreamInfo::default();
+                state.current_announcement = None;
                 state.status = "Stopped".into();
                 state.mode = UiMode::Browse;
             }
@@ -1656,6 +1801,57 @@ fn sanitize_download_name(name: &str, content_type: &str) -> String {
     clean
 }
 
+/// "48 kHz stereo · SBR · PS" — only the parts we actually know.
+fn format_stream_line(stream: &PlaybackStreamInfo) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(sr) = stream.sample_rate_hz {
+        let mode = match stream.base_channels {
+            Some(1) => " mono",
+            Some(2) => " stereo",
+            _ => "",
+        };
+        parts.push(format!("{} kHz{}", sr / 1000, mode));
+    }
+    if stream.sbr {
+        parts.push("SBR".into());
+    }
+    if stream.ps {
+        parts.push("PS".into());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn format_bitrate_line(stream: &PlaybackStreamInfo) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(kbps) = stream.bitrate_kbps {
+        parts.push(format!("{kbps} kbps"));
+    }
+    if let Some(prot) = stream.protection.as_deref() {
+        parts.push(prot.to_string());
+    }
+    if let Some(subch) = stream.subch_id {
+        parts.push(format!("SubCh {subch}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn format_channel_line(stream: &PlaybackStreamInfo) -> Option<String> {
+    match (stream.channel_name.as_deref(), stream.frequency_hz) {
+        (Some(name), Some(hz)) => Some(format!("{name} ({:.3} MHz)", hz as f64 / 1e6)),
+        (Some(name), None) => Some(name.to_string()),
+        (None, Some(hz)) => Some(format!("{:.3} MHz", hz as f64 / 1e6)),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1670,6 +1866,97 @@ mod tests {
         let (_update_tx, update_rx) = mpsc::sync_channel(1);
         let (cmd_tx, _cmd_rx) = mpsc::sync_channel(4);
         PipelineHandle { update_rx, cmd_tx }
+    }
+
+    #[test]
+    fn format_stream_line_includes_known_parts_only() {
+        let stream = PlaybackStreamInfo {
+            sample_rate_hz: Some(48_000),
+            base_channels: Some(2),
+            sbr: true,
+            ps: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_stream_line(&stream),
+            Some("48 kHz stereo · SBR".into())
+        );
+        assert_eq!(format_stream_line(&PlaybackStreamInfo::default()), None);
+    }
+
+    #[test]
+    fn format_bitrate_line_combines_fields() {
+        let stream = PlaybackStreamInfo {
+            bitrate_kbps: Some(96),
+            protection: Some("EEP-3A".into()),
+            subch_id: Some(6),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_bitrate_line(&stream),
+            Some("96 kbps · EEP-3A · SubCh 6".into())
+        );
+    }
+
+    #[test]
+    fn format_channel_line_renders_name_and_freq() {
+        let stream = PlaybackStreamInfo {
+            channel_name: Some("12B".into()),
+            frequency_hz: Some(225_648_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_channel_line(&stream),
+            Some("12B (225.648 MHz)".into())
+        );
+    }
+
+    #[test]
+    fn build_now_playing_lines_renders_announcement_banner() {
+        let rendered = AppState::build_now_playing_lines(
+            Some("Radio"),
+            "Ensemble",
+            None,
+            None,
+            0,
+            None,
+            None,
+            &PlaybackStreamInfo::default(),
+            Some(AnnouncementInfo {
+                flags: 1 << 4,
+                subch_id: Some(7),
+            }),
+        )
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(rendered.contains("News Flash announcement"));
+        assert!(rendered.contains("SubCh 7"));
+    }
+
+    #[test]
+    fn build_now_playing_lines_renders_genre_from_pty() {
+        let service = Service {
+            pty_static: Some(10), // Pop Music
+            ..Default::default()
+        };
+        let rendered = AppState::build_now_playing_lines(
+            Some("Radio"),
+            "Ensemble",
+            Some(&service),
+            None,
+            0,
+            None,
+            None,
+            &PlaybackStreamInfo::default(),
+            None,
+        )
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(rendered.contains("Genre: Pop Music"));
     }
 
     #[test]
@@ -1704,6 +1991,8 @@ mod tests {
             0,
             Some("HE-AAC v2"),
             Some(87),
+            &PlaybackStreamInfo::default(),
+            None,
         );
         let rendered = lines
             .iter()
@@ -1776,6 +2065,8 @@ mod tests {
             1,
             None,
             None,
+            &PlaybackStreamInfo::default(),
+            None,
         );
         let rendered = lines
             .iter()
@@ -1819,6 +2110,8 @@ mod tests {
             None,
             0,
             None,
+            None,
+            &PlaybackStreamInfo::default(),
             None,
         )
         .iter()
@@ -1911,6 +2204,8 @@ mod tests {
             0,
             None,
             None,
+            &PlaybackStreamInfo::default(),
+            None,
         )
         .iter()
         .map(|line| line.to_string())
@@ -1940,6 +2235,8 @@ mod tests {
             Some(&now_playing),
             0,
             None,
+            None,
+            &PlaybackStreamInfo::default(),
             None,
         )
         .iter()

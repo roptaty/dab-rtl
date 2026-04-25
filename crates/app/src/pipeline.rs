@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use audio::DabPlusDecoder;
 #[cfg(feature = "mp2")]
 use audio::Mp2Decoder;
+use audio::{DabPlusDecoder, DabPlusFormat};
 use fec::ViterbiDecoder;
 use ofdm::OfdmProcessor;
 use protocol::{
@@ -55,11 +55,30 @@ pub enum PipelineUpdate {
     Status(String),
     /// Structured now-playing metadata updated for a service.
     NowPlaying { sid: u32, metadata: NowPlaying },
-    /// Playback metadata such as codec and signal quality updated for a service.
+    /// Playback metadata such as codec, signal quality, sub-channel
+    /// parameters and audio stream format updated for a service.
     PlaybackMeta {
         sid: u32,
         codec: String,
         signal_quality_percent: u8,
+        bitrate_kbps: Option<u32>,
+        protection: Option<String>,
+        subch_id: Option<u8>,
+        sample_rate_hz: Option<u32>,
+        base_channels: Option<u8>,
+        sbr: bool,
+        ps: bool,
+        channel_name: Option<String>,
+        frequency_hz: Option<u32>,
+    },
+    /// Currently-active announcements for the playing service. `flags` is the
+    /// OR of asw_flags across all clusters this service belongs to that are
+    /// active in `Ensemble.active_announcements`. `flags == 0` means no
+    /// announcement is active.
+    Announcement {
+        sid: u32,
+        flags: u16,
+        subch_id: Option<u8>,
     },
     /// Downloadable slideshow / cover-art content updated for a service.
     Content { sid: u32, content: ContentItem },
@@ -419,8 +438,14 @@ fn run_pipeline(
         let mut pending_retune: Option<u32> = None;
         let mut last_playing_announced: Option<u32> = None;
         let mut cif_soft = Vec::<f32>::with_capacity(18 * 3072);
-        let mut last_signal_quality: Option<u8> = None;
+        let mut playback_meta_cache = PlaybackMetaCache::default();
         let mut signal_tracker = PlaybackSignalTracker::new();
+        let mut announcement_tracker = AnnouncementTracker::default();
+        // Channel name string for the currently-tuned frequency, used by the
+        // playback meta event so the TUI can show "12B (225.648 MHz)".
+        // Reassigned each pipeline-loop iteration via `current_freq_hz`.
+        let channel_name: Option<String> =
+            crate::freq_to_channel_name(current_freq_hz).map(str::to_string);
         #[cfg(not(feature = "mp2"))]
         let mut warned_mp2_unsupported = false;
 
@@ -443,8 +468,9 @@ fn run_pipeline(
                                 metadata_generation.wrapping_add(1),
                                 MetadataWorker::bump_generation,
                             );
-                            last_signal_quality = None;
+                            playback_meta_cache = PlaybackMetaCache::default();
                             signal_tracker.reset();
+                            announcement_tracker.reset();
                             last_playing_announced = None;
                             #[cfg(not(feature = "mp2"))]
                             {
@@ -458,8 +484,9 @@ fn run_pipeline(
                                 metadata_generation.wrapping_add(1),
                                 MetadataWorker::bump_generation,
                             );
-                            last_signal_quality = None;
+                            playback_meta_cache = PlaybackMetaCache::default();
                             signal_tracker.reset();
+                            announcement_tracker.reset();
                             last_playing_announced = None;
                             #[cfg(not(feature = "mp2"))]
                             {
@@ -482,17 +509,22 @@ fn run_pipeline(
             }
 
             if let Some(sid) = playing_sid {
-                if let Some(component) = find_component(fic.handler.ensemble(), sid) {
+                let ens_snap = fic.handler.ensemble();
+                if let Some(component) = find_component(ens_snap, sid) {
                     if let Some(quality) = signal_tracker.current_quality() {
                         maybe_emit_playback_meta(
                             &update_tx,
                             sid,
                             component,
                             quality,
-                            &mut last_signal_quality,
+                            None,
+                            channel_name.as_deref(),
+                            current_freq_hz,
+                            &mut playback_meta_cache,
                         );
                     }
                 }
+                announcement_tracker.maybe_emit(&update_tx, sid, ens_snap);
             }
 
             // OFDM demodulation.
@@ -688,6 +720,11 @@ fn run_pipeline(
                                             Vec::new()
                                         }
                                     };
+                                    let audio_format = if frame.is_dab_plus {
+                                        dab_plus.last_format
+                                    } else {
+                                        None
+                                    };
                                     if pcm.is_empty() {
                                         log::debug!(
                                             "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
@@ -699,7 +736,10 @@ fn run_pipeline(
                                             sid,
                                             component,
                                             quality,
-                                            &mut last_signal_quality,
+                                            audio_format,
+                                            channel_name.as_deref(),
+                                            current_freq_hz,
+                                            &mut playback_meta_cache,
                                         );
                                         let (min, max) = pcm
                                             .iter()
@@ -720,7 +760,10 @@ fn run_pipeline(
                                             sid,
                                             component,
                                             quality,
-                                            &mut last_signal_quality,
+                                            audio_format,
+                                            channel_name.as_deref(),
+                                            current_freq_hz,
+                                            &mut playback_meta_cache,
                                         );
                                         log::debug!(
                                             "MSC: {} PCM samples ready but no audio device",
@@ -735,7 +778,10 @@ fn run_pipeline(
                                         sid,
                                         component,
                                         quality,
-                                        &mut last_signal_quality,
+                                        None,
+                                        channel_name.as_deref(),
+                                        current_freq_hz,
+                                        &mut playback_meta_cache,
                                     );
                                 }
                             }
@@ -1322,25 +1368,116 @@ impl PlaybackSignalTracker {
     }
 }
 
+/// Watches `Ensemble.active_announcements` and emits a `PipelineUpdate::Announcement`
+/// whenever the OR of `asw_flags` for the playing service's clusters changes.
+#[derive(Default)]
+struct AnnouncementTracker {
+    last_flags: Option<u16>,
+}
+
+impl AnnouncementTracker {
+    fn reset(&mut self) {
+        self.last_flags = None;
+    }
+
+    fn maybe_emit(
+        &mut self,
+        update_tx: &mpsc::SyncSender<PipelineUpdate>,
+        sid: u32,
+        ens: &Ensemble,
+    ) {
+        let svc = ens.services.iter().find(|s| s.id == sid);
+        let (flags, subch) = match svc {
+            Some(svc) if !svc.announcement_clusters.is_empty() => {
+                let mut flags = 0u16;
+                let mut subch: Option<u8> = None;
+                for cid in &svc.announcement_clusters {
+                    if let Some(ann) = ens.active_announcements.get(cid) {
+                        flags |= ann.asw_flags;
+                        if subch.is_none() {
+                            subch = Some(ann.subch_id);
+                        }
+                    }
+                }
+                (flags, subch)
+            }
+            _ => (0, None),
+        };
+        if self.last_flags == Some(flags) {
+            return;
+        }
+        self.last_flags = Some(flags);
+        let _ = update_tx.try_send(PipelineUpdate::Announcement {
+            sid,
+            flags,
+            subch_id: subch,
+        });
+    }
+}
+
+#[derive(Default, Clone)]
+struct PlaybackMetaCache {
+    signal_quality: Option<u8>,
+    sample_rate_hz: Option<u32>,
+    base_channels: Option<u8>,
+    sbr: bool,
+    ps: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn maybe_emit_playback_meta(
     update_tx: &mpsc::SyncSender<PipelineUpdate>,
     sid: u32,
     component: &Component,
     signal_quality_percent: u8,
-    last_signal_quality: &mut Option<u8>,
+    audio_format: Option<DabPlusFormat>,
+    channel_name: Option<&str>,
+    frequency_hz: u32,
+    cache: &mut PlaybackMetaCache,
 ) {
-    let should_emit = match last_signal_quality {
+    let format_changed = match (audio_format, cache.sample_rate_hz, cache.base_channels) {
+        (Some(f), Some(prev_sr), Some(prev_ch)) => {
+            f.sample_rate_hz != prev_sr
+                || f.base_channels != prev_ch
+                || f.sbr != cache.sbr
+                || f.ps != cache.ps
+        }
+        (Some(_), _, _) => true,
+        (None, _, _) => false,
+    };
+    let signal_changed = match cache.signal_quality {
         None => true,
         Some(prev) => prev.abs_diff(signal_quality_percent) >= 2,
     };
-    if should_emit {
-        *last_signal_quality = Some(signal_quality_percent);
-        let _ = update_tx.try_send(PipelineUpdate::PlaybackMeta {
-            sid,
-            codec: codec_label(component).to_string(),
-            signal_quality_percent,
-        });
+    if !signal_changed && !format_changed {
+        return;
     }
+    cache.signal_quality = Some(signal_quality_percent);
+    if let Some(f) = audio_format {
+        cache.sample_rate_hz = Some(f.sample_rate_hz);
+        cache.base_channels = Some(f.base_channels);
+        cache.sbr = f.sbr;
+        cache.ps = f.ps;
+    }
+    let frequency = if frequency_hz == 0 {
+        None
+    } else {
+        Some(frequency_hz)
+    };
+    let _ = update_tx.try_send(PipelineUpdate::PlaybackMeta {
+        sid,
+        codec: codec_label(component).to_string(),
+        signal_quality_percent,
+        bitrate_kbps: component.bitrate_kbps(),
+        protection: Some(component.protection.label()),
+        subch_id: Some(component.subchannel_id),
+        sample_rate_hz: cache.sample_rate_hz,
+        base_channels: cache.base_channels,
+        sbr: cache.sbr,
+        ps: cache.ps,
+        channel_name: channel_name.map(str::to_string),
+        frequency_hz: frequency,
+    });
 }
 
 fn decode_charset_text(bytes: &[u8], charset: u8) -> String {

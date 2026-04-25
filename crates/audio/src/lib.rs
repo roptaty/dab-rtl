@@ -2,7 +2,7 @@ pub mod decode;
 mod fdk;
 #[cfg(feature = "mp2")]
 pub use decode::{decode_mp2, Mp2Decoder};
-pub use decode::{firecode_check, DabPlusDecoder};
+pub use decode::{firecode_check, DabPlusDecoder, DabPlusFormat};
 
 /// Audio output via cpal (ALSA or PulseAudio on Linux).
 ///

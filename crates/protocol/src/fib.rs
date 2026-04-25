@@ -183,6 +183,9 @@ impl FibParser {
             2 => self.parse_fig_0_2(payload),
             3 => self.parse_fig_0_3(payload),
             13 => self.parse_fig_0_13(payload),
+            17 => self.parse_fig_0_17(payload),
+            18 => self.parse_fig_0_18(payload),
+            19 => self.parse_fig_0_19(payload),
             _ => {}
         }
     }
@@ -511,6 +514,154 @@ impl FibParser {
                     pending.len()
                 );
             }
+        }
+    }
+
+    /// FIG 0/17 — Programme Type (PTy), ETSI EN 300 401 §8.1.5.
+    ///
+    /// Layout per service entry (P/D=0):
+    ///   [SId: 16 bits]
+    ///   [SD:1 | P/S:1 | L:1 | CC:1 | Rfa:4]
+    ///   [Rfa1:1 | Rfu:2 | Int.code:5]
+    ///   [Language: 8 bits]   if L=1
+    ///   [Rfa:3 | NFC:5 | NFC × Cc-byte] if CC=1
+    ///
+    /// Static (S/D=0) and dynamic (S/D=1) PTy are stored separately on the
+    /// service so a TUI can prefer the dynamic value but fall back to static.
+    fn parse_fig_0_17(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+        while i + 4 <= data.len() {
+            let sid = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            let b0 = data[i + 2];
+            let b1 = data[i + 3];
+            i += 4;
+
+            let sd = (b0 >> 7) & 1;
+            let l_flag = (b0 >> 5) & 1;
+            let cc_flag = (b0 >> 4) & 1;
+            let int_code = b1 & 0x1F;
+
+            let language = if l_flag == 1 {
+                if i >= data.len() {
+                    return;
+                }
+                let lang = data[i];
+                i += 1;
+                Some(lang)
+            } else {
+                None
+            };
+
+            // Skip complementary codes (we don't surface them).
+            if cc_flag == 1 {
+                if i >= data.len() {
+                    return;
+                }
+                let nfc = (data[i] & 0x1F) as usize;
+                i += 1;
+                if i + nfc > data.len() {
+                    return;
+                }
+                i += nfc;
+            }
+
+            let svc = self.ensemble.get_or_insert_service(sid);
+            if sd == 0 {
+                svc.pty_static = Some(int_code);
+            } else {
+                svc.pty_dynamic = Some(int_code);
+            }
+            if let Some(lang) = language {
+                svc.language = Some(lang);
+            }
+            log::debug!(
+                "FIG 0/17: SId={:04X} SD={} PTy={} lang={:?}",
+                sid,
+                sd,
+                int_code,
+                language
+            );
+        }
+    }
+
+    /// FIG 0/18 — Announcement support, ETSI EN 300 401 §8.1.6.1.
+    ///
+    /// Layout per service entry (P/D=0):
+    ///   [SId: 16 bits]
+    ///   [Asu flags: 16 bits]
+    ///   [Rfa:5 | Number_of_clusters:3]
+    ///   [Cluster_Id × N: 8 bits each]
+    fn parse_fig_0_18(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+        while i + 5 <= data.len() {
+            let sid = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            let asu_flags = u16::from_be_bytes([data[i + 2], data[i + 3]]);
+            let num_clusters = (data[i + 4] & 0x07) as usize;
+            i += 5;
+
+            if i + num_clusters > data.len() {
+                return;
+            }
+            let clusters: Vec<u8> = data[i..i + num_clusters].to_vec();
+            i += num_clusters;
+
+            let svc = self.ensemble.get_or_insert_service(sid);
+            svc.announcement_support = asu_flags;
+            svc.announcement_clusters = clusters.clone();
+            log::debug!(
+                "FIG 0/18: SId={:04X} ASu=0x{:04X} clusters={:?}",
+                sid,
+                asu_flags,
+                clusters
+            );
+        }
+    }
+
+    /// FIG 0/19 — Announcement switching, ETSI EN 300 401 §8.1.6.2.
+    ///
+    /// Layout per cluster entry:
+    ///   [Cluster_Id: 8 bits]
+    ///   [Asw flags: 16 bits]
+    ///   [New_Flag:1 | Region_Flag:1 | Rfa:2 | SubChId:6]
+    ///   [Rfa:2 | Region_Id:6]   if Region_Flag=1
+    ///
+    /// `asw_flags == 0` is treated as "this announcement is no longer active"
+    /// and removes the cluster from `Ensemble.active_announcements`.
+    fn parse_fig_0_19(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+        while i + 4 <= data.len() {
+            let cluster_id = data[i];
+            let asw_flags = u16::from_be_bytes([data[i + 1], data[i + 2]]);
+            let b3 = data[i + 3];
+            let region_flag = (b3 >> 6) & 1;
+            let subch_id = b3 & 0x3F;
+            i += 4;
+
+            if region_flag == 1 {
+                if i >= data.len() {
+                    return;
+                }
+                i += 1; // skip region id byte
+            }
+
+            if asw_flags == 0 {
+                self.ensemble.active_announcements.remove(&cluster_id);
+            } else {
+                self.ensemble.active_announcements.insert(
+                    cluster_id,
+                    crate::ensemble::ActiveAnnouncement {
+                        asw_flags,
+                        subch_id,
+                    },
+                );
+            }
+            log::debug!(
+                "FIG 0/19: cluster={} ASw=0x{:04X} subch={} region_flag={}",
+                cluster_id,
+                asw_flags,
+                subch_id,
+                region_flag
+            );
         }
     }
 
@@ -926,6 +1077,128 @@ mod tests {
             comp.user_applications[0].uatype,
             UserApplication::UATYPE_SLIDESHOW
         );
+    }
+
+    #[test]
+    fn parse_fig_0_17_dynamic_pty_and_language() {
+        let mut parser = FibParser::new();
+        // SId=0xC221, S/D=1 (dynamic), L=1 (language present), CC=0,
+        // Int. PTy = 10 (Pop Music), Language = 0x09 (English).
+        // Byte 2: SD=1 << 7 | PS=0 | L=1 << 5 | CC=0 << 4 | Rfa=0 = 0xA0
+        // Byte 3: Rfa1=0 | Rfu=0 | Int.code=0x0A = 0x0A
+        let payload = [0xC2, 0x21, 0xA0, 0x0A, 0x09];
+        parser.parse_fig_0_17(&payload);
+
+        let svc = parser
+            .ensemble
+            .services
+            .iter()
+            .find(|s| s.id == 0xC221)
+            .expect("service created");
+        assert_eq!(svc.pty_dynamic, Some(10));
+        assert_eq!(svc.pty_static, None);
+        assert_eq!(svc.language, Some(0x09));
+    }
+
+    #[test]
+    fn parse_fig_0_17_static_pty_no_language() {
+        let mut parser = FibParser::new();
+        // SId=0xABCD, S/D=0 (static), L=0, CC=0, Int. PTy = 4 (Sport).
+        let payload = [0xAB, 0xCD, 0x00, 0x04];
+        parser.parse_fig_0_17(&payload);
+
+        let svc = &parser.ensemble.services[0];
+        assert_eq!(svc.pty_static, Some(4));
+        assert_eq!(svc.pty_dynamic, None);
+        assert_eq!(svc.language, None);
+    }
+
+    #[test]
+    fn parse_fig_0_17_skips_complementary_codes() {
+        let mut parser = FibParser::new();
+        // CC=1, NFC=2 (skip 2 bytes after the NFC byte).
+        // Byte 2: SD=0 | PS=0 | L=0 | CC=1 | Rfa=0 = 0x10
+        // Byte 3: Int.PTy = 1 (News)
+        // Byte 4: NFC=2
+        // Bytes 5-6: complementary codes (skipped)
+        // Then a second service entry to confirm we resumed correctly.
+        let payload = [
+            0x11, 0x11, 0x10, 0x01, 0x02, 0xAA, 0xBB, // first service (with CC)
+            0x22, 0x22, 0x00, 0x07, // second service: SD=0, no L/CC, PTy=7
+        ];
+        parser.parse_fig_0_17(&payload);
+
+        let s1 = parser
+            .ensemble
+            .services
+            .iter()
+            .find(|s| s.id == 0x1111)
+            .unwrap();
+        assert_eq!(s1.pty_static, Some(1));
+        let s2 = parser
+            .ensemble
+            .services
+            .iter()
+            .find(|s| s.id == 0x2222)
+            .unwrap();
+        assert_eq!(s2.pty_static, Some(7));
+    }
+
+    #[test]
+    fn parse_fig_0_18_records_support_and_clusters() {
+        let mut parser = FibParser::new();
+        // SId=0x1234, ASu=0x0012 (Road Traffic + News Flash), Num_clusters=2
+        // Cluster ids: 0x07, 0x09.
+        let payload = [0x12, 0x34, 0x00, 0x12, 0x02, 0x07, 0x09];
+        parser.parse_fig_0_18(&payload);
+
+        let svc = parser
+            .ensemble
+            .services
+            .iter()
+            .find(|s| s.id == 0x1234)
+            .expect("service created by FIG 0/18");
+        assert_eq!(svc.announcement_support, 0x0012);
+        assert_eq!(svc.announcement_clusters, vec![0x07, 0x09]);
+    }
+
+    #[test]
+    fn parse_fig_0_19_inserts_and_clears_active_clusters() {
+        let mut parser = FibParser::new();
+
+        // Activate cluster 0x07 with News Flash on subchannel 5.
+        // Byte 0: cluster_id = 0x07
+        // Bytes 1-2: ASw = 0x0010 (News Flash, bit 4)
+        // Byte 3: New=0 | Region=0 | Rfa=0 | SubChId=5 = 0x05
+        let activate = [0x07, 0x00, 0x10, 0x05];
+        parser.parse_fig_0_19(&activate);
+
+        let entry = parser
+            .ensemble
+            .active_announcements
+            .get(&0x07)
+            .expect("cluster present");
+        assert_eq!(entry.asw_flags, 0x0010);
+        assert_eq!(entry.subch_id, 5);
+
+        // Now deactivate by sending the same cluster with ASw=0.
+        let deactivate = [0x07, 0x00, 0x00, 0x05];
+        parser.parse_fig_0_19(&deactivate);
+        assert!(!parser.ensemble.active_announcements.contains_key(&0x07));
+    }
+
+    #[test]
+    fn parse_fig_0_19_skips_region_id_byte() {
+        let mut parser = FibParser::new();
+        // Region_Flag=1 → an extra byte follows the SubChId byte.
+        // Byte 3: New=0 | Region=1<<6 | Rfa=0 | SubChId=8 = 0x48
+        // Byte 4: region id (skipped)
+        let activate = [0x09, 0x00, 0x02, 0x48, 0xAA];
+        parser.parse_fig_0_19(&activate);
+
+        let entry = parser.ensemble.active_announcements.get(&0x09).unwrap();
+        assert_eq!(entry.asw_flags, 0x0002);
+        assert_eq!(entry.subch_id, 8);
     }
 
     #[test]

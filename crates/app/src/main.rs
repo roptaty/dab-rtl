@@ -164,6 +164,51 @@ fn resolve_channel(ch: &str) -> u32 {
     })
 }
 
+/// Reverse lookup: DAB Band III centre frequency (Hz) → channel name (e.g. "12B").
+pub fn freq_to_channel_name(hz: u32) -> Option<&'static str> {
+    match hz {
+        174_928_000 => Some("5A"),
+        176_640_000 => Some("5B"),
+        178_352_000 => Some("5C"),
+        180_064_000 => Some("5D"),
+        181_936_000 => Some("6A"),
+        183_648_000 => Some("6B"),
+        185_360_000 => Some("6C"),
+        187_072_000 => Some("6D"),
+        188_928_000 => Some("7A"),
+        190_640_000 => Some("7B"),
+        192_352_000 => Some("7C"),
+        194_064_000 => Some("7D"),
+        195_936_000 => Some("8A"),
+        197_648_000 => Some("8B"),
+        199_360_000 => Some("8C"),
+        201_072_000 => Some("8D"),
+        202_928_000 => Some("9A"),
+        204_640_000 => Some("9B"),
+        206_352_000 => Some("9C"),
+        208_064_000 => Some("9D"),
+        209_936_000 => Some("10A"),
+        211_648_000 => Some("10B"),
+        213_360_000 => Some("10C"),
+        215_072_000 => Some("10D"),
+        216_928_000 => Some("11A"),
+        218_640_000 => Some("11B"),
+        220_352_000 => Some("11C"),
+        222_064_000 => Some("11D"),
+        223_936_000 => Some("12A"),
+        225_648_000 => Some("12B"),
+        227_360_000 => Some("12C"),
+        229_072_000 => Some("12D"),
+        230_784_000 => Some("13A"),
+        232_496_000 => Some("13B"),
+        234_208_000 => Some("13C"),
+        235_776_000 => Some("13D"),
+        237_488_000 => Some("13E"),
+        239_200_000 => Some("13F"),
+        _ => None,
+    }
+}
+
 /// Normalise a `--tcp` address: append `:1234` if no port is given.
 fn normalise_tcp_addr(addr: &str) -> String {
     if addr.contains(':') {
@@ -666,12 +711,17 @@ fn cmd_play(
                 sid,
                 codec,
                 signal_quality_percent,
+                bitrate_kbps,
+                sample_rate_hz,
+                ..
             } => {
                 log::info!(
-                    "PlaybackMeta SId={:04X}: codec={} signal={}%",
+                    "PlaybackMeta SId={:04X}: codec={} signal={}% bitrate={:?}kbps sr={:?}Hz",
                     sid,
                     codec,
-                    signal_quality_percent
+                    signal_quality_percent,
+                    bitrate_kbps,
+                    sample_rate_hz,
                 );
             }
             PipelineUpdate::Content { sid, content } => {
@@ -681,6 +731,18 @@ fn cmd_play(
                     content.content_type,
                     content.filename,
                     content.bytes.len()
+                );
+            }
+            PipelineUpdate::Announcement {
+                sid,
+                flags,
+                subch_id,
+            } => {
+                log::info!(
+                    "Announcement SId={:04X}: flags=0x{:04X} subch={:?}",
+                    sid,
+                    flags,
+                    subch_id,
                 );
             }
         }

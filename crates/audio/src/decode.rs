@@ -261,6 +261,20 @@ impl AacState {
     }
 }
 
+/// Stream format extracted from the DAB+ superframe header byte
+/// (ETSI TS 102 563 Table 1).
+///
+/// `sample_rate_hz` is the actual output rate (32 000 or 48 000 Hz; the
+/// decoder upsamples internally when SBR is signalled and fdk-aac returned
+/// the half-rate core).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DabPlusFormat {
+    pub sample_rate_hz: u32,
+    pub base_channels: u8,
+    pub sbr: bool,
+    pub ps: bool,
+}
+
 /// Stateful DAB+ audio decoder.
 ///
 /// Accumulates raw bytes until a full superframe (5 CIFs) is available,
@@ -277,6 +291,9 @@ pub struct DabPlusDecoder {
     /// AU data (without CRC) from the most recently decoded superframe, for PAD
     /// extraction.  Populated by [`decode_superframe`] and drained by the caller.
     pub pad_aus: Vec<Vec<u8>>,
+    /// Format of the most recently decoded superframe (sample rate, channels,
+    /// SBR / PS flags).  `None` until the first successful decode.
+    pub last_format: Option<DabPlusFormat>,
 }
 
 impl DabPlusDecoder {
@@ -292,6 +309,7 @@ impl DabPlusDecoder {
             synced: false,
             aac: None,
             pad_aus: Vec::new(),
+            last_format: None,
         }
     }
 
@@ -437,6 +455,14 @@ impl DabPlusDecoder {
         };
 
         let channels: u8 = if aac_channel_mode == 0 { 1 } else { 2 };
+
+        // Surface the stream format for the caller (TUI / pipeline).
+        self.last_format = Some(DabPlusFormat {
+            sample_rate_hz: if dac_rate == 1 { 48_000 } else { 32_000 },
+            base_channels: channels,
+            sbr: sbr_flag != 0,
+            ps: ps_flag != 0,
+        });
 
         // AU[0] start offset — fixed per ETSI TS 102 563, Table 3 (dablin).
         let first_au_offset: usize = match (dac_rate, sbr_flag) {
