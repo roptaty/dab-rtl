@@ -44,7 +44,9 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use protocol::{announcement_label, pty_label, ContentItem, Ensemble, NowPlaying, Service};
+use protocol::{
+    announcement_label, displayable_pty_label, ContentItem, Ensemble, NowPlaying, Service,
+};
 
 use crate::pipeline::{PipelineCmd, PipelineHandle, PipelineUpdate};
 
@@ -303,7 +305,8 @@ impl AppState {
                 let tag = if s.is_dab_plus { "" } else { " [DAB Legacy]" };
                 let pty_chip = s
                     .pty
-                    .map(|c| format!(" [{}]", pty_label(c)))
+                    .and_then(displayable_pty_label)
+                    .map(|label| format!(" [{label}]"))
                     .unwrap_or_default();
                 format!("{}{tag}{pty_chip}", s.label)
             }));
@@ -319,7 +322,8 @@ impl AppState {
                     let pty_chip = s
                         .pty_dynamic
                         .or(s.pty_static)
-                        .map(|c| format!(" [{}]", pty_label(c)))
+                        .and_then(displayable_pty_label)
+                        .map(|label| format!(" [{label}]"))
                         .unwrap_or_default();
                     format!("{label}{tag}{pty_chip}")
                 }));
@@ -445,10 +449,14 @@ impl AppState {
                 ]));
             }
             if let Some(svc) = service {
-                if let Some(code) = svc.pty_dynamic.or(svc.pty_static) {
+                if let Some(label) = svc
+                    .pty_dynamic
+                    .or(svc.pty_static)
+                    .and_then(displayable_pty_label)
+                {
                     lines.push(Line::from(vec![
                         Span::styled("Genre: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(pty_label(code).to_string()),
+                        Span::raw(label.to_string()),
                     ]));
                 }
             }

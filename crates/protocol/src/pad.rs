@@ -119,6 +119,12 @@ struct DlPlusFields {
     /// Item Running bit from the DL+ command header.  `Some(false)` tells the
     /// receiver to clear any displayed title/artist/etc. for the service.
     item_running: Option<bool>,
+    /// Set when the DLS segment toggle flips while we still hold a cached DL+
+    /// command. Tag offsets reference the *previous* label, so applying them
+    /// to the new text would slice junk. The IT/IR flags are kept for status
+    /// signalling, but tag-based extraction is suppressed until the next DL+
+    /// command arrives confirming the same item.
+    pending_reconfirm: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -635,6 +641,10 @@ impl XPadAssembler {
                 let cached_it = self.dl_plus.as_ref().and_then(|d| d.item_toggle);
                 if cached_it.is_none() {
                     self.dl_plus = None;
+                } else if let Some(dl_plus) = self.dl_plus.as_mut() {
+                    // Tag offsets reference the previous label; suppress them
+                    // until the next DL+ command confirms the same item.
+                    dl_plus.pending_reconfirm = true;
                 }
                 log::debug!(
                     "X-PAD DLS: toggle changed ({} → {}) — new label (dl_plus kept={})",
@@ -999,6 +1009,7 @@ fn parse_dl_plus_command(bytes: &[u8]) -> Option<DlPlusFields> {
         tags,
         item_toggle,
         item_running,
+        pending_reconfirm: false,
     })
 }
 
@@ -1016,6 +1027,10 @@ fn apply_dl_plus_to_text(text: &str, dl_plus: Option<&DlPlusFields>) -> DlPlusVa
     let Some(dl_plus) = dl_plus else {
         return out;
     };
+    if dl_plus.pending_reconfirm {
+        log::info!("DL+ apply: skipped — cached tags pending re-confirm after DLS toggle flip");
+        return out;
+    }
     let chars: Vec<char> = text.chars().collect();
     log::info!(
         "DL+ apply: text={:?} ({} chars), tags={:?}",
@@ -1884,10 +1899,12 @@ mod tests {
     }
 
     #[test]
-    fn dls_toggle_flip_preserves_dl_plus_when_it_is_known() {
+    fn dls_toggle_flip_keeps_dl_plus_cached_but_suppresses_tags() {
         // When the DLS segment toggle flips (cosmetic label refresh) but we
-        // already have a cached DL+ IT, the DL+ tags should persist across
-        // the reset so the title/artist don't blink.
+        // already have a cached DL+ IT, the cache survives so item_toggle /
+        // item_running keep flowing — but tag offsets reference the previous
+        // label, so title/artist must be suppressed until the next DL+
+        // command confirms the same item against the new text.
         let mut asm = XPadAssembler::new();
 
         // Seed the cache: text + DL+ command with IT=0, IR=1.
@@ -1895,13 +1912,9 @@ mod tests {
         let cmd = [0x05u8, 0x01, 0, 4, 0x04, 5, 5];
         let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
 
-        let mut frame1 = vec![0u8; 8];
-        frame1.extend_from_slice(&text_chunk);
-        frame1.push(0x00);
-        frame1.push(0x82);
-        frame1.push(0x20);
-        frame1.push(0x02);
-        asm.push_mp2_frame_metadata(&frame1).expect("text");
+        let mut logical_text = text_chunk.clone();
+        logical_text.reverse();
+        asm.process_dls_chunk(&logical_text).expect("text");
         let mut logical_cmd = cmd_chunk.clone();
         logical_cmd.reverse();
         asm.process_dls_chunk(&logical_cmd)
@@ -1909,19 +1922,69 @@ mod tests {
         assert!(asm.dl_plus.is_some());
 
         // Now a new DLS segment arrives with the toggle flipped. The DL+
-        // cache should survive so subsequent assemblies can keep tagging.
+        // cache must survive (so IT/IR keep flowing) but tag-based slicing
+        // must be suppressed.
         let refreshed = build_dls_segment_physical(b"TitleArtist", true, true, true, 0, 0);
-        let mut frame2 = vec![0u8; 8];
-        frame2.extend_from_slice(&refreshed);
-        frame2.push(0x00);
-        frame2.push(0x82);
-        frame2.push(0x20);
-        frame2.push(0x02);
-        let meta2 = asm.push_mp2_frame_metadata(&frame2).expect("refresh");
+        let mut logical_refresh = refreshed.clone();
+        logical_refresh.reverse();
+        let meta2 = asm
+            .process_dls_chunk(&logical_refresh)
+            .expect("expected refresh metadata");
         assert!(asm.dl_plus.is_some(), "dl_plus must survive toggle flip");
-        assert_eq!(meta2.title.as_deref(), Some("Title"));
-        assert_eq!(meta2.artist.as_deref(), Some("Artist"));
+        assert_eq!(meta2.title, None);
+        assert_eq!(meta2.artist, None);
         assert_eq!(meta2.item_toggle, Some(false));
+        assert_eq!(meta2.item_running, Some(true));
+
+        // A fresh DL+ command (carrying the new DLS segment toggle) then
+        // re-confirms tagging against the new text.
+        let cmd_chunk2 = build_dl_plus_command_physical(&cmd, true);
+        let mut logical_cmd2 = cmd_chunk2;
+        logical_cmd2.reverse();
+        let reconfirmed = asm
+            .process_dls_chunk(&logical_cmd2)
+            .expect("expected metadata after re-confirm");
+        assert_eq!(reconfirmed.title.as_deref(), Some("Title"));
+        assert_eq!(reconfirmed.artist.as_deref(), Some("Artist"));
+    }
+
+    #[test]
+    fn dls_toggle_flip_does_not_apply_stale_tags_to_new_text() {
+        // Regression: a song "TitleArtist" with title=chars[0..5], artist=
+        // chars[5..11] was playing, then the broadcaster switched to a
+        // programme-intro label. Without the pending-reconfirm gate the
+        // cached tag offsets sliced the new text and surfaced bogus
+        // title/artist substrings.
+        let mut asm = XPadAssembler::new();
+
+        // Seed: text + DL+ command with IT=0, IR=1.
+        let text_chunk = build_dls_segment_physical(b"TitleArtist", false, true, true, 0, 0);
+        let cmd = [0x05u8, 0x01, 0, 4, 0x04, 5, 5];
+        let cmd_chunk = build_dl_plus_command_physical(&cmd, false);
+
+        let mut logical_text = text_chunk.clone();
+        logical_text.reverse();
+        asm.process_dls_chunk(&logical_text)
+            .expect("expected text metadata");
+        let mut logical_cmd = cmd_chunk.clone();
+        logical_cmd.reverse();
+        let initial = asm
+            .process_dls_chunk(&logical_cmd)
+            .expect("expected metadata");
+        assert_eq!(initial.title.as_deref(), Some("Title"));
+        assert_eq!(initial.artist.as_deref(), Some("Artist"));
+
+        // New, unrelated label with toggle flipped. Tag offsets from the
+        // previous label must NOT be applied — title/artist must clear.
+        let new_text = build_dls_segment_physical(b"DifferentText", true, true, true, 0, 0);
+        let mut logical_new = new_text.clone();
+        logical_new.reverse();
+        let meta2 = asm
+            .process_dls_chunk(&logical_new)
+            .expect("expected refreshed text metadata");
+        assert_eq!(meta2.raw_text, "DifferentText");
+        assert_eq!(meta2.title, None, "stale title must not slice new text");
+        assert_eq!(meta2.artist, None, "stale artist must not slice new text");
     }
 
     #[test]

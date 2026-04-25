@@ -304,6 +304,21 @@ fn uep_bitrate_kbps(size: u16) -> Option<u32> {
     }
 }
 
+/// Returns the displayable Programme Type label for `code`, or `None` if the
+/// code does not represent a useful genre to surface in the UI.
+///
+/// Codes 0 (None), 30 (Alarm Test), and 31 (Alarm) are excluded: 0 means the
+/// broadcaster did not assign a programme type, and 30/31 are alarm-system
+/// signalling, not a genre. Real alarm announcements surface through the
+/// announcement banner, not the genre line.
+pub fn displayable_pty_label(code: u8) -> Option<&'static str> {
+    let code = code & 0x1F;
+    if code == 0 || code >= 30 {
+        return None;
+    }
+    Some(pty_label(code))
+}
+
 /// EN 300 401 Annex A — Programme Type (PTy) labels.
 pub fn pty_label(code: u8) -> &'static str {
     match code & 0x1F {
@@ -430,6 +445,15 @@ mod tests {
         assert_eq!(pty_label(1), "News");
         assert_eq!(pty_label(10), "Pop Music");
         assert_eq!(pty_label(31), "Alarm");
+    }
+
+    #[test]
+    fn displayable_pty_label_filters_alarm_and_none() {
+        assert_eq!(displayable_pty_label(0), None);
+        assert_eq!(displayable_pty_label(1), Some("News"));
+        assert_eq!(displayable_pty_label(29), Some("Documentary"));
+        assert_eq!(displayable_pty_label(30), None);
+        assert_eq!(displayable_pty_label(31), None);
     }
 
     #[test]

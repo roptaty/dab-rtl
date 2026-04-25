@@ -7,8 +7,9 @@ pub mod pad;
 pub mod text;
 
 pub use ensemble::{
-    announcement_label, pty_label, ActiveAnnouncement, Component, ContentItem, Ensemble,
-    MetadataSource, NowPlaying, ProtectionLevel, Service, ServiceType, UserApplication,
+    announcement_label, displayable_pty_label, pty_label, ActiveAnnouncement, Component,
+    ContentItem, Ensemble, MetadataSource, NowPlaying, ProtectionLevel, Service, ServiceType,
+    UserApplication,
 };
 pub use fic::FicHandler;
 pub use mot::{parse_msc_data_group, MotAssembler, MotHeader, MotObject, MscDataGroup};
