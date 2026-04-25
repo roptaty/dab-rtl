@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup show
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Run cargo-audit
@@ -48,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup show
       - name: Install cargo-outdated
         run: cargo install cargo-outdated --locked
       - name: Check for outdated dependencies
@@ -66,25 +66,25 @@ jobs:
       - name: Detect unused dependencies
         run: cargo machete
 
-  # ── Static analysis with Opengrep ───────────────────────────────────────── #
-  opengrep:
-    name: Opengrep (SAST)
+  # ── Static analysis with Semgrep ───────────────────���──────────────────── #
+  semgrep:
+    name: Semgrep (SAST)
     runs-on: ubuntu-latest
     continue-on-error: true   # informational only
+    container:
+      image: semgrep/semgrep
     steps:
       - uses: actions/checkout@v4
-      - name: Install Opengrep
-        run: pip install opengrep --quiet
-      - name: Run Opengrep on Rust source
+      - name: Run Semgrep on Rust source
         run: |
-          opengrep scan \
+          semgrep scan \
             --config "p/rust" \
             --sarif \
-            --output opengrep-results.sarif \
+            --output semgrep-results.sarif \
             . || true
       - name: Upload SARIF results
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('semgrep-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: opengrep-results.sarif
+          sarif_file: semgrep-results.sarif
         continue-on-error: true

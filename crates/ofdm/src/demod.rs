@@ -30,6 +30,10 @@ pub struct OfdmDemod {
     prs_fft: Vec<Complex<f32>>,
     /// Carriers from the previous symbol (phase-reference or last data symbol).
     phase_ref: Vec<Complex32>,
+    /// Reused carrier extraction buffer for the current symbol.
+    current_carriers: Vec<Complex32>,
+    /// Reused soft-bit output buffer.
+    soft_bits: Vec<f32>,
     /// True once `process_phase_ref` has been called.
     has_ref: bool,
     /// True once the coarse offset has been determined.
@@ -57,6 +61,8 @@ impl OfdmDemod {
             fft_buf: vec![Complex::new(0.0, 0.0); FFT_SIZE],
             prs_fft: vec![Complex::new(0.0, 0.0); FFT_SIZE],
             phase_ref: vec![Complex32::new(0.0, 0.0); NUM_CARRIERS],
+            current_carriers: vec![Complex32::new(0.0, 0.0); NUM_CARRIERS],
+            soft_bits: vec![0.0; NUM_CARRIERS * 2],
             has_ref: false,
             coarse_locked: false,
             coarse_freq_offset: 0,
@@ -99,8 +105,7 @@ impl OfdmDemod {
         self.prs_fft.copy_from_slice(&self.fft_buf);
 
         // Extract PRS carriers (offset applied if already locked).
-        let carriers = self.extract_carriers_with_offset(self.coarse_freq_offset);
-        self.phase_ref.copy_from_slice(&carriers);
+        Self::extract_from_buf(&self.fft_buf, self.coarse_freq_offset, &mut self.phase_ref);
         self.has_ref = true;
         log::debug!("Phase reference symbol processed");
     }
@@ -113,10 +118,10 @@ impl OfdmDemod {
     ///
     /// Returns 3 072 soft bits in split layout `[Re(0)..Re(K-1), Im(0)..Im(K-1)]`
     /// or empty if PRS not yet processed.
-    pub fn demod_symbol(&mut self, symbol_samples: &[Complex32]) -> Vec<f32> {
+    pub fn demod_symbol(&mut self, symbol_samples: &[Complex32]) -> &[f32] {
         if !self.has_ref {
             log::warn!("demod_symbol called before phase reference is available");
-            return Vec::new();
+            return &[];
         }
 
         // FFT the data symbol with fine correction.
@@ -134,12 +139,15 @@ impl OfdmDemod {
             );
 
             // Re-extract PRS carriers with correct offset.
-            let prs_carriers = self.extract_from_buf(&self.prs_fft, self.coarse_freq_offset);
-            self.phase_ref.copy_from_slice(&prs_carriers);
+            Self::extract_from_buf(&self.prs_fft, self.coarse_freq_offset, &mut self.phase_ref);
         }
 
         // Extract data carriers with coarse offset.
-        let current = self.extract_carriers_with_offset(self.coarse_freq_offset);
+        Self::extract_from_buf(
+            &self.fft_buf,
+            self.coarse_freq_offset,
+            &mut self.current_carriers,
+        );
 
         // Differential product: z[k] = current[k] * conj(prev[k]) * residual_correction
         //
@@ -154,24 +162,26 @@ impl OfdmDemod {
         // b0 = d_{2k}   → sign of Q (im): positive = 0
         // b1 = d_{2k+1} → sign of I (re): positive = 0
         let correction = self.residual_correction;
-        let mut soft_bits = Vec::with_capacity(NUM_CARRIERS * 2);
+        let (soft_re, soft_im) = self.soft_bits.split_at_mut(NUM_CARRIERS);
 
         // Split layout: first all real parts, then all imaginary parts.
         // This matches welle.io's output format where the FIC accumulator
         // collects 2304 bits at a time across symbol boundaries.
-        for (&cur, &prev) in current.iter().zip(self.phase_ref.iter()) {
+        for (idx, (&cur, &prev)) in self
+            .current_carriers
+            .iter()
+            .zip(self.phase_ref.iter())
+            .enumerate()
+        {
             let z = (cur * prev.conj()) * correction;
-            soft_bits.push(z.re); // I axis (first half)
-        }
-        for (&cur, &prev) in current.iter().zip(self.phase_ref.iter()) {
-            let z = (cur * prev.conj()) * correction;
-            soft_bits.push(z.im); // Q axis (second half)
+            soft_re[idx] = z.re;
+            soft_im[idx] = z.im;
         }
 
         // Update previous carriers for the next symbol.
-        self.phase_ref.copy_from_slice(&current);
+        self.phase_ref.copy_from_slice(&self.current_carriers);
 
-        soft_bits
+        &self.soft_bits
     }
 
     // ------------------------------------------------------------------ //
@@ -253,10 +263,13 @@ impl OfdmDemod {
 
         let fine_offset = self.fine_freq_offset;
         let phase_step = -2.0 * PI * fine_offset / FFT_SIZE as f32;
+        let step = Complex32::new(phase_step.cos(), phase_step.sin());
+        let mut correction = Complex32::new(1.0, 0.0);
         for (i, (dst, &src)) in self.fft_buf.iter_mut().zip(window.iter()).enumerate() {
             if fine_offset.abs() > 1e-6 {
-                let phase = phase_step * i as f32;
-                let correction = Complex32::new(phase.cos(), phase.sin());
+                if i > 0 {
+                    correction *= step;
+                }
                 let corrected = src * correction;
                 *dst = Complex::new(corrected.re, corrected.im);
             } else {
@@ -270,14 +283,9 @@ impl OfdmDemod {
         self.fft.process(&mut self.fft_buf);
     }
 
-    /// Extract carriers from `self.fft_buf` with a given bin offset.
-    fn extract_carriers_with_offset(&self, offset: i32) -> Vec<Complex32> {
-        self.extract_from_buf(&self.fft_buf, offset)
-    }
-
     /// Extract active carriers from an arbitrary FFT buffer with offset.
-    fn extract_from_buf(&self, buf: &[Complex<f32>], offset: i32) -> Vec<Complex32> {
-        let mut carriers = Vec::with_capacity(NUM_CARRIERS);
+    fn extract_from_buf(buf: &[Complex<f32>], offset: i32, out: &mut [Complex32]) {
+        let mut out_idx = 0usize;
         for k in CARRIER_MIN..=CARRIER_MAX {
             if k == 0 {
                 continue;
@@ -285,9 +293,14 @@ impl OfdmDemod {
             let base_bin = carrier_to_fft_bin(k) as i32;
             let bin = ((base_bin + offset + FFT_SIZE as i32) as usize) % FFT_SIZE;
             let c = buf[bin];
-            carriers.push(Complex32::new(c.re, c.im));
+            if out_idx < out.len() {
+                out[out_idx] = Complex32::new(c.re, c.im);
+                out_idx += 1;
+            }
         }
-        carriers
+        for dst in out[out_idx..].iter_mut() {
+            *dst = Complex32::new(0.0, 0.0);
+        }
     }
 }
 

@@ -184,7 +184,7 @@ fn try_decode_symbol(
     let im_di = deinterleaver.deinterleave(&im_ch);
 
     let mut soft: Vec<f32> = Vec::with_capacity(NUM_CARRIERS * 2);
-    for (r, i) in re_di.into_iter().zip(im_di.into_iter()) {
+    for (r, i) in re_di.into_iter().zip(im_di) {
         soft.push(r);
         soft.push(i);
     }
@@ -363,7 +363,7 @@ fn brute_force_coarse_offset() {
         let im_di = deinterleaver.deinterleave(&im_ch);
 
         let mut soft: Vec<f32> = Vec::with_capacity(NUM_CARRIERS * 2);
-        for (r, i) in re_di.into_iter().zip(im_di.into_iter()) {
+        for (r, i) in re_di.into_iter().zip(im_di) {
             soft.push(r);
             soft.push(i);
         }

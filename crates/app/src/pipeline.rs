@@ -1,3 +1,4 @@
+use std::collections::hash_map::DefaultHasher;
 /// DAB receive pipeline.
 ///
 /// Connects: SDR → OFDM → FIC decoder → MSC decoder → MP2 decode → audio out
@@ -16,17 +17,27 @@
 ///
 /// MSC decoding (per CIF = 18 symbols = 55296 soft bits = 864 CUs):
 ///   Extract target subchannel (start_address … start_address+size CUs)
-///   → EEP depuncture → Viterbi → pack bytes → MP2 decoder
+///   → EEP depuncture → Viterbi → pack bytes → audio decoder
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use audio::{DabPlusDecoder, Mp2Decoder};
+use audio::DabPlusDecoder;
+#[cfg(feature = "mp2")]
+use audio::Mp2Decoder;
 use fec::ViterbiDecoder;
 use ofdm::OfdmProcessor;
 use protocol::{
-    ensemble::{Component, ProtectionLevel},
-    Ensemble, FicHandler,
+    ensemble::{
+        Component, ContentItem, MetadataSource, NowPlaying, ProtectionLevel, ServiceType,
+        UserApplication,
+    },
+    mot::MotAssembler,
+    Ensemble, FicHandler, XPadAssembler,
 };
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -39,9 +50,19 @@ pub enum PipelineUpdate {
     /// Ensemble info refreshed (new service labels etc.).
     Ensemble(Ensemble),
     /// Successfully started playing a service.
-    Playing { label: String },
+    Playing { sid: u32, label: String },
     /// Pipeline status message (for the status bar).
     Status(String),
+    /// Structured now-playing metadata updated for a service.
+    NowPlaying { sid: u32, metadata: NowPlaying },
+    /// Playback metadata such as codec and signal quality updated for a service.
+    PlaybackMeta {
+        sid: u32,
+        codec: String,
+        signal_quality_percent: u8,
+    },
+    /// Downloadable slideshow / cover-art content updated for a service.
+    Content { sid: u32, content: ContentItem },
 }
 
 /// Commands sent to the pipeline background thread.
@@ -50,6 +71,9 @@ pub enum PipelineCmd {
     Play(u32),
     /// Stop playback (keep scanning FIC).
     Stop,
+    /// Retune to a new centre frequency (Hz). Resets OFDM/FIC state.
+    /// Only effective when the pipeline was started via `start_for_device`.
+    Retune(u32),
 }
 
 /// Handle to the running pipeline.  Drop to stop all background threads.
@@ -58,11 +82,236 @@ pub struct PipelineHandle {
     pub cmd_tx: mpsc::SyncSender<PipelineCmd>,
 }
 
+const METADATA_TASK_QUEUE_DEPTH: usize = 128;
+
+#[derive(Debug)]
+enum MetadataTask {
+    XPadDabPlus {
+        sid: u32,
+        generation: u64,
+        au_data: Vec<u8>,
+    },
+    #[cfg(feature = "mp2")]
+    XPadMp2 {
+        sid: u32,
+        generation: u64,
+        frame_data: Vec<u8>,
+    },
+    PacketDls {
+        sid: u32,
+        generation: u64,
+        cif_soft: Vec<f32>,
+        component: Component,
+        cif_idx: usize,
+    },
+    PacketMot {
+        sid: u32,
+        generation: u64,
+        cif_soft: Vec<f32>,
+        component: Component,
+        cif_idx: usize,
+    },
+}
+
+impl MetadataTask {
+    fn sid(&self) -> u32 {
+        match self {
+            Self::XPadDabPlus { sid, .. }
+            | Self::PacketDls { sid, .. }
+            | Self::PacketMot { sid, .. } => *sid,
+            #[cfg(feature = "mp2")]
+            Self::XPadMp2 { sid, .. } => *sid,
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        match self {
+            Self::XPadDabPlus { generation, .. }
+            | Self::PacketDls { generation, .. }
+            | Self::PacketMot { generation, .. } => *generation,
+            #[cfg(feature = "mp2")]
+            Self::XPadMp2 { generation, .. } => *generation,
+        }
+    }
+}
+
+struct MetadataWorker {
+    generation: Arc<AtomicU64>,
+    task_tx: mpsc::SyncSender<MetadataTask>,
+}
+
+impl MetadataWorker {
+    fn spawn(update_tx: mpsc::SyncSender<PipelineUpdate>) -> Result<Self, String> {
+        let (task_tx, task_rx) = mpsc::sync_channel::<MetadataTask>(METADATA_TASK_QUEUE_DEPTH);
+        let generation = Arc::new(AtomicU64::new(0));
+        let generation_for_thread = Arc::clone(&generation);
+        thread::Builder::new()
+            .name("metadata".into())
+            .spawn(move || run_metadata_worker(task_rx, update_tx, generation_for_thread))
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            generation,
+            task_tx,
+        })
+    }
+
+    fn bump_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn try_send(&self, task: MetadataTask) {
+        match self.task_tx.try_send(task) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(task)) => {
+                log::debug!(
+                    "metadata: dropping {:?} task for SId={:04X} because worker queue is full",
+                    metadata_task_kind(&task),
+                    task.sid()
+                );
+            }
+            Err(mpsc::TrySendError::Disconnected(task)) => {
+                log::warn!(
+                    "metadata: worker disconnected while queuing {:?} task for SId={:04X}",
+                    metadata_task_kind(&task),
+                    task.sid()
+                );
+            }
+        }
+    }
+}
+
+fn metadata_task_kind(task: &MetadataTask) -> &'static str {
+    match task {
+        MetadataTask::XPadDabPlus { .. } => "xpad_dabplus",
+        #[cfg(feature = "mp2")]
+        MetadataTask::XPadMp2 { .. } => "xpad_mp2",
+        MetadataTask::PacketDls { .. } => "packet_dls",
+        MetadataTask::PacketMot { .. } => "packet_mot",
+    }
+}
+
+fn run_metadata_worker(
+    task_rx: mpsc::Receiver<MetadataTask>,
+    update_tx: mpsc::SyncSender<PipelineUpdate>,
+    generation: Arc<AtomicU64>,
+) {
+    let mut xpad = XPadAssembler::new();
+    let mut dls_msc = MscDecoder::new();
+    let mut mot_msc = MscDecoder::new();
+    let mut packet_dls = PacketDlsAssembler::new();
+    let mut packet_mot = PacketMotAssembler::new();
+    let mut xpad_mot_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut xpad_mot_fallback_id: u64 = 0;
+    let mut last_now_playing: Option<NowPlaying> = None;
+    let mut active_generation: Option<u64> = None;
+    let mut active_sid: Option<u32> = None;
+
+    while let Ok(task) = task_rx.recv() {
+        let task_generation = task.generation();
+        let task_sid = task.sid();
+        if generation.load(Ordering::SeqCst) != task_generation {
+            continue;
+        }
+
+        if active_generation != Some(task_generation) || active_sid != Some(task_sid) {
+            xpad.reset();
+            dls_msc.set_target_sid(task_sid);
+            mot_msc.set_target_sid(task_sid);
+            packet_dls.reset();
+            packet_mot.reset();
+            xpad_mot_seen.clear();
+            xpad_mot_fallback_id = 0;
+            last_now_playing = None;
+            active_generation = Some(task_generation);
+            active_sid = Some(task_sid);
+        }
+
+        match task {
+            MetadataTask::XPadDabPlus { au_data, .. } => {
+                let meta = xpad.push_dabplus_au_metadata(&au_data);
+                if generation.load(Ordering::SeqCst) == task_generation {
+                    if let Some(meta) = meta {
+                        maybe_emit_now_playing(&update_tx, task_sid, meta, &mut last_now_playing);
+                    }
+                    drain_xpad_mot(
+                        &mut xpad,
+                        task_sid,
+                        &update_tx,
+                        &mut xpad_mot_seen,
+                        &mut xpad_mot_fallback_id,
+                    );
+                }
+            }
+            #[cfg(feature = "mp2")]
+            MetadataTask::XPadMp2 { frame_data, .. } => {
+                let meta = xpad.push_mp2_bytes_metadata(&frame_data);
+                if generation.load(Ordering::SeqCst) == task_generation {
+                    if let Some(meta) = meta {
+                        maybe_emit_now_playing(&update_tx, task_sid, meta, &mut last_now_playing);
+                    }
+                    drain_xpad_mot(
+                        &mut xpad,
+                        task_sid,
+                        &update_tx,
+                        &mut xpad_mot_seen,
+                        &mut xpad_mot_fallback_id,
+                    );
+                }
+            }
+            MetadataTask::PacketDls {
+                cif_soft,
+                component,
+                cif_idx,
+                ..
+            } => {
+                if let Some(frame) = dls_msc.process_cif(&cif_soft, &component, cif_idx) {
+                    if let Some(meta) =
+                        packet_dls.push_frame(&frame.data, component.packet_address.unwrap_or(0))
+                    {
+                        if generation.load(Ordering::SeqCst) == task_generation {
+                            maybe_emit_now_playing(
+                                &update_tx,
+                                task_sid,
+                                meta,
+                                &mut last_now_playing,
+                            );
+                        }
+                    }
+                }
+            }
+            MetadataTask::PacketMot {
+                cif_soft,
+                component,
+                cif_idx,
+                ..
+            } => {
+                if let Some(frame) = mot_msc.process_cif(&cif_soft, &component, cif_idx) {
+                    if generation.load(Ordering::SeqCst) == task_generation {
+                        for content in packet_mot
+                            .push_frame(&frame.data, component.packet_address.unwrap_or(0))
+                        {
+                            let _ = update_tx.try_send(PipelineUpdate::Content {
+                                sid: task_sid,
+                                content,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    log::info!("metadata: thread exiting");
+}
+
 // ─────────────────────────────────────────────────────────────────────────── //
 //  Pipeline launch                                                             //
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Start the receive pipeline from a pre-opened IQ stream.
+///
+/// This variant does not support `PipelineCmd::Retune`; retune commands are
+/// silently ignored.  Use `start_for_device` for retune support.
 pub fn start_with_stream(
     stream: sdr::SdrStream,
     audio_device: Option<String>,
@@ -85,7 +334,49 @@ pub fn start_with_stream(
             if let Some(ref ao) = audio_out {
                 ao.play();
             }
-            run_pipeline(stream, audio_out, update_tx, cmd_rx);
+            run_pipeline(stream, None, audio_out, update_tx, cmd_rx);
+        })
+        .map_err(|e| e.to_string())?;
+
+    Ok(PipelineHandle { update_rx, cmd_tx })
+}
+
+/// Start the receive pipeline from a live RTL-SDR device.
+///
+/// Unlike `start_with_stream`, this variant supports `PipelineCmd::Retune`:
+/// the pipeline will close the current stream and re-open the device at the
+/// new frequency, resetting all OFDM / FIC state.
+pub fn start_for_device(
+    config: sdr::DeviceConfig,
+    audio_device: Option<String>,
+) -> Result<PipelineHandle, String> {
+    start_for_source(sdr::SourceConfig::Device(config), audio_device)
+}
+
+/// Start the receive pipeline from any retuneable source (`SourceConfig`).
+///
+/// Supports `PipelineCmd::Retune` for both local RTL-SDR devices and remote
+/// `rtl_tcp` servers.
+pub fn start_for_source(
+    config: sdr::SourceConfig,
+    audio_device: Option<String>,
+) -> Result<PipelineHandle, String> {
+    let stream = sdr::open_source(&config, 32_768).map_err(|e| e.to_string())?;
+
+    let (update_tx, update_rx) = mpsc::sync_channel::<PipelineUpdate>(32);
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<PipelineCmd>(8);
+    let cmd_rx = Arc::new(Mutex::new(cmd_rx));
+
+    thread::Builder::new()
+        .name("pipeline".into())
+        .spawn(move || {
+            let audio_out = audio::AudioOutput::open(audio_device.as_deref(), 48_000, 2)
+                .map_err(|e| log::warn!("audio open failed: {e}"))
+                .ok();
+            if let Some(ref ao) = audio_out {
+                ao.play();
+            }
+            run_pipeline(stream, Some(config), audio_out, update_tx, cmd_rx);
         })
         .map_err(|e| e.to_string())?;
 
@@ -97,195 +388,451 @@ pub fn start_with_stream(
 // ─────────────────────────────────────────────────────────────────────────── //
 
 fn run_pipeline(
-    stream: sdr::SdrStream,
+    initial_stream: sdr::SdrStream,
+    source_config: Option<sdr::SourceConfig>,
     audio_out: Option<audio::AudioOutput>,
     update_tx: mpsc::SyncSender<PipelineUpdate>,
     cmd_rx: Arc<Mutex<mpsc::Receiver<PipelineCmd>>>,
 ) {
-    let mut ofdm = OfdmProcessor::new();
-    let mut fic = FicDecoder::new();
-    let mut msc = MscDecoder::new();
-    let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
-    let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
-
-    // Currently selected SId (None = scan-only).
+    let mut stream = initial_stream;
+    let metadata_worker = MetadataWorker::spawn(update_tx.clone())
+        .map_err(|e| log::warn!("metadata worker spawn failed: {e}"))
+        .ok();
+    let mut metadata_generation = 0u64;
+    // Currently selected SId (None = scan-only).  Preserved across retunes.
     let mut playing_sid: Option<u32> = None;
-    let mut last_ens_label = String::new();
-    let mut last_svc_count = 0usize;
-    let mut last_svc_labels = String::new();
-    let mut frame_count = 0u64;
+    // Track the current centre frequency so ensemble snapshots carry it.
+    let mut current_freq_hz: u32 = source_config.as_ref().map_or(0, |c| c.center_freq_hz());
 
-    let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
+    'pipeline: loop {
+        let mut ofdm = OfdmProcessor::new();
+        let mut fic = FicDecoder::new();
+        let mut msc = MscDecoder::new();
+        #[cfg(feature = "mp2")]
+        let mut mp2 = Mp2Decoder::new(1152); // ~3 MP2 frames before decode attempt
+        let mut dab_plus = DabPlusDecoder::new(0); // size set when component is known
 
-    for iq_buf in stream.rx.iter() {
-        // Drain any pending commands.
-        if let Ok(guard) = cmd_rx.try_lock() {
-            while let Ok(cmd) = guard.try_recv() {
-                match cmd {
-                    PipelineCmd::Play(sid) => {
-                        playing_sid = Some(sid);
-                        msc.set_target_sid(sid);
-                    }
-                    PipelineCmd::Stop => {
-                        playing_sid = None;
-                        msc.clear_target();
+        let mut last_ens_label = String::new();
+        let mut last_svc_count = 0usize;
+        let mut last_services: Vec<(u32, String)> = Vec::new();
+        let mut frame_count = 0u64;
+        let mut pending_retune: Option<u32> = None;
+        let mut last_playing_announced: Option<u32> = None;
+        let mut cif_soft = Vec::<f32>::with_capacity(18 * 3072);
+        let mut last_signal_quality: Option<u8> = None;
+        let mut signal_tracker = PlaybackSignalTracker::new();
+        #[cfg(not(feature = "mp2"))]
+        let mut warned_mp2_unsupported = false;
+
+        let _ = update_tx.try_send(PipelineUpdate::Status("Hunting for signal…".into()));
+
+        // Restore playing state if we re-tuned to the same channel.
+        if let Some(sid) = playing_sid {
+            msc.set_target_sid(sid);
+        }
+
+        'stream: for iq_buf in stream.rx.iter() {
+            // Drain any pending commands.
+            if let Ok(guard) = cmd_rx.try_lock() {
+                while let Ok(cmd) = guard.try_recv() {
+                    match cmd {
+                        PipelineCmd::Play(sid) => {
+                            playing_sid = Some(sid);
+                            msc.set_target_sid(sid);
+                            metadata_generation = metadata_worker.as_ref().map_or(
+                                metadata_generation.wrapping_add(1),
+                                MetadataWorker::bump_generation,
+                            );
+                            last_signal_quality = None;
+                            signal_tracker.reset();
+                            last_playing_announced = None;
+                            #[cfg(not(feature = "mp2"))]
+                            {
+                                warned_mp2_unsupported = false;
+                            }
+                        }
+                        PipelineCmd::Stop => {
+                            playing_sid = None;
+                            msc.clear_target();
+                            metadata_generation = metadata_worker.as_ref().map_or(
+                                metadata_generation.wrapping_add(1),
+                                MetadataWorker::bump_generation,
+                            );
+                            last_signal_quality = None;
+                            signal_tracker.reset();
+                            last_playing_announced = None;
+                            #[cfg(not(feature = "mp2"))]
+                            {
+                                warned_mp2_unsupported = false;
+                            }
+                        }
+                        PipelineCmd::Retune(freq_hz) => {
+                            pending_retune = Some(freq_hz);
+                            metadata_generation = metadata_worker.as_ref().map_or(
+                                metadata_generation.wrapping_add(1),
+                                MetadataWorker::bump_generation,
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        // OFDM demodulation.
-        for frame in ofdm.push_samples(&iq_buf) {
-            frame_count += 1;
-            log::debug!("Pipeline: OFDM frame #{}", frame_count);
-
-            // ── FIC (symbols 0-2) ────────────────────────────────────────── //
-            fic.begin_frame();
-            let fic_symbols = frame.soft_bits.get(0..3).unwrap_or_default();
-            for sym in fic_symbols {
-                fic.process_symbol(sym);
+            if pending_retune.is_some() {
+                break 'stream;
             }
 
-            // Propagate ensemble changes to the TUI.
-            let ens = fic.handler.ensemble();
-            // Build a fingerprint of service labels so we detect when labels
-            // arrive (they come in separate FIG messages after services appear).
-            let svc_labels: String = ens
-                .services
-                .iter()
-                .map(|s| format!("{:04X}:{}", s.id, s.label))
-                .collect::<Vec<_>>()
-                .join(",");
-            if ens.label != last_ens_label
-                || ens.services.len() != last_svc_count
-                || svc_labels != last_svc_labels
-            {
-                last_ens_label = ens.label.clone();
-                last_svc_count = ens.services.len();
-                last_svc_labels = svc_labels;
-                log::info!(
-                    "Ensemble: id={:04X} label={:?} services={}",
-                    ens.id,
-                    ens.label,
-                    ens.services.len()
-                );
-                for svc in &ens.services {
-                    log::info!(
-                        "  Service: id={:04X} label={:?} dab+={} components={}",
-                        svc.id,
-                        svc.label,
-                        svc.is_dab_plus,
-                        svc.components.len()
-                    );
-                    for comp in &svc.components {
-                        log::info!(
-                            "    Component: subch={} start={} size={} prot={:?}",
-                            comp.subchannel_id,
-                            comp.start_address,
-                            comp.size,
-                            comp.protection
+            if let Some(sid) = playing_sid {
+                if let Some(component) = find_component(fic.handler.ensemble(), sid) {
+                    if let Some(quality) = signal_tracker.current_quality() {
+                        maybe_emit_playback_meta(
+                            &update_tx,
+                            sid,
+                            component,
+                            quality,
+                            &mut last_signal_quality,
                         );
                     }
                 }
-                let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens.clone()));
-                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
-                    "Locked — {} services",
-                    ens.services.len()
-                )));
             }
 
-            // Announce when we start playing.
-            if let Some(sid) = playing_sid {
-                if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
-                    let _ = update_tx.try_send(PipelineUpdate::Playing {
-                        label: svc.label.clone(),
-                    });
+            // OFDM demodulation.
+            ofdm.process_samples(&iq_buf, |soft_bits| {
+                frame_count += 1;
+                log::debug!("Pipeline: OFDM frame #{}", frame_count);
+
+                // ── FIC (symbols 0-2) ────────────────────────────────────────── //
+                fic.begin_frame();
+                let fic_symbols = soft_bits.get(0..3).unwrap_or_default();
+                for sym in fic_symbols {
+                    fic.process_symbol(sym);
                 }
-            }
 
-            // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
-            if playing_sid.is_some() {
-                let ens_snap = ens.clone();
-                let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
-
-                for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
-                    if cif_syms.len() < 18 {
-                        continue;
-                    }
-                    // Flatten CIF symbols → 55296 soft bits.
-                    let cif_soft: Vec<f32> =
-                        cif_syms.iter().flat_map(|s| s.iter().copied()).collect();
-
-                    if let Some(sid) = playing_sid {
-                        let component = find_component(&ens_snap, sid);
-                        if component.is_none() && cif_idx == 0 {
-                            log::debug!(
-                                "MSC: no component found for SId {:04X} (service has {} components)",
-                                sid,
-                                ens_snap
-                                    .services
+                // Propagate ensemble changes to the TUI.
+                let ens = fic.handler.ensemble();
+                let services_changed = ens.services.len() != last_services.len()
+                    || !ens
+                        .services
+                        .iter()
+                        .zip(last_services.iter())
+                        .all(|(svc, (last_id, last_label))| svc.id == *last_id && svc.label == *last_label);
+                if ens.label != last_ens_label
+                    || ens.services.len() != last_svc_count
+                    || services_changed
+                {
+                    last_ens_label = ens.label.clone();
+                    last_svc_count = ens.services.len();
+                    last_services.clear();
+                    last_services.extend(
+                        ens.services
+                            .iter()
+                            .map(|svc| (svc.id, svc.label.clone())),
+                    );
+                    log::info!(
+                        "Ensemble: id={:04X} label={:?} services={}",
+                        ens.id,
+                        ens.label,
+                        ens.services.len()
+                    );
+                    for svc in &ens.services {
+                        log::info!(
+                            "  Service: id={:04X} label={:?} dab+={} components={}",
+                            svc.id,
+                            svc.label,
+                            svc.is_dab_plus,
+                            svc.components.len()
+                        );
+                        for comp in &svc.components {
+                            log::info!(
+                                "    Component: subch={} scids={:?} start={} size={} prot={:?} pkt_addr={:?} apps={:?}",
+                                comp.subchannel_id,
+                                comp.scids,
+                                comp.start_address,
+                                comp.size,
+                                comp.protection,
+                                comp.packet_address,
+                                comp.user_applications
                                     .iter()
-                                    .find(|s| s.id == sid)
-                                    .map_or(0, |s| s.components.len())
+                                    .map(|app| format!("{:#05x}", app.uatype))
+                                    .collect::<Vec<_>>()
                             );
                         }
-                        if let Some(component) = component {
-                            if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx) {
+                    }
+                    let mut ens_snapshot = ens.clone();
+                    ens_snapshot.freq_hz = current_freq_hz;
+                    let _ = update_tx.try_send(PipelineUpdate::Ensemble(ens_snapshot));
+                    let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                        "Locked — {} services",
+                        ens.services.len()
+                    )));
+                }
+
+                // Announce when we start playing.
+                if let Some(sid) = playing_sid {
+                    if let Some(svc) = ens.services.iter().find(|s| s.id == sid) {
+                        if last_playing_announced != Some(sid) {
+                            let _ = update_tx.try_send(PipelineUpdate::Playing {
+                                sid,
+                                label: svc.label.clone(),
+                            });
+                            last_playing_announced = Some(sid);
+                        }
+                        #[cfg(not(feature = "mp2"))]
+                        if !svc.is_dab_plus && !warned_mp2_unsupported {
+                            warned_mp2_unsupported = true;
+                            let _ = update_tx.try_send(PipelineUpdate::Status(
+                                "Legacy MP2 audio is disabled in this build. Rebuild with --features mp2 to enable it."
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+
+                // ── MSC (symbols 3-74, 4 CIFs × 18 symbols) ─────────────────── //
+                if playing_sid.is_some() {
+                    let msc_symbols = soft_bits.get(3..).unwrap_or_default();
+
+                    for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
+                        if cif_syms.len() < 18 {
+                            continue;
+                        }
+                        // Flatten CIF symbols → 55296 soft bits.
+                        cif_soft.clear();
+                        for sym in cif_syms {
+                            cif_soft.extend_from_slice(sym);
+                        }
+
+                        if let Some(sid) = playing_sid {
+                            let component = find_component(ens, sid);
+                            if component.is_none() && cif_idx == 0 {
                                 log::debug!(
-                                    "MSC: CIF {} subchannel {} → {} bytes ({})",
-                                    cif_idx,
-                                    frame.subchannel_id,
-                                    frame.data.len(),
-                                    if frame.is_dab_plus { "DAB+" } else { "DAB" }
+                                    "MSC: no component found for SId {:04X} (service has {} components)",
+                                    sid,
+                                    ens
+                                        .services
+                                        .iter()
+                                        .find(|s| s.id == sid)
+                                        .map_or(0, |s| s.components.len())
                                 );
-                                // Set DAB+ superframe size from actual Viterbi output.
-                                if frame.is_dab_plus
-                                    && !frame.data.is_empty()
-                                    && dab_plus.superframe_size != frame.data.len()
+                            }
+                            if let Some(component) = component {
+                                if let Some(frame) = msc.process_cif(&cif_soft, component, cif_idx)
                                 {
-                                    log::info!(
-                                        "DAB+: setting per-CIF size to {} bytes (was {})",
+                                    log::debug!(
+                                        "MSC: CIF {} subchannel {} → {} bytes ({})",
+                                        cif_idx,
+                                        frame.subchannel_id,
                                         frame.data.len(),
-                                        dab_plus.superframe_size
+                                        if frame.is_dab_plus { "DAB+" } else { "DAB" }
                                     );
-                                    dab_plus.set_superframe_size(frame.data.len());
+                                    // Set DAB+ superframe size from actual Viterbi output.
+                                    if frame.is_dab_plus
+                                        && !frame.data.is_empty()
+                                        && dab_plus.superframe_size != frame.data.len()
+                                    {
+                                        log::info!(
+                                            "DAB+: setting per-CIF size to {} bytes (was {})",
+                                            frame.data.len(),
+                                            dab_plus.superframe_size
+                                        );
+                                        dab_plus.set_superframe_size(frame.data.len());
+                                    }
+                                    let pcm = if frame.is_dab_plus {
+                                        let pcm = dab_plus.push(&frame.data);
+                                        // Hand X-PAD metadata off to the worker so audio stays on the hot path.
+                                        let n_aus = dab_plus.pad_aus.len();
+                                        if cif_idx == 0 || n_aus > 0 {
+                                            log::debug!(
+                                                "X-PAD DAB+: CIF={} pad_aus={} (pcm_samples={})",
+                                                cif_idx,
+                                                n_aus,
+                                                pcm.len()
+                                            );
+                                        }
+                                        for au_data in dab_plus.pad_aus.drain(..) {
+                                            if let Some(worker) = &metadata_worker {
+                                                worker.try_send(MetadataTask::XPadDabPlus {
+                                                    sid,
+                                                    generation: metadata_generation,
+                                                    au_data,
+                                                });
+                                            }
+                                        }
+                                        pcm
+                                    } else {
+                                        #[cfg(feature = "mp2")]
+                                        {
+                                        let pcm = mp2.push(&frame.data);
+                                        // Offload X-PAD scanning so it cannot delay audio writes.
+                                        log::debug!(
+                                            "X-PAD DAB (MP2): CIF={} passing {} bytes to X-PAD scanner \
+                                             (first {:02X} {:02X} {:02X} {:02X})",
+                                            cif_idx,
+                                            frame.data.len(),
+                                            frame.data.first().copied().unwrap_or(0),
+                                            frame.data.get(1).copied().unwrap_or(0),
+                                            frame.data.get(2).copied().unwrap_or(0),
+                                            frame.data.get(3).copied().unwrap_or(0),
+                                        );
+                                        #[cfg(feature = "mp2")]
+                                        if let Some(worker) = &metadata_worker {
+                                            worker.try_send(MetadataTask::XPadMp2 {
+                                                sid,
+                                                generation: metadata_generation,
+                                                frame_data: frame.data.clone(),
+                                            });
+                                        }
+                                        pcm
+                                        }
+                                        #[cfg(not(feature = "mp2"))]
+                                        {
+                                            Vec::new()
+                                        }
+                                    };
+                                    if pcm.is_empty() {
+                                        log::debug!(
+                                            "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
+                                        );
+                                    } else if let Some(ao) = &audio_out {
+                                        let quality = signal_tracker.on_decode_success();
+                                        maybe_emit_playback_meta(
+                                            &update_tx,
+                                            sid,
+                                            component,
+                                            quality,
+                                            &mut last_signal_quality,
+                                        );
+                                        let (min, max) = pcm
+                                            .iter()
+                                            .fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
+                                                (lo.min(s), hi.max(s))
+                                            });
+                                        log::debug!(
+                                            "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
+                                            pcm.len(),
+                                            min,
+                                            max
+                                        );
+                                        ao.write_samples(&pcm);
+                                    } else {
+                                        let quality = signal_tracker.on_decode_success();
+                                        maybe_emit_playback_meta(
+                                            &update_tx,
+                                            sid,
+                                            component,
+                                            quality,
+                                            &mut last_signal_quality,
+                                        );
+                                        log::debug!(
+                                            "MSC: {} PCM samples ready but no audio device",
+                                            pcm.len()
+                                        );
+                                    }
+                                } else if signal_tracker.has_lock() {
+                                    let quality =
+                                        signal_tracker.current_quality().unwrap_or_default();
+                                    maybe_emit_playback_meta(
+                                        &update_tx,
+                                        sid,
+                                        component,
+                                        quality,
+                                        &mut last_signal_quality,
+                                    );
                                 }
-                                let pcm = if frame.is_dab_plus {
-                                    dab_plus.push(&frame.data)
-                                } else {
-                                    mp2.push(&frame.data)
-                                };
-                                if pcm.is_empty() {
+                            }
+                        }
+
+                        // ── DLS packet-mode subchannel ────────────────── //
+                        if let Some(sid) = playing_sid {
+                            match find_dls_component(ens, sid) {
+                                None => {
+                                    if frame_count.is_multiple_of(100) {
+                                        let svc = ens.services.iter().find(|s| s.id == sid);
+                                        log::debug!(
+                                            "DLS: no packet component for SId={:04X} (service found={}, components={:?})",
+                                            sid,
+                                            svc.is_some(),
+                                            svc.map(|s| s.components.iter().map(|c| format!("subchan={} pkt_addr={:?}", c.subchannel_id, c.packet_address)).collect::<Vec<_>>()),
+                                        );
+                                    }
+                                }
+                                Some(dls_comp) => {
                                     log::debug!(
-                                        "MSC: audio decoder returned 0 PCM samples (buffering or decode error)"
+                                        "DLS: processing CIF {cif_idx} for SId={:04X} subchan={} pkt_addr={:?}",
+                                        sid,
+                                        dls_comp.subchannel_id,
+                                        dls_comp.packet_address,
                                     );
-                                } else if let Some(ao) = &audio_out {
-                                    let (min, max) =
-                                        pcm.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &s| {
-                                            (lo.min(s), hi.max(s))
+                                    if let Some(worker) = &metadata_worker {
+                                        worker.try_send(MetadataTask::PacketDls {
+                                            sid,
+                                            generation: metadata_generation,
+                                            cif_soft: cif_soft.clone(),
+                                            component: dls_comp.clone(),
+                                            cif_idx,
                                         });
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(sid) = playing_sid {
+                            match find_slideshow_component(ens, sid) {
+                                None => {}
+                                Some(mot_comp) => {
                                     log::debug!(
-                                        "MSC: writing {} PCM samples to audio device (range {:.4}..{:.4})",
-                                        pcm.len(),
-                                        min,
-                                        max
+                                        "MOT: processing CIF {cif_idx} for SId={:04X} subchan={} pkt_addr={:?}",
+                                        sid,
+                                        mot_comp.subchannel_id,
+                                        mot_comp.packet_address,
                                     );
-                                    ao.write_samples(&pcm);
-                                } else {
-                                    log::debug!(
-                                        "MSC: {} PCM samples ready but no audio device",
-                                        pcm.len()
-                                    );
+                                    if let Some(worker) = &metadata_worker {
+                                        worker.try_send(MetadataTask::PacketMot {
+                                            sid,
+                                            generation: metadata_generation,
+                                            cif_soft: cif_soft.clone(),
+                                            component: mot_comp.clone(),
+                                            cif_idx,
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        }
-    }
+            });
+        } // end 'stream: for iq_buf
 
-    log::info!("pipeline: IQ stream ended, thread exiting");
+        // Handle retune: drop the old stream and open a new one at the new frequency.
+        match pending_retune.take() {
+            Some(freq_hz) if source_config.is_some() => {
+                let new_cfg = source_config.as_ref().unwrap().with_freq(freq_hz);
+                log::info!("pipeline: retuning to {:.3} MHz", freq_hz as f64 / 1e6);
+                let _ = update_tx.try_send(PipelineUpdate::Status(format!(
+                    "Retuning to {:.3} MHz…",
+                    freq_hz as f64 / 1e6
+                )));
+                // Drop the old stream so the device/connection is released before reopening.
+                drop(stream);
+                match sdr::open_source(&new_cfg, 32_768) {
+                    Ok(new_stream) => {
+                        stream = new_stream;
+                        current_freq_hz = freq_hz;
+                        continue 'pipeline;
+                    }
+                    Err(e) => {
+                        log::error!("pipeline: retune failed: {e}");
+                        let _ = update_tx
+                            .try_send(PipelineUpdate::Status(format!("Retune failed: {e}")));
+                        break 'pipeline;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        break 'pipeline; // stream ended naturally
+    } // end 'pipeline: loop
+
+    log::info!("pipeline: thread exiting");
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -308,6 +855,14 @@ pub struct FicDecoder {
     pub handler: FicHandler,
     /// Accumulation buffer for FIC soft bits across OFDM symbols.
     fic_buf: Vec<f32>,
+    /// Reused normalization scratch for one punctured FIC block.
+    fic_norm: Vec<f32>,
+}
+
+impl Default for FicDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FicDecoder {
@@ -317,6 +872,7 @@ impl FicDecoder {
             prbs_bits: Self::generate_prbs(768),
             handler: FicHandler::new(),
             fic_buf: Vec::with_capacity(fec::FIC_PUNCTURED_BITS),
+            fic_norm: vec![0.0; fec::FIC_PUNCTURED_BITS],
         }
     }
 
@@ -360,15 +916,17 @@ impl FicDecoder {
     fn process_fic_block(&mut self) {
         const INFO_BITS: usize = 768;
 
-        let block: Vec<f32> = self.fic_buf.drain(..fec::FIC_PUNCTURED_BITS).collect();
+        let block = &self.fic_buf[..fec::FIC_PUNCTURED_BITS];
 
         // Normalize soft bits to ~[-1, +1] for Viterbi.
         let max_abs = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = if max_abs > 0.0 { 1.0 / max_abs } else { 1.0 };
-        let normalized: Vec<f32> = block.iter().map(|v| v * scale).collect();
+        for (dst, src) in self.fic_norm.iter_mut().zip(block.iter()) {
+            *dst = *src * scale;
+        }
 
         // Depuncture 2304 → 3096 using PI_16/PI_15/PI_X.
-        let depunctured = fec::fic_depuncture(&normalized);
+        let depunctured = fec::fic_depuncture(&self.fic_norm);
 
         let bits = self.viterbi.decode(&depunctured);
         let info = &bits[..bits.len().min(INFO_BITS)];
@@ -398,6 +956,9 @@ impl FicDecoder {
         }
 
         self.handler.process_fic_bytes(&fic_bytes);
+        let remaining = self.fic_buf.len() - fec::FIC_PUNCTURED_BITS;
+        self.fic_buf.copy_within(fec::FIC_PUNCTURED_BITS.., 0);
+        self.fic_buf.truncate(remaining);
     }
 
     /// XOR FIC bytes (96 bytes = 3 FIBs) with the continuous PRBS.
@@ -436,6 +997,16 @@ pub struct MscDecoder {
     deint_count: usize,
     /// Expected subchannel soft-bit count per CIF (reset on subchannel change).
     deint_bits_per_cif: usize,
+    /// Reused scratch for deinterleaved soft bits.
+    deint_soft: Vec<f32>,
+    /// Reused scratch for normalized soft bits.
+    normalized_soft: Vec<f32>,
+}
+
+impl Default for MscDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MscDecoder {
@@ -446,6 +1017,8 @@ impl MscDecoder {
             deint_buf: Vec::new(),
             deint_count: 0,
             deint_bits_per_cif: 0,
+            deint_soft: Vec::new(),
+            normalized_soft: Vec::new(),
         }
     }
 
@@ -463,6 +1036,8 @@ impl MscDecoder {
         self.deint_buf.clear();
         self.deint_count = 0;
         self.deint_bits_per_cif = 0;
+        self.deint_soft.clear();
+        self.normalized_soft.clear();
     }
 
     /// Decode one CIF (55296 soft bits) for the given component.
@@ -499,12 +1074,14 @@ impl MscDecoder {
         if bits_per_cif != self.deint_bits_per_cif {
             self.deint_bits_per_cif = bits_per_cif;
             self.deint_buf = vec![vec![0.0f32; bits_per_cif]; 16];
+            self.deint_soft.resize(bits_per_cif, 0.0);
+            self.normalized_soft.resize(bits_per_cif, 0.0);
             self.deint_count = 0;
         }
 
         // Store in ring buffer.
         let slot = self.deint_count % 16;
-        self.deint_buf[slot] = subchannel_soft.to_vec();
+        self.deint_buf[slot].copy_from_slice(subchannel_soft);
         self.deint_count += 1;
 
         // Need 16 CIFs before the deinterleaver can produce output.
@@ -518,25 +1095,29 @@ impl MscDecoder {
         // We output the logical frame whose latest contribution just arrived.
         // For bit i: source physical CIF = (current - 15 + PI[i % 16]).
         let p = self.deint_count - 1;
-        let deint_soft: Vec<f32> = (0..bits_per_cif)
-            .map(|i| {
-                let source_cif = p - 15 + TIME_INTERLEAVE_PI[i % 16];
-                let source_slot = source_cif % 16;
-                self.deint_buf[source_slot][i]
-            })
-            .collect();
+        for i in 0..bits_per_cif {
+            let source_cif = p - 15 + TIME_INTERLEAVE_PI[i % 16];
+            let source_slot = source_cif % 16;
+            self.deint_soft[i] = self.deint_buf[source_slot][i];
+        }
 
         // Normalize soft bits to ~[-1, +1] for Viterbi (matches FIC path).
-        let max_abs = deint_soft.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let max_abs = self
+            .deint_soft
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0f32, f32::max);
         let scale = if max_abs > 0.0 { 1.0 / max_abs } else { 1.0 };
-        let normalized: Vec<f32> = deint_soft.iter().map(|v| v * scale).collect();
+        for (dst, src) in self.normalized_soft.iter_mut().zip(self.deint_soft.iter()) {
+            *dst = *src * scale;
+        }
 
         // Apply two-region EEP depuncturing (ETSI EN 300 401 Tables 8/9).
-        let depunct = eep_depuncture(&normalized, component);
+        let depunct = eep_depuncture(&self.normalized_soft, component);
 
         // Viterbi decode.  Strip K−1 = 6 tail bits (forced-zero flush bits
         // appended by the encoder; they are not part of the information stream).
-        let bits = self.viterbi.decode(&depunct);
+        let (bits, _metric) = self.viterbi.decode_with_metric(&depunct);
         let info_len = bits.len().saturating_sub(6);
 
         // Pack to bytes.
@@ -605,6 +1186,710 @@ fn find_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
         .first()
 }
 
+/// Find the DLS packet-mode component for a service (has a packet address).
+fn find_dls_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
+    ens.services
+        .iter()
+        .find(|s| s.id == sid)?
+        .components
+        .iter()
+        .find(|c| {
+            c.packet_address.is_some()
+                && c.service_type == ServiceType::Data
+                && c.user_applications
+                    .iter()
+                    .any(|app| app.uatype == UserApplication::UATYPE_DYNAMIC_LABEL)
+        })
+}
+
+/// Find the packet-mode slideshow / cover-art component for a service.
+fn find_slideshow_component(ens: &Ensemble, sid: u32) -> Option<&Component> {
+    ens.services
+        .iter()
+        .find(|s| s.id == sid)?
+        .components
+        .iter()
+        .find(|c| {
+            c.packet_address.is_some()
+                && c.service_type == ServiceType::Data
+                && c.user_applications
+                    .iter()
+                    .any(|app| app.uatype == UserApplication::UATYPE_SLIDESHOW)
+        })
+}
+
+fn unix_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_plausible_label(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return false;
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch == '\u{FFFD}' || ch.is_control())
+    {
+        return false;
+    }
+
+    let allowed = trimmed
+        .chars()
+        .filter(|&ch| {
+            ch.is_alphanumeric()
+                || ch.is_whitespace()
+                || ch.is_alphabetic()
+                || matches!(
+                    ch,
+                    '-' | '_'
+                        | '/'
+                        | '&'
+                        | '+'
+                        | '\''
+                        | '"'
+                        | '.'
+                        | ','
+                        | ':'
+                        | ';'
+                        | '!'
+                        | '?'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '#'
+                )
+        })
+        .count();
+
+    let total = trimmed.chars().count();
+    total > 0 && (allowed as f32 / total as f32) >= 0.85
+}
+
+fn codec_label(component: &Component) -> &'static str {
+    match component.service_type {
+        ServiceType::DabPlus => "HE-AAC v2",
+        ServiceType::Audio => "MPEG Layer II",
+        ServiceType::Data => "Data",
+    }
+}
+
+#[derive(Default)]
+struct PlaybackSignalTracker {
+    last_success_ms: Option<u64>,
+}
+
+impl PlaybackSignalTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn has_lock(&self) -> bool {
+        self.last_success_ms.is_some()
+    }
+
+    fn on_decode_success(&mut self) -> u8 {
+        self.last_success_ms = Some(unix_ms_now());
+        100
+    }
+
+    fn current_quality(&self) -> Option<u8> {
+        let last_success = self.last_success_ms?;
+        let age_ms = unix_ms_now().saturating_sub(last_success);
+        const HOLD_MS: u64 = 1_200;
+        const DROP_MS: u64 = 5_000;
+        if age_ms <= HOLD_MS {
+            return Some(100);
+        }
+        if age_ms >= DROP_MS {
+            return Some(0);
+        }
+        let span = (DROP_MS - HOLD_MS) as f32;
+        let remaining = (DROP_MS - age_ms) as f32 / span;
+        Some((remaining * 100.0).round() as u8)
+    }
+}
+
+fn maybe_emit_playback_meta(
+    update_tx: &mpsc::SyncSender<PipelineUpdate>,
+    sid: u32,
+    component: &Component,
+    signal_quality_percent: u8,
+    last_signal_quality: &mut Option<u8>,
+) {
+    let should_emit = match last_signal_quality {
+        None => true,
+        Some(prev) => prev.abs_diff(signal_quality_percent) >= 2,
+    };
+    if should_emit {
+        *last_signal_quality = Some(signal_quality_percent);
+        let _ = update_tx.try_send(PipelineUpdate::PlaybackMeta {
+            sid,
+            codec: codec_label(component).to_string(),
+            signal_quality_percent,
+        });
+    }
+}
+
+fn decode_charset_text(bytes: &[u8], charset: u8) -> String {
+    normalize_text(protocol::decode_dab_text(bytes, charset).trim())
+}
+
+fn maybe_emit_now_playing(
+    update_tx: &mpsc::SyncSender<PipelineUpdate>,
+    sid: u32,
+    incoming: NowPlaying,
+    last: &mut Option<NowPlaying>,
+) {
+    if !is_plausible_label(&incoming.raw_text)
+        && incoming
+            .title
+            .as_deref()
+            .is_none_or(|s| !is_plausible_label(s))
+        && incoming
+            .artist
+            .as_deref()
+            .is_none_or(|s| !is_plausible_label(s))
+    {
+        log::debug!(
+            "NowPlaying: dropping implausible text for SId={:04X}: {:?}",
+            sid,
+            incoming.raw_text
+        );
+        return;
+    }
+    let merged = merge_metadata(last.clone(), incoming);
+    let should_emit = match last {
+        None => true,
+        Some(prev) => {
+            prev.raw_text != merged.raw_text
+                || prev.title != merged.title
+                || prev.artist != merged.artist
+                || prev.album != merged.album
+                || prev.track != merged.track
+                || prev.composer != merged.composer
+                || prev.band != merged.band
+                || prev.genre != merged.genre
+                || prev.toggle != merged.toggle
+                || prev.item_toggle != merged.item_toggle
+                || prev.item_running != merged.item_running
+                || prev.source != merged.source
+        }
+    };
+    if should_emit {
+        log::info!(
+            "NowPlaying: SId={:04X} source={:?} text={:?} title={:?} artist={:?}",
+            sid,
+            merged.source,
+            merged.raw_text,
+            merged.title,
+            merged.artist
+        );
+        *last = Some(merged.clone());
+        let _ = update_tx.try_send(PipelineUpdate::NowPlaying {
+            sid,
+            metadata: merged,
+        });
+    }
+}
+
+fn merge_metadata(current: Option<NowPlaying>, mut incoming: NowPlaying) -> NowPlaying {
+    incoming.raw_text = normalize_text(&incoming.raw_text);
+    if incoming.updated_at_unix_ms == 0 {
+        incoming.updated_at_unix_ms = unix_ms_now();
+    }
+    let Some(existing) = current else {
+        return incoming;
+    };
+
+    // A DL+ Item Toggle flip is the authoritative "new item" signal
+    // (TS 102 980 §7.3.2). When IT is known on both sides and has changed,
+    // accept the incoming metadata as a fresh item without backfilling.
+    if incoming.item_toggle.is_some()
+        && existing.item_toggle.is_some()
+        && incoming.item_toggle != existing.item_toggle
+    {
+        return incoming;
+    }
+    // Fall back to the DLS segment toggle for sources that don't provide
+    // DL+ IT (e.g. packet-mode DLS with only the control-byte toggle).
+    if incoming.item_toggle.is_none()
+        && existing.item_toggle.is_none()
+        && incoming.toggle.is_some()
+        && incoming.toggle != existing.toggle
+    {
+        return incoming;
+    }
+    // When the broadcaster explicitly signals the item has stopped, drop
+    // any stale song details rather than backfilling from `existing`.
+    if incoming.item_running == Some(false) {
+        return incoming;
+    }
+    let incoming_structured = has_structured_metadata(&incoming);
+    let existing_structured = has_structured_metadata(&existing);
+    if incoming_structured && !existing_structured {
+        return incoming;
+    }
+    if existing.source == Some(MetadataSource::XPad)
+        && incoming.source == Some(MetadataSource::Packet)
+        && !incoming_structured
+    {
+        return existing;
+    }
+    if incoming.raw_text != existing.raw_text {
+        return incoming;
+    }
+    let mut merged = existing;
+    backfill_if_empty(&mut merged.title, incoming.title);
+    backfill_if_empty(&mut merged.artist, incoming.artist);
+    backfill_if_empty(&mut merged.album, incoming.album);
+    backfill_if_empty(&mut merged.track, incoming.track);
+    backfill_if_empty(&mut merged.composer, incoming.composer);
+    backfill_if_empty(&mut merged.band, incoming.band);
+    backfill_if_empty(&mut merged.genre, incoming.genre);
+    if merged.item_running.is_none() {
+        merged.item_running = incoming.item_running;
+    }
+    if merged.item_toggle.is_none() {
+        merged.item_toggle = incoming.item_toggle;
+    }
+    merged.updated_at_unix_ms = incoming.updated_at_unix_ms;
+    merged
+}
+
+fn has_structured_metadata(m: &NowPlaying) -> bool {
+    m.title.is_some()
+        || m.artist.is_some()
+        || m.album.is_some()
+        || m.track.is_some()
+        || m.composer.is_some()
+        || m.band.is_some()
+        || m.genre.is_some()
+}
+
+fn backfill_if_empty(dst: &mut Option<String>, src: Option<String>) {
+    if dst.is_none() {
+        *dst = src;
+    }
+}
+
+#[derive(Default)]
+struct PacketDlsAssembler {
+    by_address: HashMap<u16, PacketDataGroup>,
+}
+
+#[derive(Default)]
+struct PacketDataGroup {
+    bytes: Vec<u8>,
+    last_continuity: Option<u8>,
+}
+
+impl PacketDlsAssembler {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        self.by_address.clear();
+    }
+
+    fn push_frame(&mut self, data: &[u8], target_address: u16) -> Option<NowPlaying> {
+        let mut pos = 0usize;
+        while pos + 3 <= data.len() {
+            let packet_length = (data[pos] >> 6) & 0x03;
+            let packet_size = 24 * (packet_length as usize + 1);
+            let continuity = (data[pos] >> 4) & 0x03;
+            let first_last = (data[pos] >> 2) & 0x03;
+            let address = (((data[pos] & 0x03) as u16) << 8) | data[pos + 1] as u16;
+            let command_flag = (data[pos + 2] & 0x80) != 0;
+            let useful_data_len = (data[pos + 2] & 0x7F) as usize;
+
+            if pos + packet_size > data.len() {
+                break;
+            }
+            let data_start = pos + 3;
+            let data_end = (pos + packet_size - 2).min(data_start + useful_data_len);
+            if data_end <= data_start {
+                pos += packet_size;
+                continue;
+            }
+            let useful = &data[data_start..data_end];
+            if address == target_address && !command_flag {
+                if let Some(meta) = self.push_packet(address, continuity, first_last, useful) {
+                    return Some(meta);
+                }
+            }
+            pos += packet_size;
+        }
+        None
+    }
+
+    fn push_packet(
+        &mut self,
+        address: u16,
+        continuity: u8,
+        first_last: u8,
+        useful: &[u8],
+    ) -> Option<NowPlaying> {
+        let group = self.by_address.entry(address).or_default();
+        match first_last {
+            0b11 => {
+                group.bytes.clear();
+                group.last_continuity = Some(continuity);
+                parse_packet_dls_bytes(useful)
+            }
+            0b10 => {
+                group.bytes.clear();
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                None
+            }
+            0b00 => {
+                if let Some(prev) = group.last_continuity {
+                    if ((prev + 1) & 0x03) != continuity {
+                        group.bytes.clear();
+                    }
+                }
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                None
+            }
+            0b01 => {
+                if let Some(prev) = group.last_continuity {
+                    if ((prev + 1) & 0x03) != continuity {
+                        group.bytes.clear();
+                    }
+                }
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                let assembled = std::mem::take(&mut group.bytes);
+                parse_packet_dls_bytes(&assembled)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PacketMotAssembler {
+    by_address: HashMap<u16, PacketDataGroup>,
+    streams: HashMap<u16, MotStreamState>,
+    next_fallback_id: u64,
+}
+
+#[derive(Default)]
+struct MotStreamState {
+    /// MSC Data Group / MOT assembler for well-formed slideshow streams.
+    mot: MotAssembler,
+    /// Fallback scan buffer for streams that don't conform to EN 301 234
+    /// framing (e.g. test signals, encoder bugs). Only used when the MSC-DG
+    /// parse fails.
+    fallback_buffer: Vec<u8>,
+    seen_hashes: std::collections::HashSet<u64>,
+}
+
+impl PacketMotAssembler {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self) {
+        self.by_address.clear();
+        self.streams.clear();
+        self.next_fallback_id = 0;
+    }
+
+    fn push_frame(&mut self, data: &[u8], target_address: u16) -> Vec<ContentItem> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 3 <= data.len() {
+            let packet_length = (data[pos] >> 6) & 0x03;
+            let packet_size = 24 * (packet_length as usize + 1);
+            let continuity = (data[pos] >> 4) & 0x03;
+            let first_last = (data[pos] >> 2) & 0x03;
+            let address = (((data[pos] & 0x03) as u16) << 8) | data[pos + 1] as u16;
+            let command_flag = (data[pos + 2] & 0x80) != 0;
+            let useful_data_len = (data[pos + 2] & 0x7F) as usize;
+
+            if pos + packet_size > data.len() {
+                break;
+            }
+            let data_start = pos + 3;
+            let data_end = (pos + packet_size - 2).min(data_start + useful_data_len);
+            if data_end > data_start && address == target_address && !command_flag {
+                let useful = &data[data_start..data_end];
+                if let Some(group) = self.push_packet(address, continuity, first_last, useful) {
+                    out.extend(self.push_group(address, &group));
+                }
+            }
+            pos += packet_size;
+        }
+        out
+    }
+
+    fn push_packet(
+        &mut self,
+        address: u16,
+        continuity: u8,
+        first_last: u8,
+        useful: &[u8],
+    ) -> Option<Vec<u8>> {
+        let group = self.by_address.entry(address).or_default();
+        match first_last {
+            0b11 => {
+                group.bytes.clear();
+                group.last_continuity = Some(continuity);
+                Some(useful.to_vec())
+            }
+            0b10 => {
+                group.bytes.clear();
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                None
+            }
+            0b00 => {
+                if let Some(prev) = group.last_continuity {
+                    if ((prev + 1) & 0x03) != continuity {
+                        group.bytes.clear();
+                    }
+                }
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                None
+            }
+            0b01 => {
+                if let Some(prev) = group.last_continuity {
+                    if ((prev + 1) & 0x03) != continuity {
+                        group.bytes.clear();
+                    }
+                }
+                group.bytes.extend_from_slice(useful);
+                group.last_continuity = Some(continuity);
+                Some(std::mem::take(&mut group.bytes))
+            }
+            _ => None,
+        }
+    }
+
+    fn push_group(&mut self, address: u16, bytes: &[u8]) -> Vec<ContentItem> {
+        let state = self.streams.entry(address).or_default();
+        // Primary path: each packet-mode group is one MSC Data Group. Parse
+        // it, feed it to the per-address MotAssembler, and emit when a full
+        // MOT object (header + body) is in hand.
+        if let Some(obj) = state.mot.push_msc_data_group(bytes) {
+            let payload_hash = hash_bytes(&obj.body);
+            if !state.seen_hashes.insert(payload_hash) {
+                return Vec::new();
+            }
+            let mime = obj
+                .header
+                .mime_type
+                .clone()
+                .or_else(|| obj.header.inferred_mime().map(str::to_string))
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let ext = obj.header.preferred_extension();
+            let filename = obj
+                .header
+                .content_name
+                .as_deref()
+                .map(sanitize_filename)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    self.next_fallback_id += 1;
+                    format!("cover-{}.{}", self.next_fallback_id, ext)
+                });
+            return vec![ContentItem {
+                content_type: mime,
+                filename,
+                bytes: obj.body,
+                category_title: obj.header.category_title.clone(),
+                updated_at_unix_ms: unix_ms_now(),
+            }];
+        }
+
+        // Fallback: the group wasn't a recognisable MSC-DG (or was a body
+        // segment that didn't complete a transport yet). Accumulate the
+        // bytes and scan for PNG/JPEG signatures so we still pick up
+        // slideshow content from stations that ship non-standard framing.
+        state.fallback_buffer.extend_from_slice(bytes);
+        if state.fallback_buffer.len() > 2 * 1024 * 1024 {
+            let keep_from = state.fallback_buffer.len() - 512 * 1024;
+            state.fallback_buffer.drain(..keep_from);
+        }
+        let mut extracted = Vec::new();
+        while let Some((start, end, content_type, ext)) =
+            find_embedded_object(&state.fallback_buffer)
+        {
+            let payload = state.fallback_buffer[start..end].to_vec();
+            let payload_hash = hash_bytes(&payload);
+            if !state.seen_hashes.insert(payload_hash) {
+                state.fallback_buffer.drain(..end);
+                continue;
+            }
+            let context_start = start.saturating_sub(256);
+            let filename = sniff_filename(&state.fallback_buffer[context_start..start], ext)
+                .unwrap_or_else(|| {
+                    self.next_fallback_id += 1;
+                    format!("cover-{}.{}", self.next_fallback_id, ext)
+                });
+            extracted.push(ContentItem {
+                content_type: content_type.to_string(),
+                filename,
+                bytes: payload,
+                category_title: None,
+                updated_at_unix_ms: unix_ms_now(),
+            });
+            state.fallback_buffer.drain(..end);
+        }
+        extracted
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Drain any MOT objects assembled by the X-PAD path into
+/// `PipelineUpdate::Content`. Dedups repeated carousel payloads by body hash.
+fn drain_xpad_mot(
+    xpad: &mut XPadAssembler,
+    sid: u32,
+    update_tx: &mpsc::SyncSender<PipelineUpdate>,
+    seen: &mut std::collections::HashSet<u64>,
+    fallback_id: &mut u64,
+) {
+    for obj in xpad.take_mot_objects() {
+        let hash = hash_bytes(&obj.body);
+        if !seen.insert(hash) {
+            continue;
+        }
+        let mime = obj
+            .header
+            .mime_type
+            .clone()
+            .or_else(|| obj.header.inferred_mime().map(str::to_string))
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let ext = obj.header.preferred_extension();
+        let filename = obj
+            .header
+            .content_name
+            .as_deref()
+            .map(sanitize_filename)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                *fallback_id += 1;
+                format!("xpad-{}.{}", *fallback_id, ext)
+            });
+        let content = ContentItem {
+            content_type: mime,
+            filename,
+            bytes: obj.body,
+            category_title: obj.header.category_title.clone(),
+            updated_at_unix_ms: unix_ms_now(),
+        };
+        let _ = update_tx.try_send(PipelineUpdate::Content { sid, content });
+    }
+}
+
+fn find_embedded_object(bytes: &[u8]) -> Option<(usize, usize, &'static str, &'static str)> {
+    let png_start = find_subslice(bytes, b"\x89PNG\r\n\x1A\n");
+    let jpg_start = find_subslice(bytes, &[0xFF, 0xD8]);
+
+    match (png_start, jpg_start) {
+        (Some(ps), Some(js)) if js < ps => {
+            let end = find_jpeg_end(&bytes[js..])?;
+            Some((js, js + end, "image/jpeg", "jpg"))
+        }
+        (Some(ps), _) => {
+            let end = find_subslice(&bytes[ps..], b"IEND\xAE\x42\x60\x82")?;
+            Some((ps, ps + end + 8, "image/png", "png"))
+        }
+        (_, Some(js)) => {
+            let end = find_jpeg_end(&bytes[js..])?;
+            Some((js, js + end, "image/jpeg", "jpg"))
+        }
+        _ => None,
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn find_jpeg_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(2)
+        .position(|w| w == [0xFF, 0xD9])
+        .map(|idx| idx + 2)
+}
+
+fn sniff_filename(prefix: &[u8], ext: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(prefix);
+    for token in
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')))
+    {
+        let lower = token.to_ascii_lowercase();
+        if lower.ends_with(&format!(".{ext}")) {
+            let base = token.rsplit('/').next().unwrap_or(token);
+            let clean = sanitize_filename(base);
+            if !clean.is_empty() {
+                return Some(clean);
+            }
+        }
+    }
+    None
+}
+
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn parse_packet_dls_bytes(bytes: &[u8]) -> Option<NowPlaying> {
+    if bytes.len() < 2 || bytes.first() != Some(&0x01) {
+        return None;
+    }
+    let ctrl = bytes[1];
+    let charset = (ctrl >> 4) & 0x0F;
+    let toggle = Some((ctrl & 0x08) != 0);
+    let item_running = Some((ctrl & 0x04) != 0);
+    let raw_text = decode_charset_text(&bytes[2..], charset);
+    if raw_text.is_empty() {
+        return None;
+    }
+    Some(NowPlaying {
+        raw_text,
+        toggle,
+        item_running,
+        source: Some(MetadataSource::Packet),
+        updated_at_unix_ms: unix_ms_now(),
+        ..Default::default()
+    })
+}
+
 /// Quick FIB CRC-16/CCITT check for debug logging.
 fn fib_crc_check(fib: &[u8]) -> bool {
     if fib.len() < 32 {
@@ -667,6 +1952,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_metadata_prefers_xpad_over_plain_packet() {
+        let existing = NowPlaying {
+            raw_text: "Track A".into(),
+            toggle: Some(false),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 100,
+            ..Default::default()
+        };
+        let incoming = NowPlaying {
+            raw_text: "Track A".into(),
+            toggle: Some(false),
+            item_running: Some(true),
+            source: Some(MetadataSource::Packet),
+            updated_at_unix_ms: 200,
+            ..Default::default()
+        };
+        let merged = merge_metadata(Some(existing.clone()), incoming);
+        assert_eq!(merged.source, existing.source);
+        assert_eq!(merged.raw_text, "Track A");
+    }
+
+    #[test]
+    fn merge_metadata_item_toggle_flip_resets_song() {
+        let existing = NowPlaying {
+            raw_text: "Old".into(),
+            title: Some("Old title".into()),
+            artist: Some("Old artist".into()),
+            toggle: Some(false),
+            item_toggle: Some(false),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 100,
+            ..Default::default()
+        };
+        let incoming = NowPlaying {
+            raw_text: "New".into(),
+            title: Some("New title".into()),
+            toggle: Some(false),
+            item_toggle: Some(true),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 200,
+            ..Default::default()
+        };
+        let merged = merge_metadata(Some(existing), incoming);
+        // IT flipped → accept incoming wholesale, no backfill of stale artist.
+        assert_eq!(merged.title.as_deref(), Some("New title"));
+        assert_eq!(merged.artist, None);
+        assert_eq!(merged.item_toggle, Some(true));
+    }
+
+    #[test]
+    fn merge_metadata_same_it_backfills_empty_fields() {
+        let existing = NowPlaying {
+            raw_text: "Same".into(),
+            title: Some("Song".into()),
+            artist: Some("Artist".into()),
+            album: Some("Album".into()),
+            toggle: Some(false),
+            item_toggle: Some(true),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 100,
+            ..Default::default()
+        };
+        let incoming = NowPlaying {
+            raw_text: "Same".into(),
+            genre: Some("Rock".into()),
+            toggle: Some(false),
+            item_toggle: Some(true),
+            item_running: Some(true),
+            source: Some(MetadataSource::XPad),
+            updated_at_unix_ms: 200,
+            ..Default::default()
+        };
+        let merged = merge_metadata(Some(existing), incoming);
+        assert_eq!(merged.title.as_deref(), Some("Song"));
+        assert_eq!(merged.artist.as_deref(), Some("Artist"));
+        assert_eq!(merged.album.as_deref(), Some("Album"));
+        assert_eq!(merged.genre.as_deref(), Some("Rock"));
+    }
+
+    #[test]
+    fn packet_dls_single_packet_decodes_text() {
+        let mut asm = PacketDlsAssembler::new();
+        let addr = 0x0155u16;
+        // One 24-byte packet:
+        // byte0: len=0 (24B), continuity=1, first_last=3 (single), address_hi
+        // byte1: address_lo
+        // byte2: command_flag=0, useful_len=6
+        // useful: [0x01, ctrl(charset0,toggle0,item1), 'H', 'e', 'j', 0]
+        let mut pkt = vec![0u8; 24];
+        pkt[0] = (1 << 4) | (3 << 2) | ((addr >> 8) as u8 & 0x03);
+        pkt[1] = (addr & 0xFF) as u8;
+        pkt[2] = 6;
+        pkt[3] = 0x01;
+        pkt[4] = 0x04;
+        pkt[5] = b'H';
+        pkt[6] = b'e';
+        pkt[7] = b'j';
+        pkt[8] = 0;
+        let meta = asm.push_frame(&pkt, addr).expect("expected metadata");
+        assert_eq!(meta.raw_text, "Hej");
+        assert_eq!(meta.source, Some(MetadataSource::Packet));
+        assert_eq!(meta.item_running, Some(true));
+    }
+
+    #[test]
     fn pack_bits_all_ones() {
         let bits = vec![1u8; 8];
         assert_eq!(pack_bits(&bits), vec![0xFF]);
@@ -705,10 +2099,13 @@ mod tests {
 
         let comp = Component {
             subchannel_id: 0,
+            scids: Some(0),
             service_type: ServiceType::DabPlus,
             start_address: 0,
             size: 60,
             protection: ProtectionLevel::EepA(3),
+            packet_address: None,
+            user_applications: Vec::new(),
         };
 
         // Encode known data through rate-1/4 convolutional encoder
@@ -811,10 +2208,13 @@ mod tests {
         use protocol::ensemble::{Component, ProtectionLevel, ServiceType};
         let comp = Component {
             subchannel_id: 0,
+            scids: Some(0),
             service_type: ServiceType::Audio,
             start_address: 0,
             size: 4,
             protection: ProtectionLevel::EepA(2),
+            packet_address: None,
+            user_applications: Vec::new(),
         };
         let cif = vec![1.0f32; 55296];
         assert!(dec.process_cif(&cif, &comp, 0).is_none());
@@ -1783,10 +3183,13 @@ mod tests {
                         // Depuncture with this level
                         let test_comp = Component {
                             subchannel_id: comp.subchannel_id,
+                            scids: comp.scids,
                             service_type: comp.service_type.clone(),
                             start_address: comp.start_address,
                             size: comp.size,
                             protection: ProtectionLevel::EepA(eep_level),
+                            packet_address: None,
+                            user_applications: comp.user_applications.clone(),
                         };
                         let depunct = eep_depuncture(&normalized, &test_comp);
                         let bits = vit.decode(&depunct);
@@ -1858,10 +3261,13 @@ mod tests {
 
                     let test_comp = Component {
                         subchannel_id: comp.subchannel_id,
+                        scids: comp.scids,
                         service_type: comp.service_type.clone(),
                         start_address: comp.start_address,
                         size: comp.size,
                         protection: ProtectionLevel::EepA(eep_level),
+                        packet_address: None,
+                        user_applications: comp.user_applications.clone(),
                     };
                     let depunct = eep_depuncture(&normalized, &test_comp);
                     let (_, metric) = vit.decode_with_metric(&depunct);
@@ -1936,10 +3342,10 @@ mod tests {
 
         for chunk_start in (0..limit).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(limit);
-            for frame in ofdm.push_samples(&samples[chunk_start..chunk_end]) {
+            ofdm.process_samples(&samples[chunk_start..chunk_end], |frame| {
                 frame_count += 1;
                 fic.begin_frame();
-                for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+                for sym in frame.get(0..3).unwrap_or_default() {
                     fic.process_symbol(sym);
                 }
                 let ens = fic.handler.ensemble();
@@ -1965,7 +3371,7 @@ mod tests {
                 }
 
                 if let Some(ref component) = comp_info {
-                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+                    let msc_symbols = frame.get(3..).unwrap_or_default();
                     for cif_syms in msc_symbols.chunks(18) {
                         if cif_syms.len() < 18 {
                             continue;
@@ -2023,7 +3429,7 @@ mod tests {
                         decoded_cifs.push(data);
                     }
                 }
-            }
+            });
         }
 
         eprintln!(
@@ -2106,10 +3512,10 @@ mod tests {
 
         for chunk_start in (0..limit).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(limit);
-            for frame in ofdm.push_samples(&samples[chunk_start..chunk_end]) {
+            ofdm.process_samples(&samples[chunk_start..chunk_end], |frame| {
                 frame_count += 1;
                 fic.begin_frame();
-                for sym in frame.soft_bits.get(0..3).unwrap_or_default() {
+                for sym in frame.get(0..3).unwrap_or_default() {
                     fic.process_symbol(sym);
                 }
                 let ens = fic.handler.ensemble();
@@ -2135,7 +3541,7 @@ mod tests {
                 }
 
                 if let Some(sid) = first_sid {
-                    let msc_symbols = frame.soft_bits.get(3..).unwrap_or_default();
+                    let msc_symbols = frame.get(3..).unwrap_or_default();
                     for (cif_idx, cif_syms) in msc_symbols.chunks(18).enumerate() {
                         if cif_syms.len() < 18 {
                             continue;
@@ -2149,7 +3555,7 @@ mod tests {
                         }
                     }
                 }
-            }
+            });
         }
 
         eprintln!(
@@ -2347,5 +3753,96 @@ mod tests {
             "should produce substantial PCM output (got {})",
             total_pcm_samples
         );
+    }
+
+    #[test]
+    fn slideshow_component_lookup_skips_plain_data_component() {
+        let mut ens = Ensemble::default();
+        ens.services.push(protocol::Service {
+            id: 0x1234,
+            components: vec![
+                Component {
+                    subchannel_id: 1,
+                    scids: Some(0),
+                    service_type: ServiceType::Data,
+                    start_address: 0,
+                    size: 1,
+                    protection: ProtectionLevel::EepA(2),
+                    packet_address: Some(0x10),
+                    user_applications: vec![UserApplication {
+                        uatype: UserApplication::UATYPE_DYNAMIC_LABEL,
+                        data: vec![],
+                        xpad_app_type: None,
+                        dscty: None,
+                        uses_msc_data_groups: None,
+                        ca_applies: None,
+                    }],
+                },
+                Component {
+                    subchannel_id: 2,
+                    scids: Some(1),
+                    service_type: ServiceType::Data,
+                    start_address: 0,
+                    size: 1,
+                    protection: ProtectionLevel::EepA(2),
+                    packet_address: Some(0x20),
+                    user_applications: vec![UserApplication {
+                        uatype: UserApplication::UATYPE_SLIDESHOW,
+                        data: vec![],
+                        xpad_app_type: None,
+                        dscty: None,
+                        uses_msc_data_groups: None,
+                        ca_applies: None,
+                    }],
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert_eq!(
+            find_dls_component(&ens, 0x1234).and_then(|c| c.packet_address),
+            Some(0x10)
+        );
+        assert_eq!(
+            find_slideshow_component(&ens, 0x1234).and_then(|c| c.packet_address),
+            Some(0x20)
+        );
+    }
+
+    #[test]
+    fn packet_mot_extracts_png_and_filename() {
+        let mut asm = PacketMotAssembler::new();
+        let addr = 0x0123;
+        let png = b"\x89PNG\r\n\x1A\nabcIEND\xAE\x42\x60\x82";
+        let useful = b"folder/cover.png\x00";
+        let useful_len = useful.len() + png.len();
+
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = (1 << 6) | (3 << 2) | ((addr >> 8) as u8 & 0x03);
+        pkt[1] = (addr & 0xFF) as u8;
+        pkt[2] = useful_len as u8;
+        pkt[3..3 + useful.len()].copy_from_slice(useful);
+        pkt[3 + useful.len()..3 + useful.len() + png.len()].copy_from_slice(png);
+
+        let items = asm.push_frame(&pkt, addr);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content_type, "image/png");
+        assert_eq!(items[0].filename, "cover.png");
+        assert_eq!(items[0].bytes, png);
+    }
+
+    #[test]
+    fn playback_signal_tracker_drops_to_zero_when_stale() {
+        let mut tracker = PlaybackSignalTracker::new();
+        assert_eq!(tracker.on_decode_success(), 100);
+        assert!(tracker.has_lock());
+        tracker.last_success_ms = Some(unix_ms_now().saturating_sub(6_000));
+        assert_eq!(tracker.current_quality(), Some(0));
+    }
+
+    #[test]
+    fn implausible_label_is_rejected() {
+        assert!(!is_plausible_label("\u{0001}\u{0002}\u{00FF}\u{00A7}"));
+        assert!(is_plausible_label("Artist - Title"));
     }
 }

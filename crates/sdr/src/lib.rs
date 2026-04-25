@@ -2,6 +2,7 @@
 ///
 /// Wraps `rtlsdr_mt` 2.x to provide a channel-based IQ sample stream and
 /// convenience helpers for device enumeration and IQ conversion.
+/// Also supports `rtl_tcp` network sources.
 use num_complex::Complex32;
 use std::path::Path;
 use std::sync::mpsc;
@@ -31,9 +32,22 @@ pub enum SdrError {
 /// This maps [0, 255] → [−1.0, +1.0].
 #[inline]
 pub fn iq_to_complex(raw: &[u8]) -> Vec<Complex32> {
-    raw.chunks_exact(2)
-        .map(|c| Complex32::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
-        .collect()
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    iq_to_complex_into(raw, &mut out);
+    out
+}
+
+/// Convert raw RTL-SDR bytes into an existing output buffer.
+#[inline]
+pub fn iq_to_complex_into(raw: &[u8], out: &mut Vec<Complex32>) {
+    out.clear();
+    out.reserve(raw.len() / 2);
+    for chunk in raw.chunks_exact(2) {
+        out.push(Complex32::new(
+            (chunk[0] as f32 - 127.5) / 127.5,
+            (chunk[1] as f32 - 127.5) / 127.5,
+        ));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────── //
@@ -54,6 +68,7 @@ pub fn list_devices() -> Vec<(u32, String)> {
 // ─────────────────────────────────────────────────────────────────────────── //
 
 /// Configuration for opening an RTL-SDR device.
+#[derive(Clone)]
 pub struct DeviceConfig {
     /// Device index (0 = first device).
     pub index: u32,
@@ -143,15 +158,58 @@ pub fn open_stream(config: DeviceConfig, buf_size: u32) -> Result<SdrStream, Sdr
     ctl.set_center_freq(config.center_freq_hz)
         .map_err(|e| SdrError::Device(format!("set_center_freq: {e:?}")))?;
 
+    // Flush stale samples from the device buffer after configuration.
+    ctl.reset_buffer()
+        .map_err(|e| SdrError::Device(format!("reset_buffer: {e:?}")))?;
+
     let (tx, rx) = mpsc::sync_channel::<Vec<Complex32>>(8);
+
+    // Number of initial IQ sample pairs to discard while the RTL-SDR
+    // stabilises after a fresh device open (or retune).
+    //
+    // With AGC enabled, BOTH the tuner AGC (R820T) and the digital AGC
+    // (RTL2832U) need time to converge to the new signal level.  The tuner
+    // PLL also needs to lock onto the new centre frequency.  Empirically,
+    // soft-bit amplitudes at the FIC continue growing (mean_abs ≈ 80 → 240
+    // → 394 over the first ~200 ms) while AGC ramps gain, which produces
+    // amplitude-modulated samples → phase noise after the differential
+    // demod → all FIB CRCs fail.  Discarding 500 ms ensures the FIC sees
+    // settled, decode-quality samples on its very first frame; without
+    // this, scans on a freshly retuned channel often find nothing on
+    // marginal/weaker stations because the demod hasn't recovered before
+    // the per-channel time budget runs out.
+    //
+    // With fixed gain, only the PLL needs to settle (~150 ms is plenty).
+    let discard_ms: usize = if config.gain == GAIN_AUTO { 500 } else { 150 };
+    let discard_samples: usize = SAMPLE_RATE as usize * discard_ms / 1000;
 
     let thread = std::thread::Builder::new()
         .name("rtlsdr-reader".into())
         .spawn(move || {
+            let mut scratch = Vec::with_capacity(buf_size as usize / 2);
+            let mut discarded: usize = 0;
             let read_result = reader.read_async(4, buf_size, |bytes| {
-                let samples = iq_to_complex(bytes);
+                iq_to_complex_into(bytes, &mut scratch);
+
+                // Discard initial samples while the RTL-SDR PLL and AGC settle.
+                if discarded < discard_samples {
+                    discarded += scratch.len();
+                    scratch.clear();
+                    if discarded >= discard_samples {
+                        log::info!(
+                            "rtlsdr-reader: discarded {} initial samples ({:.0} ms)",
+                            discarded,
+                            discarded as f64 / SAMPLE_RATE as f64 * 1000.0
+                        );
+                    }
+                    return;
+                }
+
+                let samples = std::mem::take(&mut scratch);
                 if tx.send(samples).is_err() {
                     log::info!("rtlsdr-reader: receiver dropped, stopping");
+                } else {
+                    scratch = Vec::with_capacity(buf_size as usize / 2);
                 }
             });
 
@@ -190,6 +248,7 @@ pub fn open_file_stream(path: &Path, buf_size: usize) -> Result<SdrStream, SdrEr
         .name("file-reader".into())
         .spawn(move || {
             let mut raw = vec![0u8; buf_size];
+            let mut scratch = Vec::with_capacity(buf_size / 2);
             loop {
                 match file.read(&mut raw) {
                     Ok(0) => break, // EOF
@@ -199,10 +258,12 @@ pub fn open_file_stream(path: &Path, buf_size: usize) -> Result<SdrStream, SdrEr
                         if usable == 0 {
                             continue;
                         }
-                        let samples = iq_to_complex(&raw[..usable]);
+                        iq_to_complex_into(&raw[..usable], &mut scratch);
+                        let samples = std::mem::take(&mut scratch);
                         if tx.send(samples).is_err() {
                             break;
                         }
+                        scratch = Vec::with_capacity(buf_size / 2);
                     }
                     Err(e) => {
                         log::error!("file-reader: {e}");
@@ -211,6 +272,225 @@ pub fn open_file_stream(path: &Path, buf_size: usize) -> Result<SdrStream, SdrEr
                 }
             }
             log::info!("file-reader: finished");
+        })
+        .map_err(|e| SdrError::Device(e.to_string()))?;
+
+    Ok(SdrStream {
+        rx,
+        ctl: None,
+        thread: Some(thread),
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────── //
+//  rtl_tcp streaming                                                           //
+// ─────────────────────────────────────────────────────────────────────────── //
+
+/// Configuration for connecting to an `rtl_tcp` server.
+#[derive(Clone, Debug)]
+pub struct TcpConfig {
+    /// Server address in `host:port` form (default port 1234).
+    pub address: String,
+    /// Tuner centre frequency in Hz.
+    pub center_freq_hz: u32,
+    /// Gain in tenths of dB, or `GAIN_AUTO` (−1) to enable hardware AGC.
+    pub gain: i32,
+    /// Crystal frequency correction in PPM.
+    pub ppm_correction: i32,
+}
+
+/// Unified source configuration for opening an IQ stream.
+#[derive(Clone)]
+pub enum SourceConfig {
+    /// Local RTL-SDR USB device.
+    Device(DeviceConfig),
+    /// Remote `rtl_tcp` server.
+    Tcp(TcpConfig),
+}
+
+impl SourceConfig {
+    /// Return a new config with the centre frequency changed.
+    pub fn with_freq(&self, freq_hz: u32) -> Self {
+        match self {
+            SourceConfig::Device(c) => SourceConfig::Device(DeviceConfig {
+                center_freq_hz: freq_hz,
+                ..c.clone()
+            }),
+            SourceConfig::Tcp(c) => SourceConfig::Tcp(TcpConfig {
+                center_freq_hz: freq_hz,
+                ..c.clone()
+            }),
+        }
+    }
+
+    /// Return the current centre frequency.
+    pub fn center_freq_hz(&self) -> u32 {
+        match self {
+            SourceConfig::Device(c) => c.center_freq_hz,
+            SourceConfig::Tcp(c) => c.center_freq_hz,
+        }
+    }
+}
+
+/// Open an IQ stream from any supported source.
+pub fn open_source(config: &SourceConfig, buf_size: u32) -> Result<SdrStream, SdrError> {
+    match config {
+        SourceConfig::Device(c) => open_stream(c.clone(), buf_size),
+        SourceConfig::Tcp(c) => open_tcp_stream(c),
+    }
+}
+
+/// Build a 5-byte rtl_tcp command: `[cmd_id, param (big-endian u32)]`.
+fn rtl_tcp_cmd(cmd: u8, param: u32) -> [u8; 5] {
+    let p = param.to_be_bytes();
+    [cmd, p[0], p[1], p[2], p[3]]
+}
+
+/// Connect to an `rtl_tcp` server and return a stream handle delivering IQ
+/// sample buffers.
+///
+/// The rtl_tcp protocol:
+/// 1. Server sends a 12-byte header: `"RTL0"` + tuner type (u32 BE) + gain
+///    count (u32 BE).
+/// 2. Client sends 5-byte commands to configure the dongle.
+/// 3. Server streams raw interleaved u8 I/Q pairs continuously.
+///
+/// Samples are delivered through the same `mpsc::Receiver<Vec<Complex32>>`
+/// interface as local RTL-SDR and file sources.
+pub fn open_tcp_stream(config: &TcpConfig) -> Result<SdrStream, SdrError> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let mut tcp = TcpStream::connect(&config.address)
+        .map_err(|e| SdrError::Device(format!("rtl_tcp connect {}: {e}", config.address)))?;
+
+    // Read and validate the 12-byte server header.
+    let mut header = [0u8; 12];
+    tcp.read_exact(&mut header)
+        .map_err(|e| SdrError::Device(format!("rtl_tcp header read: {e}")))?;
+    if &header[0..4] != b"RTL0" {
+        return Err(SdrError::Device(format!(
+            "rtl_tcp: invalid magic {:?}",
+            &header[0..4]
+        )));
+    }
+    log::info!(
+        "rtl_tcp: connected to {} (tuner type {}, {} gains)",
+        config.address,
+        u32::from_be_bytes(header[4..8].try_into().unwrap()),
+        u32::from_be_bytes(header[8..12].try_into().unwrap()),
+    );
+
+    // Send configuration commands.
+    // 0x02 = set sample rate
+    tcp.write_all(&rtl_tcp_cmd(0x02, SAMPLE_RATE))
+        .map_err(|e| SdrError::Device(format!("rtl_tcp set_sample_rate: {e}")))?;
+    // 0x05 = set freq correction (PPM)
+    tcp.write_all(&rtl_tcp_cmd(0x05, config.ppm_correction as u32))
+        .map_err(|e| SdrError::Device(format!("rtl_tcp set_ppm: {e}")))?;
+
+    if config.gain == GAIN_AUTO {
+        // 0x03 = set gain mode (0 = auto)
+        tcp.write_all(&rtl_tcp_cmd(0x03, 0))
+            .map_err(|e| SdrError::Device(format!("rtl_tcp set_gain_mode: {e}")))?;
+        // 0x08 = set AGC mode (1 = on)
+        tcp.write_all(&rtl_tcp_cmd(0x08, 1))
+            .map_err(|e| SdrError::Device(format!("rtl_tcp set_agc: {e}")))?;
+    } else {
+        // 0x03 = set gain mode (1 = manual)
+        tcp.write_all(&rtl_tcp_cmd(0x03, 1))
+            .map_err(|e| SdrError::Device(format!("rtl_tcp set_gain_mode: {e}")))?;
+        // 0x04 = set tuner gain
+        tcp.write_all(&rtl_tcp_cmd(0x04, config.gain as u32))
+            .map_err(|e| SdrError::Device(format!("rtl_tcp set_gain: {e}")))?;
+        // 0x08 = set AGC mode (0 = off)
+        tcp.write_all(&rtl_tcp_cmd(0x08, 0))
+            .map_err(|e| SdrError::Device(format!("rtl_tcp set_agc: {e}")))?;
+    }
+
+    // 0x01 = set centre frequency
+    tcp.write_all(&rtl_tcp_cmd(0x01, config.center_freq_hz))
+        .map_err(|e| SdrError::Device(format!("rtl_tcp set_freq: {e}")))?;
+
+    tcp.flush()
+        .map_err(|e| SdrError::Device(format!("rtl_tcp flush: {e}")))?;
+
+    // Set a read timeout so the background thread can detect shutdown.
+    tcp.set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|e| SdrError::Device(format!("rtl_tcp set_read_timeout: {e}")))?;
+
+    let (tx, rx) = mpsc::sync_channel::<Vec<Complex32>>(8);
+    let buf_size: usize = 32_768;
+
+    // Discard the same warm-up window we use for local USB devices: the
+    // remote rtl_tcp dongle has the same AGC / PLL settling behaviour after
+    // a freq change.  See `open_stream` for the full rationale.
+    let discard_ms: usize = if config.gain == GAIN_AUTO { 500 } else { 150 };
+    let discard_samples: usize = SAMPLE_RATE as usize * discard_ms / 1000;
+
+    let thread = std::thread::Builder::new()
+        .name("rtl-tcp-reader".into())
+        .spawn(move || {
+            let mut raw = vec![0u8; buf_size];
+            let mut scratch = Vec::with_capacity(buf_size / 2);
+            let mut discarded: usize = 0;
+            let mut discard_logged = false;
+            loop {
+                match tcp.read(&mut raw) {
+                    Ok(0) => {
+                        log::info!("rtl-tcp-reader: server closed connection");
+                        break;
+                    }
+                    Ok(n) => {
+                        let usable = n & !1;
+                        if usable == 0 {
+                            continue;
+                        }
+                        iq_to_complex_into(&raw[..usable], &mut scratch);
+
+                        // Drop initial samples until AGC / PLL have settled.
+                        if discarded < discard_samples {
+                            discarded += scratch.len();
+                            scratch.clear();
+                            if discarded >= discard_samples && !discard_logged {
+                                discard_logged = true;
+                                log::info!(
+                                    "rtl-tcp-reader: discarded {} initial samples ({:.0} ms)",
+                                    discarded,
+                                    discarded as f64 / SAMPLE_RATE as f64 * 1000.0
+                                );
+                            }
+                            continue;
+                        }
+
+                        let samples = std::mem::take(&mut scratch);
+                        if tx.send(samples).is_err() {
+                            log::info!("rtl-tcp-reader: receiver dropped, stopping");
+                            break;
+                        }
+                        scratch = Vec::with_capacity(buf_size / 2);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Read timeout — check if receiver is still alive.
+                        if tx.send(Vec::new()).is_err() {
+                            log::info!("rtl-tcp-reader: receiver dropped, stopping");
+                            break;
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        if tx.send(Vec::new()).is_err() {
+                            log::info!("rtl-tcp-reader: receiver dropped, stopping");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("rtl-tcp-reader: {e}");
+                        break;
+                    }
+                }
+            }
+            log::info!("rtl-tcp-reader: finished");
         })
         .map_err(|e| SdrError::Device(e.to_string()))?;
 
@@ -261,5 +541,38 @@ mod tests {
     fn list_devices_does_not_panic() {
         // No hardware in CI — just verify it doesn't panic.
         let _ = list_devices();
+    }
+
+    #[test]
+    fn rtl_tcp_cmd_encoding() {
+        // Command 0x01 (set freq), param = 220_352_000 (0x0D22_4000)
+        let cmd = super::rtl_tcp_cmd(0x01, 220_352_000);
+        assert_eq!(cmd[0], 0x01);
+        assert_eq!(&cmd[1..], &220_352_000u32.to_be_bytes());
+    }
+
+    #[test]
+    fn rtl_tcp_cmd_zero_param() {
+        let cmd = super::rtl_tcp_cmd(0x03, 0);
+        assert_eq!(cmd, [0x03, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn source_config_with_freq() {
+        let dev = SourceConfig::Device(DeviceConfig {
+            center_freq_hz: 100_000,
+            ..DeviceConfig::default()
+        });
+        let retuned = dev.with_freq(200_000);
+        assert_eq!(retuned.center_freq_hz(), 200_000);
+
+        let tcp = SourceConfig::Tcp(TcpConfig {
+            address: "localhost:1234".into(),
+            center_freq_hz: 100_000,
+            gain: GAIN_AUTO,
+            ppm_correction: 0,
+        });
+        let retuned = tcp.with_freq(300_000);
+        assert_eq!(retuned.center_freq_hz(), 300_000);
     }
 }

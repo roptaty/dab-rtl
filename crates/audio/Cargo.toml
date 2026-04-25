@@ -6,8 +6,12 @@ edition.workspace    = true
 license.workspace    = true
 repository.workspace = true
 
+[features]
+default = []
+mp2 = ["dep:symphonia"]
+
 [dependencies]
 cpal      = "0.15"
 log       = "0.4"
 thiserror = "1"
-symphonia = { version = "0.5", default-features = false, features = ["mpa"] }
+symphonia = { version = "0.5", default-features = false, features = ["mpa"], optional = true }

@@ -1,6 +1,8 @@
 pub mod decode;
 mod fdk;
-pub use decode::{decode_mp2, firecode_check, DabPlusDecoder, Mp2Decoder};
+#[cfg(feature = "mp2")]
+pub use decode::{decode_mp2, Mp2Decoder};
+pub use decode::{firecode_check, DabPlusDecoder};
 
 /// Audio output via cpal (ALSA or PulseAudio on Linux).
 ///
@@ -9,6 +11,107 @@ pub use decode::{decode_mp2, firecode_check, DabPlusDecoder, Mp2Decoder};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+
+/// Initial PCM ring capacity in samples.
+const PCM_RING_INITIAL_CAPACITY: usize = 48_000;
+
+struct PcmRingBuffer {
+    data: Vec<f32>,
+    read_pos: usize,
+    len: usize,
+}
+
+impl PcmRingBuffer {
+    fn new(capacity: usize) -> Self {
+        let cap = capacity.max(1);
+        Self {
+            data: vec![0.0; cap],
+            read_pos: 0,
+            len: 0,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    fn write_slice(&mut self, input: &[f32]) {
+        self.ensure_capacity(self.len + input.len());
+        let write_pos = (self.read_pos + self.len) % self.capacity();
+        let first = input.len().min(self.capacity() - write_pos);
+        self.data[write_pos..write_pos + first].copy_from_slice(&input[..first]);
+        let remaining = input.len() - first;
+        if remaining > 0 {
+            self.data[..remaining].copy_from_slice(&input[first..]);
+        }
+        self.len += input.len();
+    }
+
+    fn read_into_f32(&mut self, out: &mut [f32]) -> usize {
+        let count = self.len.min(out.len());
+        if count == 0 {
+            return 0;
+        }
+        let first = count.min(self.capacity() - self.read_pos);
+        out[..first].copy_from_slice(&self.data[self.read_pos..self.read_pos + first]);
+        let remaining = count - first;
+        if remaining > 0 {
+            out[first..count].copy_from_slice(&self.data[..remaining]);
+        }
+        self.consume(count);
+        count
+    }
+
+    fn read_into_i16(&mut self, out: &mut [i16]) -> usize {
+        let count = self.len.min(out.len());
+        if count == 0 {
+            return 0;
+        }
+        let first = count.min(self.capacity() - self.read_pos);
+        for (dst, src) in out[..first]
+            .iter_mut()
+            .zip(self.data[self.read_pos..self.read_pos + first].iter())
+        {
+            *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        }
+        let remaining = count - first;
+        if remaining > 0 {
+            for (dst, src) in out[first..count]
+                .iter_mut()
+                .zip(self.data[..remaining].iter())
+            {
+                *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            }
+        }
+        self.consume(count);
+        count
+    }
+
+    fn ensure_capacity(&mut self, required: usize) {
+        if required <= self.capacity() {
+            return;
+        }
+        let new_capacity = required.next_power_of_two();
+        let mut new_data = vec![0.0; new_capacity];
+        let first = self.len.min(self.capacity() - self.read_pos);
+        new_data[..first].copy_from_slice(&self.data[self.read_pos..self.read_pos + first]);
+        let remaining = self.len - first;
+        if remaining > 0 {
+            new_data[first..self.len].copy_from_slice(&self.data[..remaining]);
+        }
+        self.data = new_data;
+        self.read_pos = 0;
+    }
+
+    fn consume(&mut self, count: usize) {
+        debug_assert!(count <= self.len);
+        self.read_pos = (self.read_pos + count) % self.capacity();
+        self.len -= count;
+        if self.len == 0 {
+            self.read_pos = 0;
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum AudioError {
@@ -49,7 +152,7 @@ pub fn list_devices() -> Vec<(usize, String)> {
 /// Audio output stream backed by a shared PCM ring buffer.
 pub struct AudioOutput {
     stream: cpal::Stream,
-    buf: Arc<Mutex<Vec<f32>>>,
+    buf: Arc<Mutex<PcmRingBuffer>>,
     pub sample_rate: u32,
     pub channels: u16,
 }
@@ -102,7 +205,8 @@ impl AudioOutput {
         };
 
         // Shared ring buffer: caller writes f32, cpal callback reads.
-        let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let buf: Arc<Mutex<PcmRingBuffer>> =
+            Arc::new(Mutex::new(PcmRingBuffer::new(PCM_RING_INITIAL_CAPACITY)));
         let buf_reader = Arc::clone(&buf);
 
         let stream = match sample_format {
@@ -113,13 +217,7 @@ impl AudioOutput {
                         &config,
                         move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                             let mut guard = buf_r.lock().unwrap();
-                            let available = guard.len().min(data.len());
-                            for (out, &inp) in
-                                data[..available].iter_mut().zip(guard[..available].iter())
-                            {
-                                *out = (inp.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                            }
-                            guard.drain(..available);
+                            let available = guard.read_into_i16(data);
                             for s in &mut data[available..] {
                                 *s = 0;
                             }
@@ -136,9 +234,7 @@ impl AudioOutput {
                         &config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                             let mut guard = buf_r.lock().unwrap();
-                            let available = guard.len().min(data.len());
-                            data[..available].copy_from_slice(&guard[..available]);
-                            guard.drain(..available);
+                            let available = guard.read_into_f32(data);
                             for s in &mut data[available..] {
                                 *s = 0.0;
                             }
@@ -158,9 +254,7 @@ impl AudioOutput {
                         &config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                             let mut guard = buf_reader.lock().unwrap();
-                            let available = guard.len().min(data.len());
-                            data[..available].copy_from_slice(&guard[..available]);
-                            guard.drain(..available);
+                            let available = guard.read_into_f32(data);
                             for s in &mut data[available..] {
                                 *s = 0.0;
                             }
@@ -186,7 +280,7 @@ impl AudioOutput {
     /// Block until the internal buffer has room (simple back-pressure).
     pub fn write_samples(&self, samples: &[f32]) {
         let mut guard = self.buf.lock().unwrap();
-        guard.extend_from_slice(samples);
+        guard.write_slice(samples);
     }
 
     /// Start audio playback.
@@ -217,5 +311,31 @@ mod tests {
     #[test]
     fn list_devices_does_not_panic() {
         let _ = list_devices();
+    }
+
+    #[test]
+    fn pcm_ring_buffer_round_trips_without_reordering() {
+        let mut buf = PcmRingBuffer::new(4);
+        buf.write_slice(&[1.0, 2.0, 3.0]);
+        let mut out = [0.0; 2];
+        assert_eq!(buf.read_into_f32(&mut out), 2);
+        assert_eq!(out, [1.0, 2.0]);
+
+        buf.write_slice(&[4.0, 5.0, 6.0]);
+        let mut out = [0.0; 4];
+        assert_eq!(buf.read_into_f32(&mut out), 4);
+        assert_eq!(out, [3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(buf.len, 0);
+    }
+
+    #[test]
+    fn pcm_ring_buffer_grows_and_preserves_contents() {
+        let mut buf = PcmRingBuffer::new(2);
+        buf.write_slice(&[0.1, 0.2, 0.3, 0.4, 0.5]);
+        assert!(buf.capacity() >= 5);
+
+        let mut out = [0.0; 5];
+        assert_eq!(buf.read_into_f32(&mut out), 5);
+        assert_eq!(out, [0.1, 0.2, 0.3, 0.4, 0.5]);
     }
 }

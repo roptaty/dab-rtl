@@ -18,7 +18,8 @@
 ///   Bytes 2+: extension-specific data
 use std::collections::HashMap;
 
-use crate::ensemble::Ensemble;
+use crate::decode_dab_text;
+use crate::ensemble::{Ensemble, UserApplication};
 
 /// Subchannel parameters from FIG 0/1, stored independently from components.
 #[derive(Debug, Clone)]
@@ -107,6 +108,9 @@ pub struct FibParser {
     /// Subchannel parameters indexed by SubChId (0–63), populated by FIG 0/1.
     /// Stored separately so they are available regardless of FIG arrival order.
     subchannels: HashMap<u8, SubchannelInfo>,
+    /// User applications indexed by (SId, SCIdS) when FIG 0/13 arrives before
+    /// the corresponding FIG 0/2 or FIG 0/3 component mapping.
+    pending_user_applications: HashMap<(u32, u8), Vec<UserApplication>>,
 }
 
 impl FibParser {
@@ -114,6 +118,7 @@ impl FibParser {
         FibParser {
             ensemble: Ensemble::default(),
             subchannels: HashMap::new(),
+            pending_user_applications: HashMap::new(),
         }
     }
 
@@ -176,6 +181,8 @@ impl FibParser {
             0 => self.parse_fig_0_0(payload),
             1 => self.parse_fig_0_1(payload),
             2 => self.parse_fig_0_2(payload),
+            3 => self.parse_fig_0_3(payload),
+            13 => self.parse_fig_0_13(payload),
             _ => {}
         }
     }
@@ -331,11 +338,28 @@ impl FibParser {
                         };
                     svc.components.push(crate::ensemble::Component {
                         subchannel_id: sub_ch_id,
+                        // The first component in a service is the primary component.
+                        // SCIdS=0 is enough to link FIG 0/13 applications for the
+                        // common single-audio-component case. Secondary stream
+                        // components need FIG 0/8 for exact SCIdS resolution.
+                        scids: if svc.components.is_empty() {
+                            Some(0)
+                        } else {
+                            None
+                        },
                         service_type,
                         start_address,
                         size,
                         protection,
+                        packet_address: None,
+                        user_applications: Vec::new(),
                     });
+                    apply_pending_user_applications(
+                        &mut self.pending_user_applications,
+                        svc,
+                        svc.components.len() - 1,
+                        sid,
+                    );
                 }
                 log::debug!(
                     "FIG 0/2: SId={:04X} SubChId={} TMId={} ASCTy={:#04x}",
@@ -343,6 +367,148 @@ impl FibParser {
                     sub_ch_id,
                     tmid,
                     ascty
+                );
+            }
+        }
+    }
+
+    /// FIG 0/3 — Service component in packet mode (ETSI EN 300 401 §6.3.2).
+    ///
+    /// Provides SubChId and PacketAddress for packet-mode service components.
+    /// Each entry (P/D=0, 16-bit SId) is 6 bytes:
+    ///   Bytes 0-1: SId [15:0]
+    ///   Byte  2:   SCIdS[7:4] | BackwardLink[3] | Toggle[2] | rfa[1:0]
+    ///   Byte  3:   SubChId[7:2] | DSCTy_high[1:0]
+    ///   Byte  4:   DSCTy_low[7:4] | PacketAddress_high[3:0]
+    ///   Byte  5:   PacketAddress_low[7:2] | CA_flag[1] | DG_flag[0]
+    fn parse_fig_0_3(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+        while i + 6 <= data.len() {
+            let sid = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            let scids = data[i + 2] >> 4;
+            let sub_ch_id = (data[i + 3] >> 2) & 0x3F;
+            let packet_address = (((data[i + 4] & 0x0F) as u16) << 6) | ((data[i + 5] >> 2) as u16);
+
+            let svc = self.ensemble.get_or_insert_service(sid);
+            // Find the component with this subchannel and set its packet address.
+            if let Some(component_idx) = svc
+                .components
+                .iter()
+                .position(|c| c.subchannel_id == sub_ch_id)
+            {
+                let comp = &mut svc.components[component_idx];
+                comp.scids = Some(scids);
+                comp.packet_address = Some(packet_address);
+                comp.service_type = crate::ensemble::ServiceType::Data;
+                apply_pending_user_applications(
+                    &mut self.pending_user_applications,
+                    svc,
+                    component_idx,
+                    sid,
+                );
+            } else {
+                // FIG 0/3 may arrive before FIG 0/2; insert a skeleton component.
+                let (start_address, size, protection) =
+                    if let Some(info) = self.subchannels.get(&sub_ch_id) {
+                        (info.start_address, info.size, info.protection.clone())
+                    } else {
+                        (0, 0, Default::default())
+                    };
+                svc.components.push(crate::ensemble::Component {
+                    subchannel_id: sub_ch_id,
+                    scids: Some(scids),
+                    service_type: crate::ensemble::ServiceType::Data,
+                    start_address,
+                    size,
+                    protection,
+                    packet_address: Some(packet_address),
+                    user_applications: Vec::new(),
+                });
+                apply_pending_user_applications(
+                    &mut self.pending_user_applications,
+                    svc,
+                    svc.components.len() - 1,
+                    sid,
+                );
+            }
+
+            log::debug!(
+                "FIG 0/3: SId={:04X} SubChId={} PacketAddr={}",
+                sid,
+                sub_ch_id,
+                packet_address
+            );
+            i += 6;
+        }
+    }
+
+    /// FIG 0/13 — User application information.
+    ///
+    /// This initial implementation supports the common 16-bit SId case and
+    /// attaches applications to components when SCIdS is known. For audio
+    /// primary components, SCIdS=0 is inferred in FIG 0/2; for packet-mode
+    /// components, SCIdS comes from FIG 0/3. Full secondary-component support
+    /// will need FIG 0/8 parsing.
+    fn parse_fig_0_13(&mut self, data: &[u8]) {
+        let mut i = 0usize;
+        while i + 3 <= data.len() {
+            let sid = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+
+            let scids = data[i] >> 4;
+            let num_apps = (data[i] & 0x0F) as usize;
+            i += 1;
+
+            let mut parsed_apps = Vec::new();
+            for _ in 0..num_apps {
+                if i + 2 > data.len() {
+                    return;
+                }
+                let app_header = u16::from_be_bytes([data[i], data[i + 1]]);
+                i += 2;
+
+                let uatype = app_header >> 5;
+                let data_len = (app_header & 0x1F) as usize;
+                if i + data_len > data.len() {
+                    return;
+                }
+                let app_data = data[i..i + data_len].to_vec();
+                i += data_len;
+
+                let (xpad_app_type, dscty, uses_msc_data_groups, ca_applies) =
+                    parse_fig_0_13_transport_fields(&app_data);
+                parsed_apps.push(UserApplication {
+                    uatype,
+                    data: app_data,
+                    xpad_app_type,
+                    dscty,
+                    uses_msc_data_groups,
+                    ca_applies,
+                });
+            }
+
+            let svc = self.ensemble.get_or_insert_service(sid);
+            if let Some(comp) = svc.components.iter_mut().find(|c| c.scids == Some(scids)) {
+                for app in parsed_apps {
+                    upsert_user_application(&mut comp.user_applications, app);
+                }
+                log::debug!(
+                    "FIG 0/13: SId={:04X} SCIdS={} apps={}",
+                    sid,
+                    scids,
+                    comp.user_applications.len()
+                );
+            } else {
+                let key = (sid, scids);
+                let pending = self.pending_user_applications.entry(key).or_default();
+                for app in parsed_apps {
+                    upsert_user_application(pending, app);
+                }
+                log::debug!(
+                    "FIG 0/13: SId={:04X} SCIdS={} queued {} app(s) until component mapping arrives",
+                    sid,
+                    scids,
+                    pending.len()
                 );
             }
         }
@@ -356,37 +522,38 @@ impl FibParser {
         if body.is_empty() {
             return;
         }
+        let charset = body[0] >> 4;
         let extension = body[0] & 0x07;
         let payload = &body[1..];
 
         match extension {
-            0 => self.parse_fig_1_0(payload),
-            1 => self.parse_fig_1_1(payload),
+            0 => self.parse_fig_1_0(payload, charset),
+            1 => self.parse_fig_1_1(payload, charset),
             _ => {}
         }
     }
 
     /// FIG 1/0 — Ensemble label.
     /// Layout: [EId:16][label: 16 bytes][short_label_flag: 16 bits]
-    fn parse_fig_1_0(&mut self, data: &[u8]) {
+    fn parse_fig_1_0(&mut self, data: &[u8], charset: u8) {
         if data.len() < 18 {
             return;
         }
         // EId (2 bytes) — cross-check but not required.
         let label_bytes = &data[2..18];
-        self.ensemble.label = decode_label(label_bytes);
+        self.ensemble.label = decode_label(label_bytes, charset);
         log::debug!("FIG 1/0: Ensemble label = {:?}", self.ensemble.label);
     }
 
     /// FIG 1/1 — Programme service label.
     /// Layout: [SId:16][label: 16 bytes][short_label_flag: 16 bits]
-    fn parse_fig_1_1(&mut self, data: &[u8]) {
+    fn parse_fig_1_1(&mut self, data: &[u8], charset: u8) {
         if data.len() < 18 {
             return;
         }
         let sid = u16::from_be_bytes([data[0], data[1]]) as u32;
         let label_bytes = &data[2..18];
-        let label = decode_label(label_bytes);
+        let label = decode_label(label_bytes, charset);
 
         let svc = self.ensemble.get_or_insert_service(sid);
         svc.label = label.clone();
@@ -422,14 +589,59 @@ fn fib_crc_valid(fib: &[u8]) -> bool {
     computed == stored
 }
 
-/// Decode a 16-byte label field (EBU Latin / ASCII, space-padded) to a String.
-fn decode_label(bytes: &[u8]) -> String {
-    // Treat as Latin-1; strip trailing spaces.
-    let s: String = bytes
-        .iter()
-        .map(|&b| if b < 0x80 { b as char } else { '?' })
-        .collect();
-    s.trim_end().to_string()
+/// Decode a FIG 1 label field using the announced DAB charset.
+fn decode_label(bytes: &[u8], charset: u8) -> String {
+    decode_dab_text(bytes, charset)
+}
+
+fn parse_fig_0_13_transport_fields(
+    data: &[u8],
+) -> (Option<u8>, Option<u8>, Option<bool>, Option<bool>) {
+    let Some(&b0) = data.first() else {
+        return (None, None, None, None);
+    };
+    let ca_applies = Some((b0 & 0x80) != 0);
+    let xpad_app_type = Some(b0 & 0x1F);
+    let Some(&b1) = data.get(1) else {
+        return (xpad_app_type, None, None, ca_applies);
+    };
+    let uses_msc_data_groups = Some((b1 & 0x80) != 0);
+    let dscty = Some(b1 & 0x3F);
+    (xpad_app_type, dscty, uses_msc_data_groups, ca_applies)
+}
+
+fn upsert_user_application(apps: &mut Vec<UserApplication>, app: UserApplication) {
+    if let Some(existing) = apps
+        .iter_mut()
+        .find(|existing| existing.uatype == app.uatype)
+    {
+        *existing = app;
+    } else {
+        apps.push(app);
+    }
+}
+
+fn apply_pending_user_applications(
+    pending_user_applications: &mut HashMap<(u32, u8), Vec<UserApplication>>,
+    svc: &mut crate::ensemble::Service,
+    component_idx: usize,
+    sid: u32,
+) {
+    let Some(scids) = svc
+        .components
+        .get(component_idx)
+        .and_then(|comp| comp.scids)
+    else {
+        return;
+    };
+    let Some(pending) = pending_user_applications.remove(&(sid, scids)) else {
+        return;
+    };
+    if let Some(comp) = svc.components.get_mut(component_idx) {
+        for app in pending {
+            upsert_user_application(&mut comp.user_applications, app);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -499,7 +711,13 @@ mod tests {
     #[test]
     fn decode_label_trims_spaces() {
         let bytes = b"Radio 4         ";
-        assert_eq!(super::decode_label(bytes), "Radio 4");
+        assert_eq!(super::decode_label(bytes, 0x00), "Radio 4");
+    }
+
+    #[test]
+    fn decode_label_respects_charset() {
+        let bytes = b"Caf\x82            ";
+        assert_eq!(super::decode_label(bytes, 0x00), "Caf\u{00E9}");
     }
 
     #[test]
@@ -539,10 +757,13 @@ mod tests {
         let svc = parser.ensemble.get_or_insert_service(0x1234);
         svc.components.push(crate::ensemble::Component {
             subchannel_id: 5,
+            scids: Some(0),
             service_type: crate::ensemble::ServiceType::Audio,
             start_address: 0,
             size: 0,
             protection: Default::default(),
+            packet_address: None,
+            user_applications: Vec::new(),
         });
 
         // FIG 0/1 long form: SubChId=5, StartAddr=100, Option=0 (EEP-A),
@@ -569,10 +790,13 @@ mod tests {
         let svc = parser.ensemble.get_or_insert_service(0x5678);
         svc.components.push(crate::ensemble::Component {
             subchannel_id: 10,
+            scids: Some(0),
             service_type: crate::ensemble::ServiceType::Audio,
             start_address: 0,
             size: 0,
             protection: Default::default(),
+            packet_address: None,
+            user_applications: Vec::new(),
         });
 
         // Short form: SubChId=10, StartAddr=50, TableIndex=15 (64kbit/s lvl4, 42 CU)
@@ -636,5 +860,98 @@ mod tests {
         assert_eq!(parser.ensemble.services[1].id, 0xBBBB);
         assert_eq!(parser.ensemble.services[1].components.len(), 1);
         assert!(parser.ensemble.services[1].is_dab_plus);
+    }
+
+    #[test]
+    fn parse_fig_0_3_sets_packet_address_and_scids() {
+        let mut parser = FibParser::new();
+
+        // Pre-seed a service/component that FIG 0/3 will complete.
+        parser.parse_fig_0_2(&[0x12, 0x34, 0x01, 0x00, 0x14]); // SubChId=5
+
+        // SId=0x1234, SCIdS=9, SubChId=5, PacketAddress=325
+        let payload = [
+            0x12,
+            0x34,
+            0x90,
+            0x14,
+            0x05,      // low nibble carries PacketAddress[9:6] = 0b0101
+            0x05 << 2, // PacketAddress[5:0] = 0b000101 = 5 => total 325
+        ];
+        parser.parse_fig_0_3(&payload);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.scids, Some(9));
+        assert_eq!(comp.packet_address, Some(325));
+        assert_eq!(comp.service_type, crate::ensemble::ServiceType::Data);
+    }
+
+    #[test]
+    fn parse_fig_0_13_attaches_user_application_to_primary_component() {
+        let mut parser = FibParser::new();
+
+        // Create one primary audio component. The parser assigns SCIdS=0.
+        parser.parse_fig_0_2(&[0x12, 0x34, 0x01, 0x00, 0x14]); // SId=0x1234, SubChId=5
+
+        // SId=0x1234, SCIdS=0, one app:
+        // UATy=0x004 (SlideShow), data_len=2 => header=0x0082
+        // app_data[0]=X-PAD app type 12, app_data[1]=DG flag set + DSCTy=0x3C
+        let payload = [0x12, 0x34, 0x01, 0x00, 0x82, 0x0C, 0xBC];
+        parser.parse_fig_0_13(&payload);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.user_applications.len(), 1);
+        let app = &comp.user_applications[0];
+        assert_eq!(app.uatype, UserApplication::UATYPE_SLIDESHOW);
+        assert_eq!(app.xpad_app_type, Some(12));
+        assert_eq!(app.dscty, Some(0x3C));
+        assert_eq!(app.uses_msc_data_groups, Some(true));
+        assert_eq!(app.ca_applies, Some(false));
+    }
+
+    #[test]
+    fn parse_fig_0_13_is_queued_until_primary_component_exists() {
+        let mut parser = FibParser::new();
+
+        // FIG 0/13 arrives before FIG 0/2 creates the primary component.
+        let fig_0_13 = [0x12, 0x34, 0x01, 0x00, 0x82, 0x0C, 0xBC];
+        parser.parse_fig_0_13(&fig_0_13);
+
+        // FIG 0/2 later creates the audio component with inferred SCIdS=0.
+        parser.parse_fig_0_2(&[0x12, 0x34, 0x01, 0x00, 0x14]);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.user_applications.len(), 1);
+        assert_eq!(
+            comp.user_applications[0].uatype,
+            UserApplication::UATYPE_SLIDESHOW
+        );
+    }
+
+    #[test]
+    fn parse_fig_0_13_is_queued_until_packet_component_exists() {
+        let mut parser = FibParser::new();
+
+        // FIG 0/13 arrives before the packet-mode FIG 0/3 mapping.
+        let fig_0_13 = [0x12, 0x34, 0x91, 0x00, 0x42, 0x02, 0x3C];
+        parser.parse_fig_0_13(&fig_0_13);
+
+        // FIG 0/2 creates the component without SCIdS.
+        parser.parse_fig_0_2(&[0x12, 0x34, 0x01, 0x00, 0x14]);
+        assert!(parser.ensemble.services[0].components[0]
+            .user_applications
+            .is_empty());
+
+        // FIG 0/3 supplies SCIdS=9 and packet-mode mapping, which should attach
+        // the pending application immediately.
+        parser.parse_fig_0_3(&[0x12, 0x34, 0x90, 0x14, 0x05, 0x05 << 2]);
+
+        let comp = &parser.ensemble.services[0].components[0];
+        assert_eq!(comp.scids, Some(9));
+        assert_eq!(comp.user_applications.len(), 1);
+        assert_eq!(
+            comp.user_applications[0].uatype,
+            UserApplication::UATYPE_DYNAMIC_LABEL
+        );
     }
 }

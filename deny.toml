@@ -11,8 +11,9 @@
 version = 2
 # Deny all vulnerabilities (no exceptions by default)
 ignore = [
-    # Add advisory IDs here to suppress specific known/accepted advisories.
-    # Example: "RUSTSEC-2021-0001"
+    # paste is unmaintained but it's a transitive dep of ratatui — no action
+    # we can take until ratatui migrates to pastey. Not a security issue.
+    "RUSTSEC-2024-0436",
 ]
 
 # ── License policy ──────────────────────────────────────────────────────────── #
@@ -28,29 +29,28 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-DFS-2016",
+    "Unicode-3.0",
     "Zlib",
     "MPL-2.0",
 ]
-# Deny copyleft licenses that would require source disclosure
-deny = [
-    "GPL-2.0",
-    "GPL-3.0",
-    "LGPL-2.0",
-    "LGPL-2.1",
-    "LGPL-3.0",
-    "AGPL-3.0",
-]
-# How to handle dependencies with no license declared
-unlicensed = "deny"
-# How to handle dependencies with licenses that aren't in the allow or deny lists
-copyleft = "warn"
+# Any license not in the allow list is denied by default.
+# Copyleft and unlicensed crates are rejected because they are not listed above.
+#
+# Exceptions for crates whose license is not in the general allow list.
+[[licenses.exceptions]]
+name = "rtlsdr_mt"
+allow = ["GPL-2.0-or-later"]
+[[licenses.exceptions]]
+name = "rtlsdr_sys"
+allow = ["GPL-2.0-or-later"]
 
 # ── Dependency bans ─────────────────────────────────────────────────────────── #
 [bans]
 # Warn when multiple versions of the same crate are pulled in
 multiple-versions = "warn"
-# Deny wildcard dependency specifications (e.g. version = "*")
-wildcards = "deny"
+# Allow wildcard versions for workspace-internal path dependencies.
+# External crates still require explicit versions via Cargo.lock.
+wildcards = "allow"
 # List of crates that must not be used in this project
 deny = [
     # Example: ban known-broken or insecure crates

@@ -33,9 +33,7 @@ jobs:
             pkg-config
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: rustup show
 
       - name: Cache cargo registry & build artifacts
         uses: actions/cache@v4

@@ -16,7 +16,7 @@ const WINDOW_SIZE: usize = 256;
 pub const MIN_WARMUP_SAMPLES: usize = 8192;
 
 /// State machine for the synchroniser.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SyncState {
     /// Searching for the first null symbol.
     Hunting,
@@ -56,6 +56,11 @@ pub struct FrameSync {
     null_sample_count: usize,
     /// Set by `reset_for_resync()` to bypass the warmup check.
     warmup_done: bool,
+    /// Adaptive EMA alpha for `long_term_avg`.
+    ///
+    /// Starts high (0.01) for fast initial convergence, then decays to
+    /// the steady-state value (0.001) once the estimate has stabilised.
+    ema_alpha: f64,
 }
 
 impl FrameSync {
@@ -71,6 +76,7 @@ impl FrameSync {
             sample_count: 0,
             null_sample_count: 0,
             warmup_done: false,
+            ema_alpha: 0.01, // fast initial convergence
         }
     }
 
@@ -91,10 +97,18 @@ impl FrameSync {
                 0.0
             };
 
-            match &self.state.clone() {
+            match self.state {
                 SyncState::Hunting | SyncState::Locked => {
                     // Update long-term average only when not in a null.
-                    self.long_term_avg = 0.999 * self.long_term_avg + 0.001 * (window_mean);
+                    let alpha = self.ema_alpha;
+                    self.long_term_avg = (1.0 - alpha) * self.long_term_avg + alpha * window_mean;
+                    // Decay alpha towards steady-state value (0.001).
+                    if self.ema_alpha > 0.001 {
+                        self.ema_alpha *= 0.999;
+                        if self.ema_alpha < 0.001 {
+                            self.ema_alpha = 0.001;
+                        }
+                    }
 
                     // Periodic status log so we can verify the sync is running.
                     if self.sample_count.is_multiple_of(500_000) {
@@ -138,7 +152,7 @@ impl FrameSync {
                         // Null ended — energy rose back.
                         // The phase-reference symbol starts right here.
                         let frame_start = FrameStart {
-                            null_start: *null_start,
+                            null_start,
                             sample_offset: self.sample_count.wrapping_sub(1),
                         };
                         log::info!(

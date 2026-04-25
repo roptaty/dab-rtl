@@ -4,6 +4,7 @@
 /// DAB+ audio is carried as HE-AAC v2 Access Units packed inside a DAB+
 /// superframe (ETSI TS 102 563).  Raw AUs are fed to fdk-aac via RAW
 /// transport with an AudioSpecificConfig (960-sample frames, SBR/PS).
+#[cfg(feature = "mp2")]
 use symphonia::core::{
     audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
     meta::MetadataOptions, probe::Hint,
@@ -13,6 +14,7 @@ use symphonia::core::{
 ///
 /// Returns interleaved stereo (or mono) f32 samples, or an empty vec on
 /// failure.  Errors are logged at warn level.
+#[cfg(feature = "mp2")]
 pub fn decode_mp2(data: &[u8]) -> Vec<f32> {
     if data.is_empty() {
         return Vec::new();
@@ -79,11 +81,13 @@ pub fn decode_mp2(data: &[u8]) -> Vec<f32> {
 ///
 /// DAB audio superframes are typically 3 MP2 frames (for 48 kHz stereo).
 /// We buffer until we have at least `min_bytes` and then flush.
+#[cfg(feature = "mp2")]
 pub struct Mp2Decoder {
     buf: Vec<u8>,
     min_bytes: usize,
 }
 
+#[cfg(feature = "mp2")]
 impl Mp2Decoder {
     /// Create a decoder.
     ///
@@ -270,6 +274,9 @@ pub struct DabPlusDecoder {
     synced: bool,
     /// Persistent fdk-aac decoder (SBR/PS/window state survives across superframes).
     aac: Option<AacState>,
+    /// AU data (without CRC) from the most recently decoded superframe, for PAD
+    /// extraction.  Populated by [`decode_superframe`] and drained by the caller.
+    pub pad_aus: Vec<Vec<u8>>,
 }
 
 impl DabPlusDecoder {
@@ -284,6 +291,7 @@ impl DabPlusDecoder {
             superframe_size,
             synced: false,
             aac: None,
+            pad_aus: Vec::new(),
         }
     }
 
@@ -313,7 +321,7 @@ impl DabPlusDecoder {
             // Try every CIF boundary in the buffer.
             let cif = self.superframe_size;
             let max_offset = self.buf.len().saturating_sub(sf_size);
-            let num_offsets = if cif > 0 { max_offset / cif + 1 } else { 0 };
+            let num_offsets = (max_offset.checked_div(cif)).map_or(0, |q| q + 1);
             log::debug!(
                 "DAB+ sync search: buf={}, sf_size={}, max_offset={}, checking {} offsets",
                 self.buf.len(),
@@ -372,7 +380,11 @@ impl DabPlusDecoder {
     /// - RS parity is stripped (110 data bytes per 120-byte RS codeword)
     /// - AU CRCs are the last 2 bytes within each AU boundary
     /// - Raw AAC AUs are fed via RAW transport (960-sample DAB+ frames)
+    ///
+    /// Populates [`pad_aus`] with the AU bytes (without CRC) from each AU that
+    /// passes its CRC check.  The caller can drain this field for PAD extraction.
     fn decode_superframe(&mut self, data: &[u8]) -> Vec<f32> {
+        self.pad_aus.clear();
         if data.len() < 6 {
             return Vec::new();
         }
@@ -519,6 +531,9 @@ impl DabPlusDecoder {
                 continue;
             }
 
+            // Collect AU data (without CRC) for PAD extraction by the caller.
+            self.pad_aus.push(au_data.to_vec());
+
             // Feed raw AU data (no ADTS header) to the RAW transport decoder.
             if let Err(e) = aac.decoder.fill(au_data) {
                 log::debug!("AAC fill error: 0x{:04X}", e);
@@ -613,17 +628,20 @@ impl DabPlusDecoder {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "mp2")]
     #[test]
     fn empty_input_returns_empty() {
         assert!(decode_mp2(&[]).is_empty());
     }
 
+    #[cfg(feature = "mp2")]
     #[test]
     fn garbage_input_returns_empty_no_panic() {
         let garbage = vec![0xFFu8; 256];
         let _ = decode_mp2(&garbage); // must not panic
     }
 
+    #[cfg(feature = "mp2")]
     #[test]
     fn mp2_decoder_buffers_until_min() {
         let mut dec = Mp2Decoder::new(512);

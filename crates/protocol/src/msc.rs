@@ -94,10 +94,13 @@ mod tests {
     fn dummy_component(start: u16, size: u16) -> Component {
         Component {
             subchannel_id: 3,
+            scids: Some(0),
             service_type: ServiceType::Audio,
             start_address: start,
             size,
             protection: ProtectionLevel::EepA(2),
+            packet_address: None,
+            user_applications: Vec::new(),
         }
     }
 
